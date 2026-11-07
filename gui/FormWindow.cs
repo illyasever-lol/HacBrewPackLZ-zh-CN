@@ -417,7 +417,7 @@ internal sealed class SearchWindow : AppWindow
         CreateTopLevel("搜索位置", 760, 560, owner);
 
         _location = Add(new TextField("要搜索的文件夹或驱动器"));
-        _location.Value = s_lastLocation ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "下载");
+        _location.Value = s_lastLocation ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
         _browse = Add(new Button("浏览", ButtonStyle.Secondary, Browse));
         _go = Add(new Button("搜索", ButtonStyle.Secondary, () => StartSearch()));
         _filter = Add(new TextField("按名称筛选"));

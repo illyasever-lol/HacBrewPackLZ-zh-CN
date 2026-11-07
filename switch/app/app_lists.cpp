@@ -53,7 +53,7 @@ std::string App::whereIs(const std::string& path) {
     }
     for (auto& drive : _drives) {
         if (startsWithNoCase(path, drive.root))
-            return drive.isUsb ? "在" + drive.name : "On the SD card";
+            return drive.isUsb ? "在" + drive.name : "在 SD 卡上";
     }
     return "";
 }
@@ -188,7 +188,7 @@ void App::applyContents(Row& row, const InstalledGame& game) {
     std::string version = row.version.empty() ? "" : "版本" + row.version;
     if (hasUpdate)
         version += version.empty() ? "含升级补丁" : "及其升级补丁";
-    row.detail = joined({version, dlc == 0 ? "" : format("%d DLC", dlc), row.storage == Storage::Nand ? "在主机上" : row.storage == Storage::Sd ? "On the SD card" : ""}, Dot);
+    row.detail = joined({version, dlc == 0 ? "" : format("%d 个 DLC", dlc), row.storage == Storage::Nand ? "在主机上" : row.storage == Storage::Sd ? "在 SD 卡上" : ""}, Dot);
 
     if (row.blocked.empty() && !hasBase)
         row.blocked = "未安装其本体游戏，因此无法重建";
@@ -985,13 +985,13 @@ void App::judgeLocked(Row& row, const ConvertOptions& options) {
         // A compressed game file can still be installed, which is all that's left to do with it.
         if (row.estimate.alreadyCompressed) {
             if (!compressedToInstallLocked(row))
-                row.belowMinimum = "Already compressed";
+                row.belowMinimum = "已压缩";
         } else if (row.estimate.savedBytes() < 0) {
-            row.belowMinimum = format("Nothing to gain: it would grow by %.0f%%", -row.estimate.savedFraction() * 100);
+            row.belowMinimum = format("没有收益：会增大 %.0f%%", -row.estimate.savedFraction() * 100);
         } else if (row.estimate.savedFraction() < NothingToGain) {
             row.belowMinimum = "没有收益：已经是最小的了";
         } else if (!SavingRule::worthCompressing(row.estimate, options)) {
-            row.belowMinimum = "已排除：它" + SavingRule::reason(row.estimate, options);
+            row.belowMinimum = "已排除：" + SavingRule::reason(row.estimate, options);
         }
     }
     if (!row.byHand)

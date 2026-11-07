@@ -101,7 +101,7 @@ void App::showWhatsWaiting() {
             _saveProblemShown = _saveProblemShown || !problem.empty();
         }
         if (!problem.empty()) {
-            showMessage("That couldn't be saved", problem);
+            showMessage("保存失败", problem);
             return;
         }
 
@@ -137,15 +137,14 @@ void App::showWhatsWaiting() {
         _notes.clear();
     }
     if (!notes.empty()) {
-        showMessage("Last time", notes);
+        showMessage("上次运行时", notes);
         return;
     }
 
     // Once each time it's opened as an applet, as that's what has it short of memory, and the way round it isn't anything anyone would guess.
     if (_memoryLimited && !_appletSaid && _screen == Screen::Main) {
         _appletSaid = true;
-        showMessage("Opened as an applet", format("Opened from the album, the app only gets %s of memory to work with. Big games may not fit, and compressing takes longer, as each new copy has to be read back from the card. "
-                                                  "For all the memory there is, hold R while starting any game: the homebrew menu opens in its place, and this app opened from there gets about 3 GB.",
+        showMessage("以小程序模式启动", format("从相册打开时，本程序只能使用 %s 内存，大型游戏可能无法处理，压缩也会更慢，因为每份新副本都要从存储卡读回。想使用全部内存，请在启动任意游戏时按住 R 键：此时会打开自制程序菜单，从这里启动本程序可获得约 3 GB 内存。",
                                                   formatSize(sys::workMemory()).c_str()));
     }
 }
@@ -170,13 +169,14 @@ void App::catchUpWithDrives() {
         }
     }
     if (_drives.size() != before)
-        showToast(_drives.size() > before ? "USB drive found" : "USB drive taken out");
+        showToast(_drives.size() > before ? "检测到 USB 可移动设备" : "USB 可移动设备已拔出");
     if (_browser && _browser->path.empty())
         browseTo("");
 }
 
 /// So can a PC sharing its games: it's heard from a second or so after this opens, which is after the list has first been looked
-/// through, and it can be closed or plugged in at any time.
+/// through, and its sending service can stop or start at any time with the cable left in. The cable watcher probes it every few
+/// seconds, so one fresh look is enough to clear or bring back its games without unplugging anything.
 void App::catchUpWithPcs() {
     bool fromPcs = (_settings.fromPcNetwork || _settings.fromPcCable) && _settings.filesFolder.empty();
     // While choosing a folder, the PCs are among what there is to choose from.
@@ -198,10 +198,15 @@ void App::catchUpWithPcs() {
         sys::Lock lock(_pcsMutex);
         before = _pcsLookedIn;
     }
-    if (fromPcs && now != before) {
+    // A service can stop and start again with the cable still plugged in, and the files it shares
+    // can change while its folder name (pc:USB/) stays the same. Any change the watcher reports
+    // therefore gets one fresh look through the list, not just a change of folder names.
+    if (fromPcs) {
         quietenWorker();
         forgetFileScan();
-        showToast(now.size() >= before.size() ? "发现正在共享游戏的 PC" : "一台 PC 已停止共享游戏");
+        showToast(now.size() > before.size() ? "发现正在共享游戏的 PC"
+                  : now.size() < before.size() ? "一台 PC 已停止共享游戏"
+                  : "PC 共享内容已更新，正在刷新列表");
     }
 }
 
@@ -312,7 +317,7 @@ void App::updateOptions(u32 pressed, const InputState& input, double dt) {
                 found = i;
         }
         for (int i = 0; i < (int)_options.size() && found < 0; i++) {
-            if (_options[(size_t)i].label == "More settings" || _options[(size_t)i].label == "Fewer settings")
+            if (_options[(size_t)i].label == "更多设置" || _options[(size_t)i].label == "收起设置")
                 found = i;
         }
         if (found >= 0)

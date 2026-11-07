@@ -202,6 +202,11 @@ void startListening() {
 /// The console's USB port, set up the once as a device of its own with one way in and one way out, as libnx's usbComms would have it, so the
 /// driver the PC has for it is the same. Unlike usbComms, each transfer waits only so long and is then called off, so a PC that's gone leaves
 /// nothing waiting.
+/// When the cable last carried a request or an answer. A probe for the PC's sending service
+/// shares the one USB endpoint and its buffer with installations and list scans, so it must not
+/// cut into them.
+std::atomic<double> g_lastUsbTraffic{0};
+
 class UsbPort {
 public:
     static UsbPort& get() {
@@ -235,6 +240,7 @@ public:
     }
 
     void write(const u8* data, size_t size, u64 wait = WaitNanoseconds) {
+        g_lastUsbTraffic.store(sys::now(), std::memory_order_relaxed);
         while (size > 0) {
             size_t n = std::min(size, BufferSize);
             memcpy(_buffer, data, n);
@@ -248,6 +254,7 @@ public:
 
     /// Exactly as much as is asked for, as the PC sends each part of an answer on its own and asking for what it comes to is what ends each one.
     void read(u8* data, size_t size, u64 wait = WaitNanoseconds) {
+        g_lastUsbTraffic.store(sys::now(), std::memory_order_relaxed);
         constexpr int MostEmpty = 8;
         int empty = 0;
         while (size > 0) {
@@ -473,8 +480,10 @@ private:
 std::atomic<bool> g_usbLooked{false};
 bool g_usbWasThere = false;
 sys::Mutex g_usbMutex;
-/// The name of the PC on the cable, asked for each time it's plugged in, and again now and then until it says. Empty if it hasn't, as
-/// when hacbrewpacklz send isn't running, and then there's no PC on the cable to look in, only a PC with a driver for the console.
+/// The name of the PC on the cable, asked for when it's plugged in and checked every few seconds
+/// after that, so a service that stops sending is noticed without unplugging anything. Empty if
+/// nothing answers, as when hacbrewpacklz send isn't running: then there's no PC on the cable to
+/// look in, only a PC with a driver for the console.
 std::string g_usbName;
 
 bool usbToPc() {
@@ -514,9 +523,17 @@ std::string askUsbName() {
 }
 
 /// Asking the PC on the cable its name can take a few seconds when nothing there answers, so it's asked on a thread of its own, and
-/// whoever wants the list of PCs never waits for it. Once it says, the list has changed.
+/// whoever wants the list of PCs never waits for it. It's asked again every few seconds once it has answered, so a service that
+/// stops is noticed too. Either way the list has changed, and whoever looks after it can take another look.
 void watchCable() {
+    /// How often to retry while no service has answered, and how often to check one that has. The
+    /// PC can stop sending with the cable still plugged in, so a name asked for only once would
+    /// leave its games on the list until the cable was pulled and plugged back in.
     constexpr double AskAgainSeconds = 10;
+    constexpr double AliveCheckSeconds = 3;
+    /// A probe goes through the same endpoint as everything else, so it waits until the cable has
+    /// been quiet for this long, keeping out of the way of an install or a list scan.
+    constexpr double QuietSeconds = 2;
     bool asked = false;
     double askedAt = 0;
     while (!g_stopping) {
@@ -526,11 +543,23 @@ void watchCable() {
             sys::Lock lock(g_usbMutex);
             if (!there) {
                 asked = false;
+                if (!g_usbName.empty())
+                    g_changed = true;
                 g_usbName.clear();
-            } else if (!asked || (g_usbName.empty() && sys::now() - askedAt > AskAgainSeconds)) {
+            } else if (!asked) {
                 asked = true;
                 askedAt = sys::now();
                 ask = true;
+            } else {
+                double now = sys::now();
+                double interval = g_usbName.empty() ? AskAgainSeconds : AliveCheckSeconds;
+                // Leave the timestamp alone until a probe really goes out, so a busy cable only
+                // delays it instead of putting it off for another whole interval.
+                if (now - askedAt >= interval &&
+                    now - g_lastUsbTraffic.load(std::memory_order_relaxed) >= QuietSeconds) {
+                    askedAt = now;
+                    ask = true;
+                }
             }
         }
         if (ask) {

@@ -576,9 +576,9 @@ private:
     void buildOptions();
     void buildWelcome();
     void finishWelcome();
-    const char* verb() const { return _settings.compress ? "Compress" : "Repack"; }
-    const char* verbing() const { return _settings.compress ? "Compressing" : "Repacking"; }
-    const char* verbed() const { return _settings.compress ? "compressed" : "repacked"; }
+    const char* verb() const { return _settings.compress ? "压缩" : "重打包"; }
+    const char* verbing() const { return _settings.compress ? "正在压缩" : "正在重打包"; }
+    const char* verbed() const { return _settings.compress ? "压缩" : "重打包"; }
 
     // Input (app_input.cpp)
     void showWhatsWaiting();

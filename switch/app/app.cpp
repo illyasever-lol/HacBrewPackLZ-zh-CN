@@ -510,7 +510,7 @@ void App::checkForUpdate(bool byHand) {
         sys::Lock lock(_mutex);
         _updateState = "未联网";
         if (byHand) {
-            _updateNoticeTitle = "Not connected";
+            _updateNoticeTitle = "未连接";
             _updateNoticeText = "此主机未连接互联网。";
         }
         return;

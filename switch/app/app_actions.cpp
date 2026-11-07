@@ -11,7 +11,7 @@ void App::showMessage(const std::string& title, const std::string& text) {
     auto dialog = std::make_unique<Dialog>();
     dialog->title = title;
     dialog->paragraphs = {text};
-    dialog->choices = {{"OK", nullptr}};
+    dialog->choices = {{"确定", nullptr}};
     dialog->cancelChoice = 0;
     _dialog = std::move(dialog);
     _dirty = true;
@@ -31,8 +31,9 @@ void App::showAbout() {
     dialog->paragraphs.push_back("密钥：" + (_keysPath.empty() ? std::string("未找到") : _keysPath));
     if (_log)
         dialog->paragraphs.push_back("运行记录写入" + _logPath);
-    dialog->paragraphs.push_back("Free software under the GNU General Public License, version 2. USB drives are read with libusbhsfs, NTFS-3G and lwext4, under the same licence.");
-    dialog->choices = {{"OK", nullptr}};
+    dialog->paragraphs.push_back("本软件遵循 GNU 通用公共许可证第 2 版，为自由软件；USB 设备通过 libusbhsfs、NTFS-3G 与 lwext4 读取，三者同样遵循该许可证。");
+    dialog->paragraphs.push_back("汉化作者:illyasever https://space.bilibili.com/36010");
+    dialog->choices = {{"确定", nullptr}};
     dialog->cancelChoice = 0;
     _dialog = std::move(dialog);
     _dirty = true;
@@ -101,9 +102,9 @@ App::TickAction App::nextTickActionLocked() {
 const char* App::tickActionLabel(TickAction action) {
     switch (action) {
         case TickAction::All:
-            return "Tick all";
+            return "全部勾选";
         case TickAction::None:
-            return "Untick all";
+            return "全部取消勾选";
         case TickAction::WorthIt:
             break;
     }
@@ -120,7 +121,7 @@ void App::cycleTicks() {
     switch (action) {
         case TickAction::All:
             tickAll(true);
-            showToast("Everything ticked");
+            showToast("已全部勾选");
             break;
         case TickAction::None:
             tickAll(false);
@@ -194,11 +195,11 @@ void App::setTab(int tab) {
 std::string App::sortDescription() {
     switch (_settings.sort) {
         case 0:
-            return _sortedByGain[_tab] ? "best saving first" : "分析完成前按名称排序";
+            return _sortedByGain[_tab] ? "按节省空间排序" : "分析完成前按名称排序";
         case 1:
-            return "largest first";
+            return "按大小排序";
         default:
-            return "by name";
+            return "按名称排序";
     }
 }
 
@@ -297,7 +298,7 @@ void App::analyzeAgain() {
         _dirty = true;
     }
     _autoAnalyze[_tab] = true;
-    showToast(count == 1 ? "Analyzing it again" : format("Analyzing %d games again", count));
+    showToast(count == 1 ? "正在重新分析该游戏" : format("正在重新分析 %d 个游戏", count));
 }
 
 void App::refreshList() {
@@ -424,7 +425,7 @@ void App::pressQuit() {
     }
     bool analyzing = _analystRunning;
     auto dialog = std::make_unique<Dialog>();
-    dialog->title = "Quit hacBrewPackLZ?";
+    dialog->title = "退出 hacBrewPackLZ？";
     if (analyzing)
         dialog->paragraphs.push_back("仍在执行分析，已得出的结果会保留，剩余部分下次继续。");
     else if (updating)
@@ -488,7 +489,7 @@ bool App::askAboutGamesWithoutUpdates() {
 
     auto dialog = std::make_unique<Dialog>();
     bool one = names.size() == 1;
-    dialog->title = one ? "此游戏没有升级补丁" : format("%d games have no update", (int)names.size());
+    dialog->title = one ? "此游戏没有升级补丁" : format("%d 个游戏没有升级补丁", (int)names.size());
     dialog->paragraphs.push_back(std::string("关闭压缩时，重打包只能通过把升级补丁并入本体来缩小体积。") + (one ? "这个处理后体积不变，白费时间，可以取消勾选。" : "这些处理后体积不变，白费时间，可以取消勾选。"));
     dialog->paragraphs.push_back(someNames(names, 3) + ".");
     dialog->choices.push_back({one ? "取消勾选它" : "取消勾选它们", [this] {
@@ -548,15 +549,13 @@ void App::askToCompress() {
     bool replacing = _tab == TabInstalled && replacesInstalled();
     bool installing = _tab != TabInstalled && onConsole > 0;
     std::string word = installing ? "安装" : verb();
-    std::string lower = word;
-    lower[0] = (char)tolower((u8)lower[0]);
     if (count == 0) {
-        showMessage("未勾选任何游戏", "在要处理的游戏上按 A 键以" + lower + "，然后重试。");
+        showMessage("未勾选任何游戏", "请先在要处理的游戏上按 A 键勾选，然后重试。");
         return;
     }
 
     if (onConsole > 0 && _settings.compress && !_platform.firmwareReadsCompression()) {
-        showMessage("此固件版本过旧", "Games stored this way need firmware 12.0.0 or newer. Saving an NSP still works: you can choose that in the settings.");
+        showMessage("此固件版本过旧", "以此方式存储的游戏需要 12.0.0 或更高版本固件；仍可选择「保存为 NSP」，请在设置中调整。");
         return;
     }
 
@@ -565,27 +564,27 @@ void App::askToCompress() {
     if (toFile > 0) {
         sys::makeDirectories(folder);
         if (!sys::isDirectory(folder)) {
-            showMessage("无法访问该文件夹", "NSP 设置为存放到" + folder + "，但该位置不存在。如果在 USB 盘上，请插好；也可以在设置里另选文件夹。");
+            showMessage("无法访问该文件夹", "NSP 设置为存放到" + folder + "，但该位置不存在。如果在 USB 可移动设备上，请插好；也可以在设置里另选文件夹。");
             return;
         }
     }
     RoomPlan plan = planRoom();
     std::string notFitting = someNames(plan.wontFit, 3);
-    bool tooLarge = plan.reason.find("can't hold") != std::string::npos;
+    bool tooLarge = plan.reason.find("放不下") != std::string::npos;
     if (plan.order.empty()) {
         if (tooLarge)
-            showMessage("空间不足，无法容纳", notFitting + ": " + plan.reason + "。FAT32 单文件上限为 4 GB，需要改用 exFAT 或 NTFS。");
+            showMessage("空间不足，无法容纳", notFitting + "：" + plan.reason + "。FAT32 单文件上限为 4 GB，需要改用 exFAT 或 NTFS。");
         else
-            showMessage("There isn't enough room", format("%s: %s more needs to be free on %s.", notFitting.c_str(), formatSize(plan.mostNeeded).c_str(), plan.reason.c_str()));
+            showMessage("空间不足", format("%s：需要在 %s 上再腾出 %s 空间。", notFitting.c_str(), plan.reason.c_str(), formatSize(plan.mostNeeded).c_str()));
         return;
     }
 
     int going = (int)plan.order.size();
     auto dialog = std::make_unique<Dialog>();
-    dialog->title = going == 1 ? word + " this game?" : format("%s these %d games?", word.c_str(), going);
+    dialog->title = going == 1 ? word + "此游戏？" : format("%s这 %d 个游戏？", word.c_str(), going);
     auto say = [&](const std::string& paragraph) { dialog->paragraphs.push_back(paragraph); };
     if (saved > 0 && replacing)
-        say(unknown > 0 ? format("This frees about %s, and whatever the ones not analyzed yet gain.", formatSize(saved).c_str()) : format("This frees about %s.", formatSize(saved).c_str()));
+        say(unknown > 0 ? format("约可释放 %s，尚未分析的游戏还会带来额外收益。", formatSize(saved).c_str()) : format("约可释放 %s。", formatSize(saved).c_str()));
     if (replacing) {
         say(std::string(_settings.compress ? "每个游戏都会被自身的压缩副本替换。" : "每个游戏都会被自身的重打包副本替换，并把升级补丁并入其中。") + (_settings.checkResult ? "先写入并校验副本，确认无误后才删除原文件。" : "先写入副本，之后才删除原文件。") + "存档数据不会改动。");
         say("以此方式存储的游戏需要 sigpatches 才能启动，且官方更新无法覆盖安装。");
@@ -600,14 +599,14 @@ void App::askToCompress() {
         say(std::string(_settings.compress ? "一个压缩 NSP" : "一个 NSP") + "会保存到" + folder + "。文件本身不会被修改。");
     }
     if (extracted > 0 && !installing)
-        say(std::string(extracted == 1 ? "An NSP of the extracted game" : "每个解包后游戏的 NSP") + "会保存到" + folder + "，原文件夹不会被修改。");
+        say(std::string(extracted == 1 ? "该解包游戏的 NSP" : "每个解包后游戏的 NSP") + "会保存到" + folder + "，原文件夹不会被修改。");
     if (!notFitting.empty())
-        say(notFitting + (tooLarge ? ": " + plan.reason + "，因此已排除。" : format(": left out, as %s more would have to be free on %s.", formatSize(plan.mostNeeded).c_str(), plan.reason.c_str())));
+        say(notFitting + (tooLarge ? "：" + plan.reason + "，因此已排除。" : format("：需要在 %s 上再腾出 %s 空间，因此已排除。", plan.reason.c_str(), formatSize(plan.mostNeeded).c_str())));
     if (_memoryLimited)
-        say("This was opened from the album, which leaves little memory to work with. For big games, hold R while starting a game to open it instead.");
+        say("本程序从相册打开，可用内存较少；处理大型游戏时，请在启动任意游戏时按住 R 键，从自制程序菜单中打开本程序。");
     int battery = _platform.batteryPercent();
     if (battery >= 0 && battery < 30 && !_platform.isCharging())
-        say(format("The battery is at %d%%. It's best to plug the console in: this can take a while.", battery));
+        say(format("当前电量为 %d%%，建议接上电源：处理过程可能较久。", battery));
 
     std::vector<std::string> keys = plan.order;
     dialog->choices.push_back({word, [this, keys] {
@@ -665,13 +664,13 @@ void App::askToRemove(bool allTicked) {
         return;
     bool one = keys.size() == 1;
     std::string what = installed ? "卸载" : "删除";
-    std::string things = installed ? (one ? "game" : "games") : anyFolder && anyFile ? "项目" : anyFolder ? (one ? "文件夹" : "文件夹") : (one ? "文件" : "文件");
+    std::string things = installed ? "个游戏" : anyFolder && anyFile ? "个项目" : anyFolder ? "个文件夹" : "个文件";
     auto dialog = std::make_unique<Dialog>();
-    dialog->title = one ? what + " " + names[0] + "?" : format("%s %d %s?", what.c_str(), (int)keys.size(), things.c_str());
+    dialog->title = one ? what + "「" + names[0] + "」？" : format("%s %d %s？", what.c_str(), (int)keys.size(), things.c_str());
     // Most of a list can be ticked without anyone having ticked it, so it says exactly what's about to go.
     if (!one)
         dialog->paragraphs.push_back(someNames(names, 6) + ".");
-    dialog->paragraphs.push_back(installed ? format("This takes %s off the console, with updates and DLC. Save data stays.", formatSize(bytes).c_str()) : format("This deletes %s. It can't be undone.", formatSize(bytes).c_str()));
+    dialog->paragraphs.push_back(installed ? format("将从主机移除 %s（含升级补丁与 DLC），存档数据保留。", formatSize(bytes).c_str()) : format("将删除 %s，此操作无法撤销。", formatSize(bytes).c_str()));
     dialog->choices.push_back({one ? "保留文件" : "保留它们", nullptr});
     dialog->choices.push_back({what, [this, keys] {
         doWhenFree([this, keys] {
@@ -760,15 +759,15 @@ void App::openMenu(int page) {
                 addSetting(label, [this, flag]() -> std::string { return _settings.*flag ? "显示" : "不显示"; }, [this, flag](int) { toggleSource(_settings.*flag); });
             };
             source("SD 卡", &Settings::fromSd);
-            source("USB 驱动器", &Settings::fromUsb);
+            source("USB 可移动设备", &Settings::fromUsb);
             source("网络上的电脑", &Settings::fromPcNetwork);
-            source("A PC on the USB cable", &Settings::fromPcCable);
+            source("通过 USB 数据线连接的电脑", &Settings::fromPcCable);
             add(_settings.filesFolder.empty() ? "仅搜索一个文件夹" : "仅搜索文件夹：" + _settings.filesFolder, [this] { chooseFilesFolder(); });
             break;
         }
         case MenuThisGame:
             if (!facts.about.empty()) {
-                add(format("About this game (%d)", (int)facts.about.size()), [this, about = facts.about, name = facts.aboutName] {
+                add(format("关于此游戏 (%d)", (int)facts.about.size()), [this, about = facts.about, name = facts.aboutName] {
                     _menu.reset();
                     showMessage(name, joined(about, "\n\n"));
                 });
@@ -798,11 +797,11 @@ void App::openMenu(int page) {
             if (facts.rows > 0 && facts.ticked == 0)
                 add("重新分析所有游戏", [this] { analyzeAgain(); });
             if (facts.doneHidden > 0)
-                add(format("Show the games that are done (%d)", facts.doneHidden), [this] { setHideDone(false); });
+                add(format("显示已完成的游戏 (%d)", facts.doneHidden), [this] { setHideDone(false); });
             else if (facts.doneShown > 0)
                 add("隐藏已完成的游戏", [this] { setHideDone(true); });
             if (facts.hidden > 0)
-                add(format("Show the hidden games again (%d)", (int)facts.hidden), [this] { showHidden(); });
+                add(format("重新显示隐藏的游戏 (%d)", (int)facts.hidden), [this] { showHidden(); });
             break;
         default:
             addSetting("排序方式", [this]() -> std::string {
@@ -814,13 +813,13 @@ void App::openMenu(int page) {
             if (_analystRunning && _analyzingTab == _tab)
                 add("停止分析", [this] { stopAnalyzing(); });
             else if (!_autoAnalyze[_tab] && facts.toAnalyze > 0)
-                add(format("Go on analyzing (%d left)", (int)facts.toAnalyze), [this] { _autoAnalyze[_tab] = true; });
+                add(format("继续分析（剩余 %d 个）", (int)facts.toAnalyze), [this] { _autoAnalyze[_tab] = true; });
             if (_tab != TabInstalled)
                 addPage("搜索位置", MenuSources);
             if (facts.rows > 0)
                 addPage("此游戏", MenuThisGame);
             if (facts.ticked > 0)
-                addPage(format("Ticked games (%d)", facts.ticked), MenuTicked);
+                addPage(format("已勾选的游戏 (%d)", facts.ticked), MenuTicked);
             addPage("列表", MenuList);
             break;
     }
@@ -886,7 +885,7 @@ void App::browseTo(std::string path) {
             continue;
         std::string note;
         try {
-            note = names.size() <= MostToLookInto && ExtractedGame::isOne(full) ? "Extracted game" : "";
+            note = names.size() <= MostToLookInto && ExtractedGame::isOne(full) ? "已解包游戏" : "";
         } catch (const ToolError&) {
         }
         browser.entries.push_back(Browser::Entry{name, full, note});
@@ -969,12 +968,12 @@ std::string App::shownFolder(const std::string& path, const char* otherwise) {
 }
 
 static std::function<std::string()> onOff(const bool& setting) {
-    return [&setting] { return setting ? std::string("On") : std::string("Off"); };
+    return [&setting] { return setting ? std::string("开") : std::string("关"); };
 }
 
 App::OptionItem App::installedGamesOption(const char* section) {
-    return OptionItem{section, "已安装游戏", "Replacing frees the space, once the new copy has been written. Saving an NSP leaves the game as it is and frees nothing.",
-                      [this] { return replacesInstalled() ? std::string("替换它们") : std::string("Save an NSP"); },
+    return OptionItem{section, "已安装游戏", "选择「替换它们」时，写入新副本后会释放原文件占用的空间；选择「保存为 NSP」则保留游戏原样，不释放空间。",
+                      [this] { return replacesInstalled() ? std::string("替换它们") : std::string("保存为 NSP"); },
                       [this](int) {
                           _settings.replaceInstalled = !_settings.replaceInstalled;
                           saveSettings();
@@ -983,7 +982,7 @@ App::OptionItem App::installedGamesOption(const char* section) {
 
 App::OptionItem App::gameFilesOption(const char* section, const char* help) {
     return OptionItem{section, "游戏文件和文件夹", help,
-                      [this] { return _settings.installFiles ? std::string("安装它们") : std::string("Save an NSP"); },
+                      [this] { return _settings.installFiles ? std::string("安装它们") : std::string("保存为 NSP"); },
                       [this](int) {
                           _settings.installFiles = !_settings.installFiles;
                           saveSettings();
@@ -994,7 +993,7 @@ App::OptionItem App::gameFilesOption(const char* section, const char* help) {
 }
 
 App::OptionItem App::nspFolderOption(const char* section) {
-    return OptionItem{section, "NSP 输出位置", "按 A 键选择 SD 卡或 USB 盘上的文件夹。",
+    return OptionItem{section, "NSP 输出位置", "按 A 键选择 SD 卡或 USB 可移动设备上的文件夹。",
                       [this] { return shownFolder(nspFolder(), ""); },
                       [this](int) {
                           browse("NSP 输出位置", nspFolder(), "使用默认文件夹", [this](const std::string& path) {
@@ -1006,8 +1005,8 @@ App::OptionItem App::nspFolderOption(const char* section) {
 }
 
 App::OptionItem App::minimumSavingOption(const char* section) {
-    return OptionItem{section, "最小节省比例", "Games that would save less than this are left unticked, so the time goes where it gains the most. You can still tick them yourself.",
-                      [this] { return _settings.minSaving == 0 ? std::string("Off") : format("%d%%", _settings.minSaving); },
+    return OptionItem{section, "最小节省比例", "节省比例低于此值的游戏默认不勾选，把时间用在收益最大的游戏上；仍可手动勾选。",
+                      [this] { return _settings.minSaving == 0 ? std::string("关闭") : format("%d%%", _settings.minSaving); },
                       [this](int direction) {
                           _settings.minSaving = nextChoice(MinSavingChoices, _settings.minSaving, direction);
                           saveSettings();
@@ -1018,7 +1017,7 @@ App::OptionItem App::minimumSavingOption(const char* section) {
 }
 
 App::OptionItem App::autoUpdateOption(const char* section) {
-    return OptionItem{section, "自动更新", "Each time it opens, it looks for a newer version and installs it, if the console is online. Whatever it gets has to carry the right signature.", onOff(_settings.autoUpdate),
+    return OptionItem{section, "自动更新", "每次启动时，若主机联网会检查并安装新版本；下载的版本必须通过签名校验。", onOff(_settings.autoUpdate),
                       [this](int) {
                           _settings.autoUpdate = !_settings.autoUpdate;
                           saveSettings();
@@ -1063,11 +1062,11 @@ void App::buildOptions() {
         sys::Lock lock(_mutex);
         _dirty = true;
     });
-    add(section, "隐藏已完成的游戏", "Leaves off what there's nothing left to do with: installed games once they're compressed, and game files once their game is installed compressed, or once they're compressed if they're saved as NSPs. The + menu brings them back.",
+    add(section, "隐藏已完成的游戏", "隐藏无需再处理的条目：已压缩的已安装游戏、已压缩安装的游戏文件，以及保存为 NSP 后已压缩的游戏文件。可在 + 菜单中重新显示。",
         onOff(_settings.hideCompressed), [this](int) { setHideDone(!_settings.hideCompressed); });
 
     section = "压缩";
-    add(section, "压缩", "Off, games are repacked just as they are, with an update made part of the game and no ticket needed. That's quicker, and a game only comes out smaller if it had an update.", onOff(_settings.compress), [this](int) {
+    add(section, "压缩", "关闭时按原样重打包，把升级补丁并入游戏且无需票据，速度更快，但只有带升级补丁的游戏才会变小。", onOff(_settings.compress), [this](int) {
         _settings.compress = !_settings.compress;
         compressionChanged();
         // What only goes with compressing comes and goes with it.
@@ -1086,18 +1085,18 @@ void App::buildOptions() {
 
     section = "处理方式";
     _options.push_back(installedGamesOption(section));
-    _options.push_back(gameFilesOption(section, "Saving leaves an NSP in the NSP folder. Installing puts the game where Install games to says, ready to play. The + menu can also install what's ticked, whatever this says."));
+    _options.push_back(gameFilesOption(section, "选择「保存为 NSP」会把游戏保存到 NSP 文件夹；选择「安装它们」会按「安装游戏到」的设置安装，装好即可游玩。无论此处如何设置，都可在 + 菜单中安装已勾选的游戏。"));
     add(section, "安装游戏到", "从文件或文件夹添加的游戏存放位置；已安装的游戏被替换时仍在原位置。",
-        [this] { return _settings.installToConsole ? std::string("Console") : std::string("SD 卡"); }, toggle(_settings.installToConsole));
-    add(section, "文件安装完成后", "Deleting frees the room the file took up, and only happens once the game has been installed and checked. Nothing else ever touches a file.",
+        [this] { return _settings.installToConsole ? std::string("主机内存") : std::string("SD 卡"); }, toggle(_settings.installToConsole));
+    add(section, "文件安装完成后", "删除文件会释放其占用空间，且只在游戏安装并校验完成后才执行；其他操作不会改动文件。",
         [this] { return _settings.deleteInstalled ? std::string("删除文件") : std::string("保留文件"); }, toggle(_settings.deleteInstalled));
-    add(section, "校验写入内容", "Compares what's written with what it should be, and reads some of the game back through the new copy before the original goes. Off is quicker, as whatever fits in memory then doesn't have to be read back at all, but a failing card wouldn't get caught.",
+    add(section, "校验写入内容", "把写入的内容与应有数据比对，并在删除原文件前通过新副本回读部分游戏数据。关闭时速度更快（内存中的数据无需回读），但无法发现存储卡故障。",
         onOff(_settings.checkResult), toggle(_settings.checkResult));
     add(section, "提升处理器频率", "耗时更短但工作时更耗电，与主机加载游戏时的状态类似。", onOff(_settings.boost), toggle(_settings.boost));
 
     section = "文件夹";
     _options.push_back(nspFolderOption(section));
-    add(section, "解包输出位置", "按 A 键选择 SD 卡或 USB 盘上的文件夹，其中的游戏文件会出现在列表中。", [this] { return shownFolder(extractFolder(), ""); }, [this](int) {
+    add(section, "解包输出位置", "按 A 键选择 SD 卡或 USB 可移动设备上的文件夹，其中的游戏文件会出现在列表中。", [this] { return shownFolder(extractFolder(), ""); }, [this](int) {
         browse("解包输出位置", extractFolder(), "使用默认文件夹", [this](const std::string& path) {
             quietenWorker();
             _settings.extractFolder = path;
@@ -1108,7 +1107,7 @@ void App::buildOptions() {
 
     section = "本程序";
     _options.push_back(autoUpdateOption(section));
-    add(section, "记录日志", "Writes what the app does to a file on the SD card, which is what to look at or send if something goes wrong. It takes a little more writing to the card.", onOff(_settings.writeLog), [this](int) {
+    add(section, "记录日志", "把程序的运行过程写入 SD 卡上的文件，出问题时可查看或发送给他人协助排查；会略微增加对存储卡的写入。", onOff(_settings.writeLog), [this](int) {
         _settings.writeLog = !_settings.writeLog;
         saveSettings();
         {
@@ -1145,7 +1144,7 @@ void App::buildOptions() {
             return std::any_of(std::begin(OnlyWhenCompressing), std::end(OnlyWhenCompressing), [&](const char* label) { return item.label == label; });
         }), _options.end());
     }
-    _options.push_back(OptionItem{"", _settings.moreSettings ? "Fewer settings" : "More settings", "压缩级别、写入校验、更新等平时很少需要改动的设置。", [] { return std::string(); }, [this](int) {
+    _options.push_back(OptionItem{"", _settings.moreSettings ? "收起设置" : "更多设置", "压缩级别、写入校验、更新等平时很少需要改动的设置。", [] { return std::string(); }, [this](int) {
         _settings.moreSettings = !_settings.moreSettings;
         saveSettings();
         _rebuildOptions = true;
@@ -1157,9 +1156,9 @@ void App::buildWelcome() {
     _welcome.clear();
     const char* section = "压缩时";
     _welcome.push_back(installedGamesOption(section));
-    _welcome.push_back(gameFilesOption(section, "Installing puts the game on the console, ready to play, compressed as it goes in. Saving leaves an NSP in the NSP folder."));
+    _welcome.push_back(gameFilesOption(section, "选择「安装它们」会把游戏压缩后直接装到主机，装好即可游玩；选择「保存为 NSP」则把 NSP 保存到 NSP 文件夹。"));
     _welcome.push_back(nspFolderOption(section));
-    _welcome.push_back(OptionItem{section, "校验写入内容", "Not checking is what most people want. Checking reads every byte back from the card and compares it before the original goes, which catches a failing card and takes a good deal longer.",
+    _welcome.push_back(OptionItem{section, "校验写入内容", "不校验是多数人的选择，速度更快；开启校验会在删除原文件前把每个字节读回比对，能发现存储卡故障，但耗时会明显增加。",
                                   [this] { return _settings.checkResult ? std::string("是，更安全") : std::string("否，更快"); },
                                   [this](int) {
                                       _settings.checkResult = !_settings.checkResult;

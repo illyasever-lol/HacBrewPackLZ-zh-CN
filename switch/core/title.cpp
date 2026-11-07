@@ -992,7 +992,7 @@ NcaInfo TitleConverter::writeContent(TitleOutput& output, const ContentPair& con
         SectionSource source;
         content.sectionAt(i, source);
         if (plan(content, source, _options) == Plan::CompressRomFs)
-            compressInto(builder, i, source.owner->openRomFsImage(*source.section, source.original), "Compressing the game data");
+            compressInto(builder, i, source.owner->openRomFsImage(*source.section, source.original), "正在压缩游戏数据");
         else
             builder.add(i, buildSection(content, source, sign));
     }
@@ -1123,7 +1123,7 @@ void TitleConverter::build(const ExtractedGame& game, TitleOutput& output) {
             NcaStream& stream = output.beginNca(label, -1, ".nca");
             NcaBuilder builder(*_writer, stream, std::max<i64>(_options.holdInMemory - needed, 0), _options.checkResult);
             builder.add(0, std::move(exefs));
-            compressInto(builder, 1, image, "Compressing the game data");
+            compressInto(builder, 1, image, "正在压缩游戏数据");
             if (logo)
                 builder.add(2, std::move(*logo));
             info = builder.finish(NcaContentType::Program, titleId, !_options.noSign, 0, BuildSdkVersion);
@@ -2007,8 +2007,8 @@ bool worthCompressing(const SizeEstimate& estimate, const ConvertOptions& option
 std::string reason(const SizeEstimate& estimate, const ConvertOptions& options) {
     double percent = estimate.savedFraction() * 100;
     if (estimate.savedBytes() >= 0)
-        return format("saves only %.0f%%, below the %d%% minimum", percent, options.minSavingPercent);
-    return format("would grow by %.0f%%, below the %d%% minimum", -percent, options.minSavingPercent);
+        return format("仅节省 %.0f%%，低于 %d%% 的最低要求", percent, options.minSavingPercent);
+    return format("反而增大 %.0f%%，低于 %d%% 的最低要求", -percent, options.minSavingPercent);
 }
 
 }  // namespace SavingRule

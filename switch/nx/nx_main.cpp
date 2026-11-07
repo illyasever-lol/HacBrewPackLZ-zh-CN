@@ -77,7 +77,7 @@ void noteFolder(const char* when) {
 class NxPlatform : public Platform {
 public:
     explicit NxPlatform(std::string program) : _program(std::move(program)) {
-        noteOpening("USB 驱动器");
+        noteOpening("USB 可移动设备");
         _usb = R_SUCCEEDED(usbHsFsInitialize(0));
         noteOpening("网络");
         _nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
@@ -108,7 +108,7 @@ public:
         hbp::stopSockets();
         if (_nifm)
             nifmExit();
-        noteOpening("正在关闭 USB 盘");
+        noteOpening("正在关闭 USB 可移动设备");
         if (_usb)
             usbHsFsExit();
         noteOpening("正在关闭其余服务");

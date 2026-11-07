@@ -584,7 +584,7 @@ internal sealed class Session : IUiSink, IDisposable
         string? first;
         lock (_gate)
             first = _log.FirstOrDefault(l => l.Level == UiLevel.Error)?.Text;
-        Finish(passed ? "全部检查通过。" : $"The NSP has problems: {first ?? "it failed a check"}", passed ? UiLevel.Success : UiLevel.Error);
+        Finish(passed ? "全部检查通过。" : $"此 NSP 存在问题：{first ?? "未通过检查"}", passed ? UiLevel.Success : UiLevel.Error);
     });
 
     /// <summary>Shares every game on the list with a Switch until it's stopped, hidden ones too, as what to install is chosen on the Switch. Ticks
@@ -962,7 +962,7 @@ internal sealed class Session : IUiSink, IDisposable
             _gameFolders.Clear();
             foreach (var (key, folder) in opened)
             {
-                string detail = folder.Version > 0 ? $"game folder v{folder.Version}" : "游戏文件夹";
+                string detail = folder.Version > 0 ? $"游戏文件夹 v{folder.Version}" : "游戏文件夹";
                 var row = new TitleRow(key, folder.Name, detail, folder.Bytes, [folder.Path]) { IsFolder = true, Icon = folder.Icon };
                 if (previous.TryGetValue(key, out var known))
                     row = known with { Name = row.Name, Detail = row.Detail, InputBytes = row.InputBytes, Icon = row.Icon };

@@ -13,7 +13,7 @@ using namespace app;
 
 namespace {
 
-constexpr const char* StepCompress = "Compress";
+constexpr const char* StepCompress = "压缩";
 /// Installing what's already compressed only copies it across, without compressing any of it again.
 constexpr const char* StepCopy = "复制过去";
 constexpr const char* StepPrepare = "准备就绪";
@@ -269,19 +269,19 @@ void App::needRoom(Storage storage, i64 output) {
     i64 needed = output + RoomToSpare;
     i64 free = _console ? _console->freeBytes(storage) : sys::freeSpace(_platform.dataFolder());
     if (free < needed)
-        throw ToolError(format("It needs %s free on %s while it works, and there's %s. Compressing smaller games first can make room", formatSize(needed).c_str(), storageName(storage), formatSize(free).c_str()));
+        throw ToolError(format("处理过程中需要 %s 上的 %s 可用空间，目前只有 %s。先压缩较小的游戏可腾出空间", storageName(storage), formatSize(needed).c_str(), formatSize(free).c_str()));
 }
 
 void App::needRoomIn(const std::string& folder, i64 output) {
     sys::makeDirectories(folder);
     if (!sys::isDirectory(folder))
-        throw ToolError("文件夹" + folder + "无法访问。如果在 USB 盘上，请确认已插好。");
+        throw ToolError("文件夹" + folder + "无法访问。如果在 USB 可移动设备上，请确认已插好。");
     if (output >= sys::largestFile(folder))
-        throw ToolError(format("It comes to %s, and %s can't hold a file that large. FAT32 stops at 4 GB, so exFAT or NTFS is what it takes", formatSize(output).c_str(), folder.c_str()));
+        throw ToolError(format("输出大小为 %s，%s 放不下这么大的文件。FAT32 单文件上限为 4 GB，需改用 exFAT 或 NTFS", formatSize(output).c_str(), folder.c_str()));
     i64 needed = output + RoomToSpare;
     i64 free = sys::freeSpace(folder);
     if (free < needed)
-        throw ToolError(format("It needs %s free in %s, and there's %s", formatSize(needed).c_str(), folder.c_str(), formatSize(free).c_str()));
+        throw ToolError(format("需要 %s 可用空间于 %s，目前只有 %s", formatSize(needed).c_str(), folder.c_str(), formatSize(free).c_str()));
 }
 
 bool App::goesOnConsole(const Row& row) const {
@@ -324,7 +324,7 @@ App::RoomPlan App::planRoom() {
             item.peak = output + RoomToSpare;
             if (goesOnConsole(*row)) {
                 bool toConsole = row->tab == TabInstalled ? row->storage == Storage::Nand : _settings.installToConsole;
-                item.pool = toConsole ? "Console" : "SD";
+                item.pool = toConsole ? "主机内存" : "SD";
                 item.change = (row->tab == TabInstalled ? row->now : 0) - output;
                 if (row->tab != TabInstalled && row->extracted.empty() && _settings.deleteInstalled && !toConsole && poolOf(row->mainFile) == "SD")
                     item.change += row->now;
@@ -332,7 +332,7 @@ App::RoomPlan App::planRoom() {
                 item.pool = poolOf(folder);
                 item.change = -output;
                 if (output >= sys::largestFile(folder))
-                    item.tooLarge = format("%s can't hold a file of %s", folder.c_str(), formatSize(output).c_str());
+                    item.tooLarge = format("%s 放不下 %s 的文件", folder.c_str(), formatSize(output).c_str());
             }
             items.push_back(std::move(item));
         }
@@ -344,7 +344,7 @@ App::RoomPlan App::planRoom() {
         if (found != free.end())
             return found->second;
         i64 bytes;
-        if (pool == "Console")
+        if (pool == "主机内存")
             bytes = _console ? _console->freeBytes(Storage::Nand) : 0;
         else if (pool == "SD")
             bytes = _console ? _console->freeBytes(Storage::Sd) : sys::freeSpace(folder);
@@ -377,7 +377,7 @@ App::RoomPlan App::planRoom() {
         if (!items[i].tooLarge.empty())
             plan.reason = items[i].tooLarge;
         else if (plan.reason.empty())
-            plan.reason = items[i].pool == "Console" ? "主机" : items[i].pool == "SD" ? "SD 卡" : "USB 盘";
+            plan.reason = items[i].pool == "主机内存" ? "主机" : items[i].pool == "SD" ? "SD 卡" : "USB 可移动设备";
     }
     return plan;
 }
@@ -517,8 +517,8 @@ void App::endGameLocked() {
 }
 
 void App::noteWorkLocked(const char* label, i64 done) {
-    static const char* const firstPass[] = {"正在删除", "Compressing the game data", "正在校验游戏数据", "正在校验其他部分", "正在写入", "正在解包", "正在读取全部内容"};
-    static const char* const secondPass[] = {"Checking every byte", "正在校验写入内容", "正在计算其哈希"};
+    static const char* const firstPass[] = {"正在删除", "正在压缩游戏数据", "正在校验游戏数据", "正在校验其他部分", "正在写入", "正在解包", "正在读取全部内容"};
+    static const char* const secondPass[] = {"正在逐字节校验", "正在校验写入内容", "正在计算其哈希"};
     int kind = -1;
     for (const char* prefix : firstPass)
         kind = strncmp(label, prefix, strlen(prefix)) == 0 ? 0 : kind;
@@ -566,14 +566,14 @@ void App::noteStepLocked(const char* label) {
         const char* step;
     };
     static const Stage compressing[] = {
-        {"Compressing the game data", StepCompress},
+        {"正在压缩游戏数据", StepCompress},
         {"正在写入", StepCompress},
         {"正在写入", StepCopy},
         {"正在校验写入内容", StepCheckNsp},
         {"正在计算哈希", StepHash},
         {"正在计算哈希", StepCheckNsp},
         {"正在计算其哈希", StepHash},
-        {"Checking every byte", StepCheck},
+        {"正在逐字节校验", StepCheck},
         {"让固件接管", StepFirmware},
         {"正在读取新副本", StepFirmware},
         {"正在替换", StepSwap},
@@ -582,7 +582,7 @@ void App::noteStepLocked(const char* label) {
         {"正在校验游戏数据", StepPrepare},
         {"正在校验其他部分", StepPrepare},
         {"正在写入", StepWrite},
-        {"Checking every byte", StepCheck},
+        {"正在逐字节校验", StepCheck},
         {"让固件接管", StepFirmware},
         {"正在读取新副本", StepFirmware},
         {"正在替换", StepSwap},
@@ -623,7 +623,7 @@ InstalledGame App::whatsInstalled(u64 application, u32 versionComing, bool whole
     for (auto& meta : game.metas) {
         bool sameTitle = wholeGame ? meta.key.type != Cnmt::MetaAddOnContent : meta.key.id == titleId;
         if (sameTitle && meta.key.version > versionComing)
-            throw ToolError(format("A newer version of this is already installed (v%u, and this file is v%u)", meta.key.version, versionComing));
+            throw ToolError(format("主机上已安装更新的版本（v%u，而此文件为 v%u）", meta.key.version, versionComing));
     }
     return game;
 }
@@ -651,13 +651,13 @@ bool App::consoleReadsWhatsMade(const std::vector<std::string>& keys) {
         try {
             replacer().checkConsole(storage, convertOptions(), _keyset);
             _consoleChecked.insert(storage);
-            logLine(format("This console reads compressed games from %s", storageName(storage)));
+            logLine(format("本主机可从 %s 读取压缩游戏", storageName(storage)));
         } catch (const Cancelled&) {
-            finishJob("Stopped", "未做任何改动。");
+            finishJob("已停止", "未做任何改动。");
             return false;
         } catch (const ToolError& e) {
             logLine(e.what());
-            finishJob("Nothing was changed", e.what());
+            finishJob("没有改动任何内容", e.what());
             return false;
         }
     }
@@ -708,7 +708,7 @@ void App::compress(const std::vector<std::string>& keys) {
             logLine(copy.name + ": " + result.message);
         } catch (const std::bad_alloc&) {
             state = RowState::Failed;
-            result.message = _memoryLimited ? "There isn't enough memory for this one here. Hold R while starting a game to open this app with all the memory there is" : NotEnoughMemory;
+            result.message = _memoryLimited ? "当前可用内存不足，无法处理该游戏。请在启动任意游戏时按住 R 键，从自制程序菜单中打开本程序以使用全部内存" : NotEnoughMemory;
             logLine(copy.name + ": " + result.message);
         }
 
@@ -750,7 +750,7 @@ void App::compress(const std::vector<std::string>& keys) {
             if (leftOut)
                 result.outcome = "已排除";
             else if (state == RowState::Done)
-                result.outcome = frees || goesOnConsole(copy) ? format("Now %s", formatSize(result.after).c_str()) : format("Saved as %s", formatSize(result.after).c_str());
+                result.outcome = frees || goesOnConsole(copy) ? format("压缩后 %s", formatSize(result.after).c_str()) : format("保存为 %s", formatSize(result.after).c_str());
             else
                 result.outcome = partly ? "部分完成" : "未改动";
             _results.push_back(result);
@@ -792,7 +792,7 @@ void App::compress(const std::vector<std::string>& keys) {
         updateFreeSpace();
     } catch (const ToolError&) {
     }
-    finishJob(stopped ? "Stopped" : anyFailed ? "已完成，但有问题" : "Finished", detail);
+    finishJob(stopped ? "已停止" : anyFailed ? "已完成，但有问题" : "已完成", detail);
 }
 
 /// How it went, in a sentence.
@@ -811,14 +811,14 @@ std::string App::compressSummary(double seconds) {
         }
         freed = _jobFreed;
     }
-    std::string detail = finished == 1 ? format("1 game %s", verbed()) : format("%d games %s", finished, verbed());
+    std::string detail = finished == 1 ? format("1 个游戏已%s", verbed()) : format("%d 个游戏已%s", finished, verbed());
     if (left > 0)
-        detail += format(", %d left out as not worth it", left);
+        detail += format("，%d 个收益过低已跳过", left);
     if (failed > 0)
-        detail += format(", %d couldn't be done", failed);
+        detail += format("，%d 个未能完成", failed);
     if (freed > 0)
-        detail += format(". %s freed", formatSize(freed).c_str());
-    detail += format(" in %s.", formatElapsed(seconds).c_str());
+        detail += format("，已释放 %s", formatSize(freed).c_str());
+    detail += format("，压缩用时 %s。", formatElapsed(seconds).c_str());
     return detail;
 }
 
@@ -1032,7 +1032,7 @@ void App::deleteInstalledFiles(const std::vector<std::string>& installed, std::s
     }
     sys::commit(nspFolder());
     if (deleted > 0)
-        detail += deleted == 1 ? " 1 file deleted." : format(" %d files deleted.", deleted);
+        detail += deleted == 1 ? "，已删除 1 个文件。" : format("，已删除 %d 个文件。", deleted);
 }
 
 // -------------------------------------------------------------------------------------------------------------------
@@ -1091,7 +1091,7 @@ void App::workThrough(const std::vector<std::string>& keys, const char* whenItFa
         _results.push_back(result);
         endGameLocked();
     }
-    finishJob(stopped ? "Stopped" : failed > 0 ? "已完成，但有问题" : "Finished", summary(failed, sys::now() - started));
+    finishJob(stopped ? "已停止" : failed > 0 ? "已完成，但有问题" : "已完成", summary(failed, sys::now() - started));
 }
 
 /// What a game's work is done on: the titles of an installed game, or of the files of a game file's row with its DLC.
@@ -1112,16 +1112,16 @@ void App::extract(const std::vector<std::string>& keys) {
     workThrough(keys, "未解包", [&](const Row& row, ResultLine& result) {
         sys::makeDirectories(output);
         if (!sys::isDirectory(output))
-            throw ToolError("文件夹" + output + "无法访问。如果在 USB 盘上，请确认已插好。");
+            throw ToolError("文件夹" + output + "无法访问。如果在 USB 可移动设备上，请确认已插好。");
         i64 free = sys::freeSpace(output);
         if (free < row.now + RoomToSpare)
-            throw ToolError(format("It needs at least %s free in %s, and there's %s", formatSize(row.now + RoomToSpare).c_str(), output.c_str(), formatSize(free).c_str()));
+            throw ToolError(format("至少需要 %s 可用空间于 %s，目前只有 %s", formatSize(row.now + RoomToSpare).c_str(), output.c_str(), formatSize(free).c_str()));
         i64 bytes = 0;
         forEachTitle(row, [&](const TitleJob& job, const TitleSet& set) {
             // There's no use in doing it again over what's there, and half a game left behind would look like a whole one on the list.
             std::string folder = extractedFolderOf(job, set, output);
             if (ExtractedGame::isOne(folder))
-                throw ToolError("它已位于" + folder + ". To extract it again, delete it from Game files first, showing the games that are done from the + menu if it's hidden");
+                throw ToolError("它已位于" + folder + "。如需再次解包，请先在「游戏文件」中删除它；若已隐藏，可在 + 菜单中显示已完成的游戏");
             // Whatever's left of a folder that isn't a whole game is no use to anyone.
             sys::removeTree(folder);
             try {
@@ -1131,9 +1131,9 @@ void App::extract(const std::vector<std::string>& keys) {
                 throw;
             }
         });
-        result.outcome = format("%s extracted", formatSize(bytes).c_str());
+        result.outcome = format("%s 已解包", formatSize(bytes).c_str());
         result.after = bytes;
-    }, [&](int, double seconds) { return format("Extracted to %s, in %s.", output.c_str(), formatElapsed(seconds).c_str()); });
+    }, [&](int, double seconds) { return format("已解包到 %s，位于 %s。", output.c_str(), formatElapsed(seconds).c_str()); });
     closeOpenJob();
     forgetFileScan();
 }
@@ -1145,8 +1145,8 @@ void App::check(const std::vector<std::string>& keys) {
         forEachTitle(row, [&](const TitleJob& job, const TitleSet&) { checkTitle(job, temp); });
         result.outcome = "文件完整";
     }, [&](int failed, double seconds) {
-        std::string what = failed == 0 ? "Every game read back as it should" : failed == 1 ? "One game didn't read back as it should" : format("%d games didn't read back as they should", failed);
-        return format("%s, in %s.", what.c_str(), formatElapsed(seconds).c_str());
+        std::string what = failed == 0 ? "所有游戏回读校验均正常" : failed == 1 ? "有 1 个游戏回读校验异常" : format("有 %d 个游戏回读校验异常", failed);
+        return format("%s，用时 %s。", what.c_str(), formatElapsed(seconds).c_str());
     });
     closeOpenJob();
 }
@@ -1160,7 +1160,7 @@ void App::remove(const std::vector<std::string>& keys) {
         closeOpenJob();
         if (row.tab == TabInstalled) {
             uninstall(row);
-            result.outcome = "Uninstalled";
+            result.outcome = "已卸载";
         } else if (!row.extracted.empty()) {
             deleteFolder(row.extracted);
             paths.push_back(row.extracted);
@@ -1180,7 +1180,7 @@ void App::remove(const std::vector<std::string>& keys) {
         result.after = 0;
         removed.push_back(row.key);
         logLine(result.outcome + " " + row.name);
-    }, [&](int failed, double seconds) { return failed == 0 ? format("Done in %s.", formatElapsed(seconds).c_str()) : failed == 1 ? std::string("其中一项保持原样未动。") : format("%d of them have been left where they were.", failed); });
+    }, [&](int failed, double seconds) { return failed == 0 ? format("已完成，用时 %s。", formatElapsed(seconds).c_str()) : failed == 1 ? std::string("其中一项保持原样未动。") : format("其中 %d 个保持原样未改动。", failed); });
 
     updateFreeSpace();
     // However it went, what the lists say has to go by what's there now.

@@ -963,10 +963,25 @@ std::string forFileSystem(const std::string& name) {
 }
 
 std::string forOutputName(const std::string& text) {
-    std::string clean = text;
-    for (char& c : clean) {
-        if (isBadCharacter(c) || c == '/' || c == '\\')
-            c = '_';
+    // The Switch only reliably handles ASCII paths. Game titles are often Chinese
+    // or Japanese, and this name becomes a folder (unpacked games) or a file name
+    // (NSPs), so fold every non-ASCII UTF-8 sequence into a single underscore.
+    // Pure-ASCII input produces exactly the same result as upstream.
+    std::string clean;
+    clean.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x80) {
+            size_t width = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            if (i + width > text.size())
+                width = 1;  // truncated sequence: consume one byte
+            i += width;
+            if (clean.empty() || clean.back() != '_')
+                clean += '_';
+            continue;
+        }
+        clean += (isBadCharacter((char)c) || c == '/' || c == '\\') ? '_' : (char)c;
+        ++i;
     }
     while (!clean.empty() && (clean.back() == ' ' || clean.back() == '.'))
         clean.pop_back();

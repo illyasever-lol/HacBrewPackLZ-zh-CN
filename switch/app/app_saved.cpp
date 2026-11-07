@@ -26,6 +26,16 @@ constexpr const char* AnswerGeneration = "4|";
 /// compressed all along, with a part too small to matter or nothing compressing touches, which it couldn't tell then.
 constexpr const char* PreviousGeneration = "3|";
 
+/// The Switch can't reliably open paths containing non-ASCII bytes. Localized
+/// builds once wrote Chinese output folder names into settings.txt, so ignore
+/// any saved output folder that isn't plain ASCII and use the default instead.
+bool asciiPathOnly(const std::string& path) {
+    for (unsigned char c : path)
+        if (c >= 0x80)
+            return false;
+    return true;
+}
+
 /// What was last saved under a name, which may be waiting beside it if the power went at just the wrong moment. Empty if there's nothing.
 std::string savedPath(const std::string& path) {
     if (sys::exists(path))
@@ -306,9 +316,13 @@ ConvertOptions App::convertOptions() const {
     return options;
 }
 
-std::string App::nspFolder() const { return _settings.nspFolder.empty() ? _platform.outputFolder() : _settings.nspFolder; }
+std::string App::nspFolder() const {
+    return _settings.nspFolder.empty() || !asciiPathOnly(_settings.nspFolder) ? _platform.outputFolder() : _settings.nspFolder;
+}
 
-std::string App::extractFolder() const { return _settings.extractFolder.empty() ? joinPath(_platform.outputFolder(), "已解包") : _settings.extractFolder; }
+std::string App::extractFolder() const {
+    return _settings.extractFolder.empty() || !asciiPathOnly(_settings.extractFolder) ? joinPath(_platform.outputFolder(), "extracted") : _settings.extractFolder;
+}
 
 // -------------------------------------------------------------------------------------------------------------------
 // What's been worked out about each game

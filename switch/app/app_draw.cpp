@@ -298,11 +298,11 @@ void App::drawTopBar(Canvas& c) {
 
     if (_freeUsb >= 0) {
         drawStorage(c, 770, 140, "SD 卡", _freeSd, _totalSd);
-        drawStorage(c, 930, 140, "Console", _freeNand, _totalNand);
+        drawStorage(c, 930, 140, "主机内存", _freeNand, _totalNand);
         drawStorage(c, 1090, 140, "USB", _freeUsb, _totalUsb);
     } else {
         drawStorage(c, 830, 190, "SD 卡", _freeSd, _totalSd);
-        drawStorage(c, 1050, 190, "Console", _freeNand, _totalNand);
+        drawStorage(c, 1050, 190, "主机内存", _freeNand, _totalNand);
     }
 }
 
@@ -332,9 +332,9 @@ void App::drawColumns(Canvas& c, const std::vector<Row*>& rows) {
     int hidden = 0;
     for (auto& row : _rows)
         hidden += row.tab == _tab && leftOffListLocked(row) ? 1 : 0;
-    std::string heading = (rows.size() == 1 ? std::string("1 个游戏") : format("%d games", (int)rows.size())) + ", " + sortDescription();
+    std::string heading = (rows.size() == 1 ? std::string("1 个游戏") : format("%d 个游戏", (int)rows.size())) + "，" + sortDescription();
     if (hidden > 0)
-        heading += format(", %d hidden", hidden);
+        heading += format("，%d 个已隐藏", hidden);
     c.textFit(_font, TextX, Baseline, heading, Size, TextW, t.dim);
     c.textRight(_font, NowRight, Baseline, "当前", Size, _settings.sort == 1 ? t.accent : t.dim, _settings.sort == 1);
     c.textRight(_font, AfterRight, Baseline, "之后", Size, t.dim);
@@ -370,13 +370,13 @@ void App::drawRow(Canvas& c, const Row& row, int y) {
         second = row.message;
         secondColor = t.bad;
     } else if (row.state == RowState::Done) {
-        second = row.freed > 0 ? format("%s. %s freed", _settings.compress ? "已压缩" : "已重打包", formatSize(row.freed).c_str()) : "已完成" + whichFile;
+        second = row.freed > 0 ? format("%s，已释放 %s", _settings.compress ? "已压缩" : "已重打包", formatSize(row.freed).c_str()) : "已完成" + whichFile;
         secondColor = t.accent;
     } else if (toInstall) {
         second = "已压缩，尚未安装" + whichFile;
         secondColor = t.accent;
     } else if (compressed) {
-        second = "Already compressed" + whichFile;
+        second = "已压缩" + whichFile;
         secondColor = t.accent;
     } else if (!row.belowMinimum.empty()) {
         second = whichFile.empty() ? row.belowMinimum : row.belowMinimum.substr(0, row.belowMinimum.find(':')) + whichFile;
@@ -490,7 +490,7 @@ void App::drawEmptyList(Canvas& c) {
     if (_settings.fromSd)
         places.push_back("SD 卡");
     if (_settings.fromUsb && usb)
-        places.push_back("USB 盘");
+        places.push_back("USB 可移动设备");
     if (_settings.fromPcNetwork || _settings.fromPcCable)
         places.push_back("正在共享游戏的 PC");
     std::string listed;
@@ -507,7 +507,7 @@ void App::drawEmptyList(Canvas& c) {
     else if (scanning)
         drawEmpty(c, "正在查找游戏文件", "正在浏览" + where + "中的 NSP、NSZ、XCI、XCZ 文件及已解包游戏的文件夹。", true);
     else if (done > 0)
-        drawEmpty(c, "此处内容已全部处理", format("%d %s hidden, with nothing left to do with them. The + button brings them back.", done, done == 1 ? "game" : "games"), false);
+        drawEmpty(c, "此处内容已全部处理", format("%d 个游戏已隐藏（无需再处理），按 + 键可重新显示。", done), false);
     else if (_tab == TabInstalled)
         drawEmpty(c, "没有已安装的游戏", _hidden.empty() ? "" : "被隐藏的游戏可用 + 键重新显示。", false);
     else
@@ -547,7 +547,7 @@ void App::drawFooter(Canvas& c, const std::vector<Row*>& rows) {
     }
 
     if (analyzing) {
-        c.textFit(_font, Margin, Line1, "Analyzing " + _analysisTitle, 17, Width, t.text, true);
+        c.textFit(_font, Margin, Line1, "正在分析 " + _analysisTitle, 17, Width, t.text, true);
         drawBar(c, Rect{Margin, (int)Line2 - 10, 300, 5}, _analysisCount > 0 ? (double)std::max(_analysisIndex - 1, 0) / _analysisCount : 0, t.accent);
         c.text(_font, Margin + 312, Line2 - 3, format("%d of %d", _analysisIndex, _analysisCount), 14.5f, t.dim);
     } else if (looking) {
@@ -561,14 +561,14 @@ void App::drawFooter(Canvas& c, const std::vector<Row*>& rows) {
             second += (second.empty() ? "" : Dot) + std::string("同时正在分析") + _analysisTitle;
         c.textFit(_font, Margin, Line2, second, 14.5f, Width, t.dim);
     } else if (!rows.empty()) {
-        c.text(_font, Margin, Line1, format("%d of %d ticked", ticked, (int)rows.size()), 17, t.text, true);
+        c.text(_font, Margin, Line1, format("已勾选 %d / %d", ticked, (int)rows.size()), 17, t.text, true);
         std::string second;
         Color color = t.dim;
         bool frees = _tab == TabInstalled && replacesInstalled();
         if (ticked == 0) {
             second = "在游戏上按 A 键以勾选";
         } else if (saved > 0) {
-            second = format(frees ? "Frees about %s" : "About %s smaller", formatSize(saved).c_str());
+            second = format(frees ? "可释放约 %s" : "约可缩小 %s", formatSize(saved).c_str());
             if (unknown > 0)
                 second += "，还有更多待处理";
             color = t.accent;
@@ -577,7 +577,7 @@ void App::drawFooter(Canvas& c, const std::vector<Row*>& rows) {
         } else if (unknown > 0) {
             second = "尚未分析";
         } else {
-            second = "Nothing to gain";
+            second = "没有收益";
         }
         if (!elsewhere.empty())
             second += (second.empty() ? "" : Dot) + elsewhere;
@@ -714,7 +714,7 @@ void App::drawWelcome(Canvas& c) {
     constexpr int SectionH = 30;
 
     c.text(_font, Left, 70, "欢迎使用 hacBrewPackLZ", 31, t.text, true);
-    float y = c.textWrapped(_font, Left, 110, "It stores games compressed, in the form the firmware itself reads, so they take up less room and play just the same. Tick games with A and press X. The + button has everything else.", 17, Width, 25, t.dim);
+    float y = c.textWrapped(_font, Left, 110, "以固件本身可读取的形式压缩存储游戏，占用空间更小，运行效果相同。按 A 键勾选游戏，按 X 键开始处理，+ 键打开菜单。", 17, Width, 25, t.dim);
     y = c.textWrapped(_font, Left, y + 4, "以此方式存储的游戏需要 sigpatches 才能启动，且官方更新无法覆盖安装。", 17, Width, 25, t.warn);
 
     // Where each one goes, with a heading wherever a section starts.
@@ -943,7 +943,7 @@ void App::drawJob(Canvas& c) {
     stats.push_back({"剩余时间", overall > 0.02 && elapsed > 20 ? roughTime(secondsLeft) : "正在估算"});
     stats.push_back({"已完成", roughTime(elapsed)});
     if (_jobFilesDone > 0)
-        stats.push_back({"文件", _jobFilesTotal > 0 ? format("%lld of %lld", (long long)_jobFilesDone, (long long)_jobFilesTotal) : format("%lld so far", (long long)_jobFilesDone)});
+        stats.push_back({"文件", _jobFilesTotal > 0 ? format("%lld / %lld", (long long)_jobFilesDone, (long long)_jobFilesTotal) : format("已完成 %lld", (long long)_jobFilesDone)});
     if (kind == JobKind::Compressing && _jobFreed > 0)
         stats.push_back({"已释放", formatSize(_jobFreed)});
     int statX = Margin;
@@ -955,7 +955,7 @@ void App::drawJob(Canvas& c) {
 
     c.fill(Rect{0, FooterY, ScreenW, 1}, t.line);
     bool replacing = _jobSteps.size() > 2;
-    c.textWrapped(_font, Margin, 672, replacing ? (_settings.checkResult ? "The original stays until the new copy has been checked. If the power goes, it's put right next time this opens." : "The original stays until the new copy has been written. If the power goes, it's put right next time this opens.") : "原文件不会被修改。", 15, 880, 21, t.dim, 2);
+    c.textWrapped(_font, Margin, 672, replacing ? (_settings.checkResult ? "新副本校验完成前原文件会一直保留；若中途断电，下次启动时会自动修复。" : "新副本写入完成前原文件会一直保留；若中途断电，下次启动时会自动修复。") : "原文件不会被修改。", 15, 880, 21, t.dim, 2);
 
     std::vector<Hint> hints;
     if (kind == JobKind::Removing)
@@ -985,7 +985,7 @@ void App::drawResults(Canvas& c) {
         anyFailed = anyFailed || result.state == RowState::Failed;
 
     if (count == 0)
-        drawEmpty(c, "Nothing was changed", "", false);
+        drawEmpty(c, "没有改动任何内容", "", false);
     for (int i = _resultTop; i < count && i < _resultTop + Shown; i++) {
         const ResultLine& result = _results[(size_t)i];
         int y = ListY + (i - _resultTop) * ResultH;
@@ -998,11 +998,11 @@ void App::drawResults(Canvas& c) {
             Color color = result.state == RowState::Failed ? t.bad : t.warn;
             c.textWrapped(_font, (float)textX, y + 49.0f, result.message, 14, (float)textW, 18, color, 2);
         } else {
-            std::string change = format("Was %s", formatSize(result.before).c_str());
+            std::string change = format("原为 %s", formatSize(result.before).c_str());
             if (result.after > 0 && result.after < result.before)
-                change += format(", %.0f%% smaller", (1.0 - (double)result.after / (double)result.before) * 100);
+                change += format("，缩小 %.0f%%", (1.0 - (double)result.after / (double)result.before) * 100);
             else if (result.after > result.before && result.before > 0)
-                change += format(", %.0f%% larger", ((double)result.after / (double)result.before - 1.0) * 100);
+                change += format("，增大 %.0f%%", ((double)result.after / (double)result.before - 1.0) * 100);
             c.textFit(_font, (float)textX, y + 55.0f, change, 14.5f, (float)textW, t.dim);
         }
         Color outcomeColor = result.state == RowState::Done ? t.accent : result.state == RowState::Failed ? t.bad : t.dim;
@@ -1029,7 +1029,7 @@ void App::drawNoKeys(Canvas& c) {
     constexpr float Left = 240;
     constexpr float Width = 800;
     c.text(_font, Left, 190, "此操作需要主机密钥", 29, t.text, true);
-    float y = c.textWrapped(_font, Left, 236, "They're what games are encrypted with. They come from your own console and can't be included here. Getting them takes a minute:", 18, Width, 27, t.dim);
+    float y = c.textWrapped(_font, Left, 236, "游戏是用这些密钥加密的，只能从您自己的主机导出，无法随本程序提供。获取只需一分钟：", 18, Width, 27, t.dim);
 
     const char* steps[] = {"重启进入 payload 引导器，运行 Lockpick_RCM。", "选择导出主机密钥，密钥会保存到 SD 卡。", "回到此处并按 A 键。"};
     y += 16;

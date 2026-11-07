@@ -985,7 +985,22 @@ std::vector<std::string> wrapText(Font& font, const std::string& text, float siz
         std::string candidate = line.empty() ? word : line + " " + word;
         if (!line.empty() && font.measure(candidate, size) > maxWidth) {
             lines.push_back(line);
-            line = word;
+            line.clear();
+            candidate = word;
+        }
+        if (line.empty() && font.measure(candidate, size) > maxWidth) {
+            // Chinese has no spaces: a whole paragraph arrives as one word. Split it by
+            // UTF-8 codepoint so long CJK text wraps instead of running off the card.
+            for (size_t i = 0; i < candidate.size();) {
+                size_t at = i;
+                (void)nextCodepoint(candidate, i);
+                std::string ch = candidate.substr(at, i - at);
+                if (!line.empty() && font.measure(line + ch, size) > maxWidth) {
+                    lines.push_back(line);
+                    line.clear();
+                }
+                line += ch;
+            }
         } else {
             line = candidate;
         }

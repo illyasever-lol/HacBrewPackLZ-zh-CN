@@ -351,7 +351,7 @@ public:
     NcaStream& beginNca(const char*, i64 size, const char*) override {
         i64 free = _console.freeBytes(_journal.storage);
         if (free < size)
-            throw ToolError(format("There isn't enough room on %s: this needs %s more, and %s is free", storageName(_journal.storage), formatSize(size).c_str(), formatSize(free).c_str()));
+            throw ToolError(format("%s 空间不足：还需 %s，目前仅剩 %s", storageName(_journal.storage), formatSize(size).c_str(), formatSize(free).c_str()));
         _writer = _console.createContent(_journal.storage, size);
         _journal.placeholders.push_back(_writer->token());
         saveJournal(_journalFolder, _journal);
@@ -471,7 +471,7 @@ void checkWritten(ConsoleApi& console, Storage storage, const std::vector<Instal
         hash.finish(result);
         auto expected = std::find_if(hashes.begin(), hashes.end(), [&](auto& h) { return h.first == content.id; });
         if (expected == hashes.end() || memcmp(result, expected->second.data(), 32) != 0)
-            throw ToolError(format("What was written to %s doesn't read back the same (%s). The card may be failing", storageName(storage), content.id.hex().c_str()));
+            throw ToolError(format("写入 %s 的内容回读不一致（%s），存储卡可能出现故障", storageName(storage), content.id.hex().c_str()));
     }
     progress.done();
 }
@@ -502,12 +502,12 @@ void compareGameData(FirmwareView& view, const SourcePtr& image, const std::stri
             image->read(file.offset + at, mine.data(), n);
             view.read("/" + file.path, at, theirs.data(), n);
             if (memcmp(mine.data(), theirs.data(), n) != 0)
-                throw ToolError(format("The new copy reads %s differently from the original, so the original stays", file.path.c_str()));
+                throw ToolError(format("新副本回读的 %s 与原文件不一致，因此保留原文件", file.path.c_str()));
         }
         progress.report(++checked);
     }
     progress.done();
-    sink().message(format("Read %d files of %s back, and they're the same", checked, what.c_str()));
+    sink().message(format("已回读 %d 个文件（%s），内容一致", checked, what.c_str()));
 }
 
 bool romFsSectionOf(const ContentPair& content, SectionSource& source) {
@@ -518,7 +518,7 @@ bool romFsSectionOf(const ContentPair& content, SectionSource& source) {
     return false;
 }
 
-constexpr const char* FirmwareRefusal = "This console's firmware won't read compressed games, so nothing was changed. It needs firmware 12.0.0 or newer and sigpatches. ";
+constexpr const char* FirmwareRefusal = "本主机固件无法读取压缩游戏，因此未作任何改动。需要 12.0.0 或更高版本固件及 sigpatches。";
 
 /// The ID the test copy goes by. It has nothing to do with any game, so that no game can get in the way of it.
 constexpr u64 TestCopyId = 0x01FFFFFFFFFFF000ull;
@@ -552,11 +552,11 @@ void checkLogo(ConsoleApi& console, Storage storage, const ContentId& id, const 
             mine->read(file, 0, a.data(), 0x400);
             theirs->read(file, 0, b.data(), 0x400);
         } catch (const ToolError& e) {
-            sink().message(format("The firmware wasn't asked about %s: %s", file, e.what()));
+            sink().message(format("未能向固件查询 %s：%s", file, e.what()));
             continue;
         }
         if (memcmp(a.data(), b.data(), 0x400) != 0)
-            throw ToolError(format("The firmware reads %s differently from what was written, so the original stays", file));
+            throw ToolError(format("固件读取的 %s 与写入内容不一致，因此保留原文件", file));
     }
     sink().message("固件已接受新副本");
 }
@@ -592,7 +592,7 @@ void checkNewCopy(ConsoleApi& console, const TitleJob& job, const Journal& journ
             } else {
                 checkLogo(console, journal.storage, candidate.id, raw, rebuilt.programId(), keyset);
                 auto view = readGameDataOf(raw, candidate.id.hex(), keyset);
-                compareGameData(*view, image, candidate.id.hex(), "Reading the new copy back");
+                compareGameData(*view, image, candidate.id.hex(), "正在回读校验新副本");
             }
         }
         if (!found && !journal.kept.empty())
@@ -613,7 +613,7 @@ void checkBuiltCopy(ConsoleApi& console, const ExtractedGame& game, const Journa
             continue;
         checkLogo(console, journal.storage, candidate.id, raw, rebuilt.programId(), keyset);
         auto view = readGameDataOf(raw, candidate.id.hex(), keyset);
-        compareGameData(*view, image, candidate.id.hex(), "Reading the new copy back");
+        compareGameData(*view, image, candidate.id.hex(), "正在回读校验新副本");
     }
 }
 
@@ -643,7 +643,7 @@ ReplaceResult replaceTitle(ConsoleApi& console, const std::string& journalFolder
     if (journal.storage == Storage::None)
         journal.storage = installTo;
     if (journal.storage != Storage::Sd && journal.storage != Storage::Nand)
-        throw ToolError(format("This title is on %s, so it can't be replaced", storageName(journal.storage)));
+        throw ToolError(format("该游戏位于 %s，无法替换", storageName(journal.storage)));
     saveJournal(journalFolder, journal);
 
     InstallOutput output(console, journal, journalFolder);

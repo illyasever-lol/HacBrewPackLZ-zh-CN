@@ -24,7 +24,7 @@ internal static class Sender
     private enum Status : uint { Done = 0, NotThere = 1, Failed = 2, Working = 3 }
 
     /// <param name="watch">Where to keep what's going on, for a window to show. The command line only has what's said.</param>
-    /// <param name="密钥">The keys, for working out what's in the files for the Switch. Only asked for when it's needed.</param>
+    /// <param name="keys">The keys, for working out what's in the files for the Switch. Only asked for when it's needed.</param>
     public static void Run(IReadOnlyList<string> inputs, CancellationToken token, SendWatch? watch = null, Func<Keyset>? keys = null)
     {
         var roots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -34,16 +34,16 @@ internal static class Sender
             bool isFile = File.Exists(full);
             // It takes no options, and what follows one, like the keys after -k, is no game to share.
             if (input.StartsWith('-') && !isFile && !Directory.Exists(full))
-                throw new ToolException($"send doesn't take '{input}'. Give it only the game files or folders to send to the Switch.");
+                throw new ToolException($"'{input}' 不是有效参数：send 只接受要发送到 Switch 的游戏文件或文件夹。");
             if (!isFile && !Directory.Exists(full))
             {
-                Ui.Warn($"'{input}' not found");
+                Ui.Warn($"未找到 '{input}'");
                 continue;
             }
             // Folders are shared whole, as an extracted game's files can be anything. A file on its own has to be a game.
             if (isFile && !GameArchive.IsGameFile(full))
             {
-                Ui.Warn($"'{input}' isn't an NSP, NSZ, XCI or XCZ, so it's not shared");
+                Ui.Warn($"'{input}' 不是 NSP、NSZ、XCI 或 XCZ，已跳过不共享");
                 continue;
             }
             string name = Path.GetFileName(full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
@@ -75,14 +75,14 @@ internal static class Sender
         if (listener is null)
             throw new ToolException("无法启动网络共享：所需的端口已被占用。");
 
-        Ui.Info($"Sharing {roots.Count} {(roots.Count == 1 ? "item" : "items")} with the Switch as {Environment.MachineName}:");
+        Ui.Info($"正以 {Environment.MachineName} 的身份向 Switch 共享 {roots.Count} 个项目：");
         foreach (var root in roots)
             Ui.Info($"  {root.Value}");
         Ui.Info("");
         Ui.Info("在 Switch 上打开 hacBrewPackLZ，这些游戏会出现在「游戏文件」中。请保持此窗口运行直到完成。");
-        Ui.Info($"Over the network, both have to be on the same one, and Windows may ask to let this through its firewall. Port {port}.");
+        Ui.Info($"通过网络共享时，PC 与 Switch 必须处于同一局域网；Windows 可能提示是否允许通过防火墙。端口 {port}。");
         if (OperatingSystem.IsWindows())
-            Ui.Info("Over a USB cable, Windows needs the WinUSB or libusbK driver for the Switch, which Zadig installs, the same one DBI uses.");
+            Ui.Info("通过 USB 数据线连接时，Windows 需要为 Switch 安装 WinUSB 或 libusbK 驱动（可用 Zadig 安装，与 DBI 使用的是同一个驱动）。");
 
         var sent = watch ?? new SendWatch();
         sent.Started(Environment.MachineName, port);
@@ -166,13 +166,13 @@ internal static class Sender
             new Thread(() =>
             {
                 string who = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "网络";
-                Ui.Info($"The Switch connected from {who}.");
-                string how = $"over the network ({who})";
+                Ui.Info($"Switch 已从 {who} 连接。");
+                string how = $"通过网络（{who}）";
                 sent.Connected(how);
                 using (client)
                     Serve(client.GetStream(), roots, answers, sent, token);
                 sent.Disconnected(how);
-                Ui.Info($"The Switch at {who} disconnected.");
+                Ui.Info($"{who} 的 Switch 已断开连接。");
             }) { IsBackground = true, Name = "正在提供服务" }.Start();
         }
     }
@@ -462,9 +462,9 @@ internal sealed class SendWatch
             {
                 _lastSaid = now;
                 if (newFile)
-                    Ui.Info($"Sending {Path.GetFileName(path)}");
+                    Ui.Info($"正在发送 {Path.GetFileName(path)}");
                 else
-                    Ui.Info($"  {ProgressReporter.Format(_files[path].read)} of {ProgressReporter.Format(length)}");
+                    Ui.Info($"  已发送 {ProgressReporter.Format(_files[path].read)} / 共 {ProgressReporter.Format(length)}");
             }
         }
         Changed?.Invoke();
@@ -483,7 +483,7 @@ internal sealed class SendWatch
     }
 }
 
-/// <param name="正在读取">The file the Switch is reading now, if it's reading anything.</param>
+/// <param name="Reading">The file the Switch is reading now, if it's reading anything.</param>
 internal sealed record SendSnapshot(string Machine, int Port, string[] Connected, string? UsbProblem, string? Reading, long BytesPerSecond,
     IReadOnlyDictionary<string, (long read, long length)> Files)
 {

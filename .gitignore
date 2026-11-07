@@ -26,12 +26,14 @@ keys.ini
 switch/third_party/libusbhsfs/release/
 switch/third_party/libusbhsfs/lib/
 
-# 本地构建与密钥（禁止入库）
-bin/
-obj/
+# Binaries go to Releases, not into git
 *.exe
 *.dll
+*.pdb
 *.nupkg
+*.o
+*.a
+*.cache
 *.nro
 prod.keys
 title.keys

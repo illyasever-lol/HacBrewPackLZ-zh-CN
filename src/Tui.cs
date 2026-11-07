@@ -452,7 +452,7 @@ internal sealed class Tui
             long before = known.Sum(r => r.InputBytes);
             long after = known.Sum(r => r.AfterBytes!.Value);
             rows.Add(RuleRow(width));
-            rows.Add(Row("", "", known.Count == s.Rows.Length ? "全部游戏" : $"{known.Count} of {s.Rows.Length} titles", "", "",
+            rows.Add(Row("", "", known.Count == s.Rows.Length ? "全部游戏" : $"{known.Count}/{s.Rows.Length} 个标题", "", "",
                 ProgressReporter.Format(before), ProgressReporter.Format(after), "", Percent(before, after), Sgr.Good));
         }
 

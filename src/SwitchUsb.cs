@@ -83,7 +83,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
         _out = outPipe;
         _read = (delegate* unmanaged[Stdcall]<nint, byte, byte*, uint, uint*, nint, int>)NativeLibrary.GetExport(library, prefix + "ReadPipe");
         _write = (delegate* unmanaged[Stdcall]<nint, byte, byte*, uint, uint*, nint, int>)NativeLibrary.GetExport(library, prefix + "WritePipe");
-        _free = (delegate* unmanaged[Stdcall]<nint, int>)NativeLibrary.GetExport(library, prefix + "可用");
+        _free = (delegate* unmanaged[Stdcall]<nint, int>)NativeLibrary.GetExport(library, prefix + "Free");
     }
 
     /// <summary>Null if there's no console there, with why not in problem when that's something to do anything about.</summary>
@@ -98,7 +98,9 @@ internal sealed unsafe class SwitchUsb : IDisposable
         }
         catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or InvalidOperationException)
         {
-            problem = "无法打开 Switch 的 USB 连接：" + e.Message;
+            problem = e is EntryPointNotFoundException
+                ? "无法打开 Switch 的 USB 连接：驱动缺少所需的函数，请用 Zadig 重新安装 WinUSB 或 libusbK 驱动。"
+                : "无法打开 Switch 的 USB 连接：" + e.Message;
             return null;
         }
     }
@@ -124,7 +126,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
                 {
                     problem = service.Length == 0
                         ? "检测到 Switch 已插入，但 Windows 未安装其驱动，请用 Zadig 安装 WinUSB 驱动。"
-                        : $"A Switch is plugged in, but with the {service} driver. Install the WinUSB or libusbK driver for it with Zadig instead.";
+                        : $"检测到 Switch 已插入，但当前使用的是 {service} 驱动，请用 Zadig 改装 WinUSB 或 libusbK 驱动。";
                     return null;
                 }
                 Guid? guid = InterfaceGuid(set, &info);
@@ -221,7 +223,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
         problem = null;
         if (!NativeLibrary.TryLoad(library, out nint lib))
         {
-            problem = $"The Switch's driver needs {library}, which isn't there.";
+            problem = $"Switch 驱动所需的 {library} 不存在，请用 Zadig 重新安装驱动。";
             return null;
         }
         const uint GenericReadWrite = 0xC0000000, ShareReadWrite = 3, OpenExisting = 3, Overlapped = 0x40000000, Normal = 0x80;
@@ -230,10 +232,18 @@ internal sealed unsafe class SwitchUsb : IDisposable
             file = CreateFileW(p, GenericReadWrite, ShareReadWrite, 0, OpenExisting, Normal | Overlapped, 0);
         if (file == -1)
             return null;
+        // A driver with a missing export used to surface as a bare "Entry point was not found."
+        foreach (string suffix in new[] { "Initialize", "QueryInterfaceSettings", "QueryPipe", "Free", "ReadPipe", "WritePipe" })
+            if (!NativeLibrary.TryGetExport(lib, prefix + suffix, out _))
+            {
+                CloseHandle(file);
+                problem = $"Switch 的 USB 驱动缺少 {prefix + suffix} 函数，请用 Zadig 重新安装 WinUSB 或 libusbK 驱动。";
+                return null;
+            }
         var initialize = (delegate* unmanaged[Stdcall]<nint, nint*, int>)NativeLibrary.GetExport(lib, prefix + "Initialize");
         var querySettings = (delegate* unmanaged[Stdcall]<nint, byte, InterfaceDescriptor*, int>)NativeLibrary.GetExport(lib, prefix + "QueryInterfaceSettings");
         var queryPipe = (delegate* unmanaged[Stdcall]<nint, byte, byte, PipeInformation*, int>)NativeLibrary.GetExport(lib, prefix + "QueryPipe");
-        var free = (delegate* unmanaged[Stdcall]<nint, int>)NativeLibrary.GetExport(lib, prefix + "可用");
+        var free = (delegate* unmanaged[Stdcall]<nint, int>)NativeLibrary.GetExport(lib, prefix + "Free");
         nint usb;
         if (initialize(file, &usb) == 0)
         {
