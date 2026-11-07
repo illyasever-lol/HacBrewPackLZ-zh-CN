@@ -56,12 +56,6 @@ LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无�
 
 压缩级别、块大小、线程数等原有选项也已完整汉化。
 
-### 关于
-
-![关于窗口](screenshots/about-window.png)
-
-关于窗口完整汉化，并附汉化作者与 B 站空间链接。
-
 > 以上为 Windows 图形界面截图。Switch 端 NRO 的界面同样已全量汉化，实机画面请用 Release 中的
 > `hacBrewPackLZ_zh.nro` 在主机上查看。
 
