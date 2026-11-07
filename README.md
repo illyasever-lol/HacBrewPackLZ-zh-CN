@@ -23,7 +23,6 @@ LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无�
 | --- | --- |
 | `hacBrewPackLZ_zh.nro` | Switch 端程序（放到 SD 卡 `/switch/` 下用 Homebrew Menu 启动） |
 | `hacbrewpacklz-gui_zh.exe` | Windows 图形界面，免安装 .NET 8 |
-| `hacbrewpacklz_zh.exe` | Windows 命令行，免安装 .NET 8 |
 | `SHA256SUMS.txt` | 上述文件的校验和 |
 
 图形界面版双击即用；`prod.keys` 请自行准备，放在 exe 同目录或用 `-k` 指定。
