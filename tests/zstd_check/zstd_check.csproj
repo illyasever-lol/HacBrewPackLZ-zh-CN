@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>HacBrewPackLz</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TieredPGO>true</TieredPGO>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\Zstd.cs" />
+    <Compile Include="..\..\src\DataSource.cs" />
+    <Compile Include="..\..\src\Ui.cs" />
+    <Compile Include="..\..\src\ProgressReporter.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,40 @@
+# Build output
+bin/
+obj/
+selftest/build/
+switch/build/
+switch/*.nro
+switch/*.elf
+switch/*.nacp
+switch/*.map
+tests/out/
+tests/libhac/
+__pycache__/
+
+# Never commit keys, or console and game content
+*.keys
+keys.dat
+keys.txt
+keys.ini
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.nca
+*.ncz
+*.zst
+switch/third_party/libusbhsfs/release/
+switch/third_party/libusbhsfs/lib/
+
+# 本地构建与密钥（禁止入库）
+bin/
+obj/
+*.exe
+*.dll
+*.nupkg
+*.nro
+prod.keys
+title.keys
+dev.keys
+.vs/
+.idea/

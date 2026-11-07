@@ -1,0 +1,2 @@
+libusbhsfs 0.2.10 from https://github.com/DarkMatterCore/libusbhsfs, as released. Its Makefile has had -Werror taken off, as newer compilers warn about things it does.
+It is built with BUILD_TYPE=GPL, which also needs devkitPro's switch-ntfs-3g and switch-lwext4.
