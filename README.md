@@ -4,7 +4,7 @@
 >
 > 上游项目：[hacBrewPackLZ 1.4.3](https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz)（GNU GPL-2.0）
 > 汉化与增强：[illyasever](https://space.bilibili.com/36010)
-> 当前版本：**v11**（2026-11-08）
+> 当前版本：**v12**（2026-11-08）
 
 把 Nintendo Switch 游戏**变小**的工具：把 NSP / NSZ / XCI / XCZ 重建为数据经过 LZ4 压缩的 NSP。
 LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无需解包，也绝不改动原始文件。
@@ -171,6 +171,7 @@ hacbrewpacklz_zh.exe --help
 | v9 | NRO 四处漏译、`Free` 导出名复原、进度映射双端同步 | 60/60 断言 + 系统 DLL 导出表 6/6 |
 | v10 | 解包输出路径 ASCII 化、旧设置兜底、输出名折叠 | 34/34（含 3010 纯 ASCII 零回归用例） |
 | v11 | EXE 发送流程汉化、USB 服务心跳、服务变化自动刷新 | 94/94 + 状态机行为模拟 6/6 |
+| v12 | EXE 估算行漏译、NRO 解包收尾「位于」→「用时」 | 40/40；EXE/NRO 同步重编 |
 
 完整明细见 [CHANGELOG.md](CHANGELOG.md)。
 
