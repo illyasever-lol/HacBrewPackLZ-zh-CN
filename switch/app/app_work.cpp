@@ -1133,7 +1133,7 @@ void App::extract(const std::vector<std::string>& keys) {
         });
         result.outcome = format("%s 已解包", formatSize(bytes).c_str());
         result.after = bytes;
-    }, [&](int, double seconds) { return format("已解包到 %s，位于 %s。", output.c_str(), formatElapsed(seconds).c_str()); });
+    }, [&](int, double seconds) { return format("已解包到 %s，用时 %s。", output.c_str(), formatElapsed(seconds).c_str()); });
     closeOpenJob();
     forgetFileScan();
 }
