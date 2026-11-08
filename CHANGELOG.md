@@ -1,7 +1,7 @@
 # 汉化版更新日志
 
 上游基线：hacBrewPackLZ 1.4.3（<https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz>），GPL-2.0。
-当前版本：**v11**（2026-11-08）。
+当前版本：**v12**（2026-11-08）。
 
 | 版本 | 内容 | 验证结论 |
 | --- | --- | --- |
@@ -17,6 +17,8 @@
 | v9 | NRO 四处漏译（`Compress` / `Compressing the game data` / 压缩用时 / 压缩后）；修复 USB 发送报 `Entry point was not found.`（导出名 `Free` 被误译）；进度文字产出源与中文前缀表双端同步；补齐 `Downloads` 路径与 5 处漏译（21 处 / 7 文件，EXE 与 NRO 均重编） | 60/60 断言；系统 `winusb.dll` 导出表 6/6 存在、误译名不存在；7 条旧英文 C 串 0 残留 |
 | v10 | Switch 不认中文路径：默认解包目录复原 `extracted`；`asciiPathOnly()` 对旧 `settings.txt` 残留中文目录回退；`forOutputName()` 把 UTF-8 非 ASCII 折叠为 `_`（仅 NRO 端） | 34/34（源码 14 + 3010 纯 ASCII 零回归用例 + 二进制 13 + 编译）；含中文且含 `/` 的 C 串 0 条 |
 | v11 | EXE 发送流程 11 处汉化（共享数量、局域网/防火墙、Zadig/DBI 驱动说明）；NRO 新增 USB 发送服务检测：3 s Hello 心跳 + 通道空闲 2 s 门槛 + 服务变化即自动刷新列表（18 处 / 3 文件，EXE 与 NRO 同步重编） | 94/94（源码 39 + 行为模拟 6 + NRO 二进制 17 + EXE/#US 堆 26 + 冒烟 6）；状态机模拟 6/6；停止→清除 3～5 s、恢复→新内容 3～10 s |
+
+| v12 | 两处文案修订：EXE 估算行 `game data compresses to` → `游戏数据可压缩至`；NRO 解包收尾「位于 3 s」→「用时 3 s」（`in %s` 表耗时非位置）（2 处 / 2 文件，EXE 与 NRO 同步重编） | 40/40（源码 10 + 补丁重放 4 + NRO 二进制 10 + EXE/#US 堆 12 + 构建/冒烟 4）；自包含 EXE 2/2、NRO 40 对象 0 错 0 警 |
 
 每版均执行：补丁逐字节重放（`--check` 预检）→ 编译（2 个自包含 exe；改了 Switch 端再加 NRO）
 → `#US` / `#Strings` 堆或 NRO 二进制 C 串核验 → 运行与参数链路 / 行为级模拟验证
