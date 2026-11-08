@@ -71,7 +71,7 @@ internal sealed record TitleRow(string Key, string Name, string Detail, long Inp
     public string DetailWithEstimate => BelowMinimum is { } reason
         ? $"{Detail}, {reason}"
         : Estimate is { RomFsBytes: > 0 } e && e.RomFsStoredBytes < e.RomFsBytes
-        ? $"{Detail}, game data compresses to {e.RomFsFraction * 100:0}%"
+        ? $"{Detail}, 游戏数据可压缩至 {e.RomFsFraction * 100:0}%"
         : Detail;
 }
 
