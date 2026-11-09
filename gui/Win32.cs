@@ -176,6 +176,7 @@ internal static unsafe class Win32
     public const uint WS_CHILD = 0x40000000;
     public const uint WS_CLIPCHILDREN = 0x02000000;
     public const uint WS_VSCROLL = 0x00200000;
+    public const uint WS_HSCROLL = 0x00100000;
     public const uint WS_EX_TOOLWINDOW = 0x00000080;
 
     public const uint ES_MULTILINE = 0x0004;
