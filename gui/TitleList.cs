@@ -336,9 +336,12 @@ internal sealed class TitleList(Action<TitleRow> toggle, Action<bool> selectAll,
         // While sending, what the Switch has read of each one is what matters.
         if (_send is { } send && send.Of(row.Files) is { length: > 0 } sent)
         {
-            return sent.read >= sent.length
+            // The Switch only reads the parts of an NSP it needs, so reaching 100% is not
+            // the same as being installed. Once this title's own files go quiet, show it as
+            // sent; other titles still being read must not change that.
+            return sent.read >= sent.length || send.IsSettled(row.Files)
                 ? ("已发送", p.Good, "", p.Text)
-                : ($"Sending {sent.read * 100 / sent.length}%", p.Accent, "", p.Text);
+                : ($"正在发送 {sent.read * 100 / sent.length}%", p.Accent, "", p.Text);
         }
         switch (row.State)
         {
