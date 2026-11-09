@@ -273,7 +273,8 @@ void App::needRoom(Storage storage, i64 output) {
 }
 
 void App::needRoomIn(const std::string& folder, i64 output) {
-    sys::makeDirectories(folder);
+    if (!sys::isDirectory(folder))
+        sys::makeDirectories(folder);
     if (!sys::isDirectory(folder))
         throw ToolError("文件夹" + folder + "无法访问。如果在 USB 可移动设备上，请确认已插好。");
     if (output >= sys::largestFile(folder))
@@ -1110,7 +1111,8 @@ void App::forEachTitle(const Row& row, const std::function<void(const TitleJob&,
 void App::extract(const std::vector<std::string>& keys) {
     std::string output = extractFolder();
     workThrough(keys, "未解包", [&](const Row& row, ResultLine& result) {
-        sys::makeDirectories(output);
+        if (!sys::isDirectory(output))
+            sys::makeDirectories(output);
         if (!sys::isDirectory(output))
             throw ToolError("文件夹" + output + "无法访问。如果在 USB 可移动设备上，请确认已插好。");
         i64 free = sys::freeSpace(output);
