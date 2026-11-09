@@ -393,17 +393,26 @@ internal static class Sender
 internal sealed class SendWatch
 {
     private const double SpeedSeconds = 3;
+    /// The settle window lives on SendSnapshot: the window asks it about each title,
+    /// so one constant serves both the global snapshot and per-title checks.
 
     private readonly object _gate = new();
     private readonly List<string> _connected = [];
     private readonly Dictionary<string, (long read, long length)> _files = new(StringComparer.OrdinalIgnoreCase);
+    /// When each output file was last read. A title is done when all of its own files go
+    /// quiet, so starting another title can't drag an earlier one back to a stale percent.
+    private readonly Dictionary<string, DateTime> _lastReadAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<(DateTime at, long bytes)> _recent = new();
     private string _machine = "";
     private int _port;
     private string? _usbProblem;
     private string? _file;
+    private DateTime _fileAt = DateTime.MinValue;
     private DateTime _lastRead = DateTime.MinValue;
     private DateTime _lastSaid = DateTime.MinValue;
+    /// Announce each output file once per send; several can be read in turn while a
+    /// merged title is installed, and announcing every switch floods the details log.
+    private readonly HashSet<string> _announced = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Raised on whichever thread it happened on.</summary>
     public event Action? Changed;
@@ -445,28 +454,51 @@ internal sealed class SendWatch
 
     public void Read(string path, long count, long length)
     {
+        string? say = null;
         lock (_gate)
         {
             var now = DateTime.UtcNow;
             var (read, _) = _files.GetValueOrDefault(path);
             // What's read more than once still only counts the once, as far as how much is left goes.
             _files[path] = (Math.Min(read + count, length), length);
+            _lastReadAt[path] = now;
             _recent.Enqueue((now, count));
             while (_recent.Count > 0 && (now - _recent.Peek().at).TotalSeconds > SpeedSeconds)
                 _recent.Dequeue();
             _lastRead = now;
 
+            // Several output NSPs can be read in turn. Keep the status on the one still
+            // in progress instead of flapping between them on every single request.
             bool newFile = path != _file;
-            _file = path;
-            if (newFile || (now - _lastSaid).TotalSeconds >= 5)
+            if (newFile)
+            {
+                var (currentRead, currentLength) = _files.GetValueOrDefault(_file ?? "");
+                bool currentDone = _file is null || currentRead >= currentLength;
+                bool currentQuiet = _file is null || (now - _fileAt).TotalSeconds >= 2;
+                if (!currentDone && !currentQuiet)
+                    newFile = false;
+            }
+            if (path == _file)
+                _fileAt = now;
+            if (newFile)
+            {
+                _file = path;
+                _fileAt = now;
+            }
+            bool announce = newFile && _announced.Add(path);
+            if (announce || (now - _lastSaid).TotalSeconds >= 5)
             {
                 _lastSaid = now;
-                if (newFile)
-                    Ui.Info($"正在发送 {Path.GetFileName(path)}");
-                else
-                    Ui.Info($"  已发送 {ProgressReporter.Format(_files[path].read)} / 共 {ProgressReporter.Format(length)}");
+                say = announce
+                    ? $"正在发送 {Path.GetFileName(path)}"
+                    : $"  已发送 {ProgressReporter.Format(_files[path].read)} / 共 {ProgressReporter.Format(length)}";
             }
         }
+        // Never call out to the UI while holding _gate. Session.Snapshot() takes Session's
+        // lock before asking this object for a snapshot; doing the reverse here used to
+        // deadlock the window thread part way through a long USB transfer.
+        if (say is not null)
+            Ui.Info(say);
         Changed?.Invoke();
     }
 
@@ -476,33 +508,61 @@ internal sealed class SendWatch
         {
             var now = DateTime.UtcNow;
             bool active = (now - _lastRead).TotalSeconds < SpeedSeconds;
+            bool settled = (now - _lastRead).TotalSeconds >= SendSnapshot.SettleSeconds;
             long speed = active ? (long)(_recent.Where(r => (now - r.at).TotalSeconds <= SpeedSeconds).Sum(r => r.bytes) / SpeedSeconds) : 0;
             return new SendSnapshot(_machine, _port, _connected.ToArray(), _usbProblem, active ? _file : null, speed,
-                new Dictionary<string, (long, long)>(_files, StringComparer.OrdinalIgnoreCase));
+                new Dictionary<string, (long, long)>(_files, StringComparer.OrdinalIgnoreCase), settled,
+                new Dictionary<string, DateTime>(_lastReadAt, StringComparer.OrdinalIgnoreCase), now);
         }
     }
 }
 
 /// <param name="Reading">The file the Switch is reading now, if it's reading anything.</param>
+/// <param name="Settled">True once the Switch has been quiet long enough that a part-read file counts as sent.</param>
+/// <param name="LastReadAt">When each output file was last read, for per-title settle checks.</param>
+/// <param name="At">When this snapshot was taken, so settle checks use one clock value.</param>
 internal sealed record SendSnapshot(string Machine, int Port, string[] Connected, string? UsbProblem, string? Reading, long BytesPerSecond,
-    IReadOnlyDictionary<string, (long read, long length)> Files)
+    IReadOnlyDictionary<string, (long read, long length)> Files, bool Settled,
+    IReadOnlyDictionary<string, DateTime> LastReadAt, DateTime At)
 {
-    /// <summary>How much of these files, or of the files in these folders, the Switch has read.</summary>
-    public (long read, long length) Of(IEnumerable<string> paths)
+    /// <summary>How long a title's own files must be quiet before a part-read file counts as sent.</summary>
+    public const double SettleSeconds = 8;
+
+    /// <summary>True once every file this title is made of has been quiet long enough. Files never
+    /// read don't count, and reading another title later can't make an earlier one look unfinished.</summary>
+    public bool IsSettled(IEnumerable<string> paths)
     {
-        long read = 0, length = 0;
+        bool any = false;
+        foreach (string file in Matching(paths))
+        {
+            any = true;
+            if (!LastReadAt.TryGetValue(file, out var at) || (At - at).TotalSeconds < SettleSeconds)
+                return false;
+        }
+        return any;
+    }
+
+    private IEnumerable<string> Matching(IEnumerable<string> paths)
+    {
         foreach (string path in paths)
         {
             string full = Path.GetFullPath(path);
             string inside = full.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            foreach (var file in Files)
-            {
-                if (string.Equals(file.Key, full, StringComparison.OrdinalIgnoreCase) || file.Key.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
-                {
-                    read += file.Value.read;
-                    length += file.Value.length;
-                }
-            }
+            foreach (string file in Files.Keys)
+                if (string.Equals(file, full, StringComparison.OrdinalIgnoreCase)
+                    || file.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
+                    yield return file;
+        }
+    }
+
+    /// <summary>How much of these files, or of the files in these folders, the Switch has read.</summary>
+    public (long read, long length) Of(IEnumerable<string> paths)
+    {
+        long read = 0, length = 0;
+        foreach (string file in Matching(paths))
+        {
+            read += Files[file].read;
+            length += Files[file].length;
         }
         return (read, length);
     }
