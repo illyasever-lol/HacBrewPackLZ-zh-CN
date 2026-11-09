@@ -222,15 +222,39 @@ void saveJournal(const std::string& folder, const Journal& journal) {
     sys::makeDirectories(folder);
     std::string text = journal.text();
     std::string temp = journalTempPath(folder);
-    {
-        sys::File file(temp, sys::File::Mode::Create);
+    std::string target = journalPath(folder);
+    auto writeTo = [&](const std::string& path) {
+        sys::File file(path, sys::File::Mode::Create);
         file.write(0, text.data(), text.size());
         file.flush();
-    }
+    };
+    writeTo(temp);
     sys::commit(temp);
-    sys::removeFile(journalPath(folder));
-    sys::renameFile(temp, journalPath(folder));
-    sys::commit(journalPath(folder));
+    // The SD-card FS session is shared with the file scan and the USB worker, so a
+    // single IPC can fail transiently; and libnx's rename never overwrites an
+    // existing target, unlike POSIX rename(). Retry the swap, then fall back to
+    // writing the fresh journal straight over the old one. A journal that can't be
+    // replaced only costs resume-after-power-cut; it must never abort an install
+    // whose content has already been placed. Same fallback as writeWholeFile().
+    bool swapped = false;
+    for (int attempt = 0; attempt < 3 && !swapped; attempt++) {
+        sys::removeFile(target);
+        try {
+            sys::renameFile(temp, target);
+            swapped = true;
+        } catch (const ToolError&) {
+            sys::sleepMs(10 * (attempt + 1));
+        }
+    }
+    if (!swapped) {
+        try {
+            writeTo(target);
+        } catch (const ToolError&) {
+            // Leave the old journal in place rather than failing the install.
+        }
+        sys::removeFile(temp);
+    }
+    sys::commit(target);
 }
 
 void clearJournal(const std::string& folder) {
