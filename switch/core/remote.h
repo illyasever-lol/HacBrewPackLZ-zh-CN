@@ -2,6 +2,7 @@
 // any other, at pc:<name>/, so that installing from them works the same as from the SD card. Only reading is possible.
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -15,6 +16,25 @@ public:
     virtual ~Transport() = default;
     virtual void send(const void* data, size_t size) = 0;
     virtual void receive(void* data, size_t size) = 0;
+};
+
+/// The cable has one pair of endpoints and one shared 1 MiB buffer. Posting two transfers at
+/// once - an install's answer and a probe for the sending service - makes the console's usb
+/// system module fatal (2162-0002 / 0x4a2). One whole request/answer pair, or one whole probe,
+/// holds this for as long as it touches the cable.
+extern std::atomic<bool> cableBusy;
+
+class CableGuard {
+public:
+    /// `enabled` is false for a network link. With `wait` false, a probe that finds the cable in
+    /// use gives up instead of holding up an install; `held()` says whether it went ahead.
+    CableGuard(bool enabled, bool wait);
+    ~CableGuard();
+    CableGuard(const CableGuard&) = delete;
+    bool held() const { return _held; }
+
+private:
+    bool _held = false;
 };
 
 /// A PC that can be reached, and how.
