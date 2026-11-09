@@ -31,7 +31,9 @@ constexpr const char* PreviousGeneration = "3|";
 /// any saved output folder that isn't plain ASCII and use the default instead.
 bool asciiPathOnly(const std::string& path) {
     for (unsigned char c : path)
-        if (c >= 0x80)
+        // Control bytes (a trailing CR from a settings.txt edited on Windows above all)
+        // make the path unusable on the console even though they're technically ASCII.
+        if (c >= 0x80 || c < 0x20)
             return false;
     return true;
 }
@@ -272,6 +274,8 @@ void App::loadSettings() {
             return;
         std::string name = line.substr(0, eq);
         std::string word = line.substr(eq + 1);
+        while (!word.empty() && (unsigned char)word.back() <= ' ')
+            word.pop_back();
         long long value = atoll(word.c_str());
         for (auto& flag : SavedFlags) {
             if (name == flag.first)
