@@ -180,7 +180,7 @@ internal static class OptionCatalog
             CommandHelp = "以十六进制设置密钥区域密钥 2，长度 16 字节",
         },
         new("--sdkversion", "SDK 版本", OptionKind.Choice, Rebuilds,
-            "按实测的密钥世代 / 固件范围选择；不选择则沿用各源文件自身的 SDK 版本。也可在下拉旁的输入框自定义填写，例如 11.0.0、0xA (9.1.0-12.0.3) 或 000C1100。下拉中的 0xD 是主密钥版本，NCA 头部会写入 1 起值 0xE，外部工具便显示为 0xD，同时避免 0xFF (Unknown)。")
+            "选择沿用源文件则不修改密钥版本，可在下拉框选择需要修改的SDK版本，例：11.0.0、0xA (9.1.0-12.0.3)或000C1100。")
         {
             Choices = FirmwareVersions.Choices,
             Default = "沿用源文件",
