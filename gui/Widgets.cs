@@ -141,7 +141,7 @@ internal sealed class ToggleSwitch(Action<bool> changed) : Widget
             g.StrokeRound(track.Inset(-S(2)), height / 2f + S(2), p.Accent, S(2));
         int knob = S(12);
         g.FillCircle(On ? track.Right - S(4) - knob : track.X + S(4), track.Y + (height - knob) / 2f, knob, On ? p.OnAccent : p.SubText);
-        g.Text(On ? "On" : "Off", new Rect(track.Right + S(10), Bounds.Y, S(60), Bounds.H), Fonts.Body, p.SubText);
+        g.Text(On ? "开" : "关", new Rect(track.Right + S(10), Bounds.Y, S(60), Bounds.H), Fonts.Body, p.SubText);
     }
 
     public override void MouseUp(int x, int y)
@@ -392,7 +392,10 @@ internal sealed class LogView : Widget
 
     public override void Attached()
     {
-        _edit = Win32.CreateWindowExW(0, "EDIT", "", Win32.WS_CHILD | Win32.WS_VSCROLL | Win32.ES_MULTILINE | Win32.ES_READONLY | Win32.ES_AUTOVSCROLL,
+        // Without ES_AUTOHSCROLL a multiline EDIT word-wraps, and re-wraps every line
+        // on each width change: dragging the window crawled once a long transfer had
+        // filled the log. Long lines get a horizontal scrollbar instead.
+        _edit = Win32.CreateWindowExW(0, "EDIT", "", Win32.WS_CHILD | Win32.WS_VSCROLL | Win32.WS_HSCROLL | Win32.ES_MULTILINE | Win32.ES_READONLY | Win32.ES_AUTOVSCROLL | Win32.ES_AUTOHSCROLL,
             0, 0, 10, 10, Window.Handle, IntPtr.Zero, Win32.GetModuleHandleW(null), IntPtr.Zero);
         Win32.SendMessageW(_edit, Win32.EM_SETLIMITTEXT, 0x400000, IntPtr.Zero);
         ApplyTheme();
