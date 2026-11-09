@@ -4,7 +4,7 @@
 >
 > 上游项目：[hacBrewPackLZ 1.4.3](https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz)（GNU GPL-2.0）
 > 汉化与增强：[illyasever](https://space.bilibili.com/36010)
-> 当前版本：**v12**（2026-11-08）
+> 当前版本：**v16**（2026-11-09）
 
 把 Nintendo Switch 游戏**变小**的工具：把 NSP / NSZ / XCI / XCZ 重建为数据经过 LZ4 压缩的 NSP。
 LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无需解包，也绝不改动原始文件。
@@ -172,6 +172,10 @@ hacbrewpacklz_zh.exe --help
 | v10 | 解包输出路径 ASCII 化、旧设置兜底、输出名折叠 | 34/34（含 3010 纯 ASCII 零回归用例） |
 | v11 | EXE 发送流程汉化、USB 服务心跳、服务变化自动刷新 | 94/94 + 状态机行为模拟 6/6 |
 | v12 | EXE 估算行漏译、NRO 解包收尾「位于」→「用时」 | 40/40；EXE/NRO 同步重编 |
+| v13 | **修复 USB 连续传输 2～3 GB 后主机崩溃 2162-0002 (0x4a2)**（心跳与安装抢同一端点/缓冲） | 51/51；仅 NRO 重编，行为模拟并发 post 3→0 |
+| v14 | 修复 EXE 发送死锁（锁序反转）、NRO 输出目录误判、4 处漏译 | 77/77；EXE + NRO 双端重编 |
+| v15 | 实机反馈 7 项：journal 改名失败中断安装、装完仍留进度、插线等 30 s、多 NSP 播报错乱、详细信息拖窗卡顿、SDK 文案、默认 1024×768 | 105/105；双端重编，行为模拟 5/5 |
+| v16 | 装完后进度残留与状态栏冻结（时间函数缺时间推进） | 51/51；仅 EXE 重编，行为模拟 5/5 |
 
 完整明细见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -225,7 +229,7 @@ Switch 端 NRO 需要 devkitPro / libnx，编译方式见 `switch/README.md`。
 | `screenshots/` | 本汉化版界面截图 |
 | `upstream/hacbrewpacklz-upstream-source.zip` | **原始上游源码快照**（打包为 ZIP，已排除 `.git` 与二进制） |
 | `upstream/README-upstream.md` | 上游英文 README 原文 |
-| `CHANGELOG.md` | v1 → v11 逐版改动记录 |
+| `CHANGELOG.md` | v1 → v16 逐版改动记录 |
 | `LICENSE` | GNU GPL-2.0 原文 |
 
 ---
@@ -246,6 +250,7 @@ Switch 端 NRO 需要 devkitPro / libnx，编译方式见 `switch/README.md`。
 - 开发环境没有 `prod.keys`、真实 NSP 样本与真实 Switch + WinUSB 设备：
   合并打包、密钥世代写入、USB 传输安装、USB 端点真机时序（尤其 v11「通道空闲 2 秒」门槛）
   仅完成编译 / 源码断言 / 二进制核验 / 行为模拟验证，**建议实机打包后运行 `--verify` 复核**。
+- 全部游戏安装完毕后，PC 端共享服务器为常驻设计，**需手动点「停止」结束共享**（v17 自动停止需求暂未落地）。
 - Switch 端 NRO 为 ISC + curl stub 验证构建（缺 ntfs-3g / lwext4 / curl 三个 portlibs），
   在线更新不可用，NTFS / ext4 移动硬盘可能无法读取。
 - v10 之前版本生成的中文输出目录 `sdmc:/hacBrewPackLZ/已解包/` 不会自动迁移，
