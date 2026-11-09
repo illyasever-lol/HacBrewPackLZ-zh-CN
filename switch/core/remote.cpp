@@ -1,11 +1,34 @@
 #include "remote.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <deque>
 #include <map>
 
 namespace hbp::remote {
+
+std::atomic<bool> cableBusy{false};
+
+CableGuard::CableGuard(bool enabled, bool wait) {
+    if (!enabled)
+        return;
+    while (true) {
+        bool expected = false;
+        if (cableBusy.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+            _held = true;
+            return;
+        }
+        if (!wait)
+            return;
+        sys::sleepMs(1);
+    }
+}
+
+CableGuard::~CableGuard() {
+    if (_held)
+        cableBusy.store(false, std::memory_order_release);
+}
 
 namespace {
 
@@ -109,6 +132,9 @@ Status ask(const std::string& path, Command command, i64 a, i64 b, Bytes& answer
         throw ToolError("'" + path + "' 不在 PC 上");
     auto link = linkFor(id);
     sys::Lock lock(link->mutex);
+    // The cable's single endpoint pair and buffer are shared with the service probe. Hold them
+    // for the whole request/answer pair, not just one send or one receive.
+    CableGuard cable(!link->streams, true);
 
     // A connection that's gone stale gets one more go with a new one.
     for (int attempt = 0;; attempt++) {
