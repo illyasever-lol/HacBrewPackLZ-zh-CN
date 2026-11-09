@@ -1,7 +1,7 @@
 # 汉化版更新日志
 
 上游基线：hacBrewPackLZ 1.4.3（<https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz>），GPL-2.0。
-当前版本：**v12**（2026-11-08）。
+当前版本：**v16**（2026-11-09）。
 
 | 版本 | 内容 | 验证结论 |
 | --- | --- | --- |
@@ -17,8 +17,11 @@
 | v9 | NRO 四处漏译（`Compress` / `Compressing the game data` / 压缩用时 / 压缩后）；修复 USB 发送报 `Entry point was not found.`（导出名 `Free` 被误译）；进度文字产出源与中文前缀表双端同步；补齐 `Downloads` 路径与 5 处漏译（21 处 / 7 文件，EXE 与 NRO 均重编） | 60/60 断言；系统 `winusb.dll` 导出表 6/6 存在、误译名不存在；7 条旧英文 C 串 0 残留 |
 | v10 | Switch 不认中文路径：默认解包目录复原 `extracted`；`asciiPathOnly()` 对旧 `settings.txt` 残留中文目录回退；`forOutputName()` 把 UTF-8 非 ASCII 折叠为 `_`（仅 NRO 端） | 34/34（源码 14 + 3010 纯 ASCII 零回归用例 + 二进制 13 + 编译）；含中文且含 `/` 的 C 串 0 条 |
 | v11 | EXE 发送流程 11 处汉化（共享数量、局域网/防火墙、Zadig/DBI 驱动说明）；NRO 新增 USB 发送服务检测：3 s Hello 心跳 + 通道空闲 2 s 门槛 + 服务变化即自动刷新列表（18 处 / 3 文件，EXE 与 NRO 同步重编） | 94/94（源码 39 + 行为模拟 6 + NRO 二进制 17 + EXE/#US 堆 26 + 冒烟 6）；状态机模拟 6/6；停止→清除 3～5 s、恢复→新内容 3～10 s |
-
 | v12 | 两处文案修订：EXE 估算行 `game data compresses to` → `游戏数据可压缩至`；NRO 解包收尾「位于 3 s」→「用时 3 s」（`in %s` 表耗时非位置）（2 处 / 2 文件，EXE 与 NRO 同步重编） | 40/40（源码 10 + 补丁重放 4 + NRO 二进制 10 + EXE/#US 堆 12 + 构建/冒烟 4）；自包含 EXE 2/2、NRO 40 对象 0 错 0 警 |
+| v13 | **USB 长传输崩溃修复**：`2162-0002 (0x4a2)` / `usb` sysmodule。根因是 v11 心跳探针与安装事务并发 `PostBufferAsync` 同一端点与同一块 1 MiB 缓冲；新增 `cableBusy` + `CableGuard` 事务级互斥、探针 try-guard、URB 超时排空、失败退避（9 处 / 3 文件，**仅 NRO 重编**） | 51/51；40 对象全量重编 0 错 0 警；行为模拟 4 GB 并发 post 3→0 |
+| v14 | **EXE 发送死锁 + NRO 输出目录误判 + 漏译**：`SendWatch.Read()` 跨对象回调不得持自身锁发出（锁序反转）；`isDirectory()` 单次 FS 调用失败重试并回落 open；`makeDirectories()` 先判存在；补齐 `Choose:`/`Add N files`/`On-Off`/`N of M` 等漏译 | 77/77（源码 30 + 基线 15 + ELF/二进制 12 + 构建 8 + 模拟 8 + 冒烟 4）；EXE + NRO 双端重编 |
+| v15 | **实机反馈 7 项**：`saveJournal` 删+改名重试 3 次并覆写兜底（journal 失败不再中断安装）；部分读取即视为已发送；服务发现退避 30 s → 2 s；多 NSP 每文件每次发送只播报一次；多行 EDIT 加 `ES_AUTOHSCROLL` 消除拖窗重折行；SDK 帮助文案按指定文本；默认窗口 1024×768 | 105/105；EXE 2/2 + NRO 40 对象 0 错 0 警；行为模拟 5/5（journal 中断 99.85%→0） |
+| v16 | **装完后进度残留与状态栏冻结**：`Settled` 是取快照瞬间的时间函数，而 `Refresh()` 纯事件驱动，Switch 停止读取后快照被永久冻结；新增仅发送期运行的 1 s 心跳推进时间，`IsSettled(paths)` 按本行自己的文件判定，交错安装不回退 | 51/51；仅 EXE 2/2 重编 0 错 0 警；行为模拟 5/5（8 s 清进度、3 s 清状态栏、回退 46→0）；NRO 未改动 |
 
 每版均执行：补丁逐字节重放（`--check` 预检）→ 编译（2 个自包含 exe；改了 Switch 端再加 NRO）
 → `#US` / `#Strings` 堆或 NRO 二进制 C 串核验 → 运行与参数链路 / 行为级模拟验证
@@ -33,3 +36,4 @@ NRO 界面观感、NSP 传输安装需实机确认。NRO 为 ISC + curl stub 构
 
 **发布记录**：公开仓库 `illyasever-lol/HacBrewPackLZ-zh-CN`；源码 + 原版上游 ZIP + 界面截图
 随版本同步；`hacBrewPackLZ_zh.nro` 与 `hacbrewpacklz-gui_zh.exe` 等二进制走 Releases。
+v13～v16 四版累积改动于 v16 一次性同步，v11 / v12 Release 原样保留。
