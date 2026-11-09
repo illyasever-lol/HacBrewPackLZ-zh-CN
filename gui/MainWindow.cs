@@ -25,12 +25,14 @@ internal sealed class MainWindow : AppWindow
     private bool _closeWhenIdle;
     private FormWindow? _optionsWindow;
     private Timer? _animation;
+    /// Keeps the sending snapshot fresh after the Switch stops asking for data.
+    private Timer? _sendTick;
 
     public MainWindow(Session session)
     {
         _session = session;
         _state = session.Snapshot();
-        CreateTopLevel(AppInfo.Name, 920, 620, null);
+        CreateTopLevel(AppInfo.Name, 1024, 768, null);
 
         _list = Add(new TitleList(row => _session.Toggle(row), all => _session.SelectAll(all), row => _session.Remove(row), issue => _session.Remove(issue), Explorer.Show,
             ShowNotes, ShowCompressed));
@@ -87,6 +89,26 @@ internal sealed class MainWindow : AppWindow
         }
     }
 
+    /// A sending session raises no events at all once the Switch stops reading. Without
+    /// this slow tick the last snapshot stays on screen forever, still showing a stale
+    /// "正在发送 66%" and the name of a file that finished long ago. One refresh a second
+    /// is plenty for the 8 second settle window and keeps the details log cheap: SetLines
+    /// only appends lines, and does nothing at all when the count hasn't changed.
+    private void TickSending(bool on)
+    {
+        if (on && _sendTick is null)
+            _sendTick = new Timer(_ =>
+            {
+                Interlocked.Exchange(ref _refreshPending, 1);
+                PostFromWorker();
+            }, null, 1000, 1000);
+        else if (!on && _sendTick is not null)
+        {
+            _sendTick.Dispose();
+            _sendTick = null;
+        }
+    }
+
     protected override void OnThemeChanged() => _log.ApplyTheme();
 
     /// <summary>What else can be done with what's on the list, from the arrow at the end of the Compress button.</summary>
@@ -112,8 +134,8 @@ internal sealed class MainWindow : AppWindow
         if (names.Length > 0)
         {
             const int NamesShown = 6;
-            string list = string.Join("\n", names.Take(NamesShown)) + (names.Length > NamesShown ? $"\nand {names.Length - NamesShown} more" : "");
-            int answer = Win32.MessageBoxW(Handle, $"With compression off, repacking only makes a title smaller by making its update part of it, and these have none:\n\n{list}\n\nUntick them?\n\nNo repacks them too.", AppInfo.Name, Win32.MB_YESNOCANCEL | Win32.MB_ICONINFORMATION);
+            string list = string.Join("\n", names.Take(NamesShown)) + (names.Length > NamesShown ? $"\n另有 {names.Length - NamesShown} 个" : "");
+            int answer = Win32.MessageBoxW(Handle, $"关闭压缩后，重新打包只能靠把更新包并入本体来缩小体积，而以下游戏没有更新包：\n\n{list}\n\n是否取消勾选它们？\n\n选「否」则仍会一并重新打包。", AppInfo.Name, Win32.MB_YESNOCANCEL | Win32.MB_ICONINFORMATION);
             if (answer == Win32.IDCANCEL)
                 return;
             if (answer == Win32.IDYES)
@@ -136,6 +158,7 @@ internal sealed class MainWindow : AppWindow
     protected override void OnClosed()
     {
         Animate(false);
+        TickSending(false);
         Win32.PostQuitMessage(0);
     }
 
@@ -161,13 +184,17 @@ internal sealed class MainWindow : AppWindow
 
         _state = state;
         _list.SetData(state);
-        _log.SetLines(state.Log);
+        // The details drawer is hidden most of the time; feeding the native EDIT while
+        // it's hidden only grows the text it has to re-wrap on the next resize.
+        if (_log.Visible)
+            _log.SetLines(state.Log);
         _compress.Text = compressLabel;
         UpdateEnabled();
         TaskbarProgress.Set(Handle, ProgressFraction(state));
         bool sliding = state.IsBusy && ProgressFraction(state) is null;
         _progress.Sliding = sliding;
         Animate(sliding);
+        TickSending(state.Activity == SessionActivity.Sending);
         if (layoutChanged)
             Relayout();
         Invalidate();
@@ -540,5 +567,7 @@ internal sealed class MainWindow : AppWindow
     {
         _showDetails = !_showDetails;
         Relayout();
+        if (_log.Visible)
+            _log.SetLines(_state.Log);
     }
 }
