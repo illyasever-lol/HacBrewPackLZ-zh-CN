@@ -100,7 +100,7 @@ internal sealed record SessionSnapshot(
     public bool IsBusy => Activity != SessionActivity.Idle;
 
     /// <summary>What reading is on, such as "正在打开游戏文件：12 个中的第 3 个".</summary>
-    public string ReadingText => CurrentTitle is null ? "正在读取文件" : CurrentCount > 0 ? $"{CurrentTitle}: {CurrentIndex} of {CurrentCount}" : CurrentTitle;
+    public string ReadingText => CurrentTitle is null ? "正在读取文件" : CurrentCount > 0 ? $"{CurrentTitle}: {CurrentIndex}/{CurrentCount}" : CurrentTitle;
 }
 
 /// <summary>
@@ -187,6 +187,9 @@ internal sealed class Session : IUiSink, IDisposable
 
     public SessionSnapshot Snapshot()
     {
+        // SendWatch has its own lock. Take it before _gate, never inside it: progress
+        // reporting used to run the other way round, which is a lock-order inversion.
+        SendSnapshot? send = _sendWatch?.Snapshot();
         lock (_gate)
         {
             var shown = VisibleRowsLocked();
@@ -194,7 +197,7 @@ internal sealed class Session : IUiSink, IDisposable
             // What could be hidden again, once it's been asked to be shown.
             int shownCompressed = Settings.Get("--showcompressed") == "1" ? _rows.Count(r => r.IsCompressed && r.State != RowState.Done) : 0;
             return new SessionSnapshot(_activity, shown.ToArray(), _issues.Concat(_expansionIssues).ToArray(), _notes.Concat(_titleNotes).ToArray(), _log.ToArray(),
-                _progress, _keyProblem, _currentTitle, _currentIndex, _currentCount, _summary, _summaryLevel, _lastOutput, _updateNote, _sendWatch?.Snapshot(),
+                _progress, _keyProblem, _currentTitle, _currentIndex, _currentCount, _summary, _summaryLevel, _lastOutput, _updateNote, send,
                 hidden, _hiddenSmall, shownCompressed);
         }
     }
