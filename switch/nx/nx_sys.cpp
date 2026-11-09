@@ -323,8 +323,20 @@ bool isDirectory(const std::string& path) {
         struct stat info;
         return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
     }
-    FsDirEntryType type;
-    return R_SUCCEEDED(fsFsGetEntryType(sdCard(), inner(path), &type)) && type == FsDirEntryType_Dir;
+    // One GetEntryType call is not enough: the FS session is shared with the file scan
+    // on another thread, and a single failed call used to make an existing output
+    // folder look unreachable. Retry, then open it, which is the authoritative test.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        FsDirEntryType type;
+        if (R_SUCCEEDED(fsFsGetEntryType(sdCard(), inner(path), &type)))
+            return type == FsDirEntryType_Dir;
+        sys::sleepMs(10 * (attempt + 1));
+    }
+    FsDir dir;
+    if (R_FAILED(fsFsOpenDirectory(sdCard(), inner(path), FsDirOpenMode_ReadDirs, &dir)))
+        return false;
+    fsDirClose(&dir);
+    return true;
 }
 
 std::vector<DirEntry> list(const std::string& path, bool sizes) {
@@ -416,6 +428,10 @@ void makeDirectories(const std::string& path) {
         return;
     }
     FsFileSystem* fs = sdCard();
+    // Already there: leave the shared FS session alone. Re-posting CreateDirectory
+    // for a folder that exists is what makes the following entry-type query fail.
+    if (isDirectory(path))
+        return;
     const char* whole = inner(path);
     std::string part;
     for (const char* c = whole;; c++) {
