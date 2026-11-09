@@ -441,9 +441,17 @@ private:
                     continue;
             }
             usbDsEndpoint_Cancel(endpoint);
-            // The transfer has stopped by the time it says it's finished, and only then can the buffer be used again.
-            waitSingle(waiterForEvent(&endpoint->CompletionEvent), 1000000000ULL);
+            // The transfer has stopped by the time it says it's finished, and only then can the
+            // buffer be used again. Keep waiting for that event: reusing a buffer the console's
+            // usb system module still has in flight corrupts its own state.
+            for (int i = 0; i < 20; i++)
+                if (R_SUCCEEDED(waitSingle(waiterForEvent(&endpoint->CompletionEvent), 100000000ULL)))
+                    break;
             eventClear(&endpoint->CompletionEvent);
+            // A cancelled URB can leave a report behind. Drain it while the cable is ours, so
+            // the next transfer isn't matched against a stale entry.
+            UsbDsReportData cancelled;
+            usbDsEndpoint_GetReportData(endpoint, &cancelled);
             _outOfStep = true;
             if (givingWay)
                 throw Cancelled();
@@ -454,6 +462,9 @@ private:
         u32 requested = 0, transferred = 0;
         if (R_FAILED(usbDsEndpoint_GetReportData(endpoint, &report)) || R_FAILED(usbDsParseReportData(&report, urb, &requested, &transferred)))
             throw ToolError("USB 数据线已断开");
+        // Refreshed on every completed transfer, not just at the start of a large read: a long
+        // answer must never look like an idle cable to the service probe.
+        g_lastUsbTraffic.store(sys::now(), std::memory_order_relaxed);
         return std::min<size_t>(transferred, size);
     }
 };
@@ -495,7 +506,12 @@ bool usbToPc() {
 }
 
 /// Asks the PC on the cable what it's called, not waiting long, as nothing may be running there to answer.
-std::string askUsbName() {
+/// False when an install owns the cable: the probe is skipped altogether, and the last name is
+/// kept. The whole probe holds cableBusy, so it can never be posted alongside a request/answer.
+bool askUsbName(std::string& name) {
+    CableGuard probe(true, false);
+    if (!probe.held())
+        return false;
     constexpr u64 ShortWait = 1500000000ULL;
     try {
         UsbPort& port = UsbPort::get();
@@ -506,19 +522,21 @@ std::string askUsbName() {
         port.read(header, sizeof(header), ShortWait);
         u64 length = 0;
         memcpy(&length, header + 8, 8);
+        name.clear();
         if (memcmp(header, "HBPR", 4) != 0 || length == 0 || length > 1024)
-            return "";
+            return true;
         std::string text(length, '\0');
         port.read((u8*)text.data(), length, ShortWait);
         size_t line = text.find('\n');
-        std::string name = line == std::string::npos ? "" : text.substr(line + 1);
+        name = line == std::string::npos ? "" : text.substr(line + 1);
         for (char& c : name) {
             if (c == '/' || c == '\\' || c == ':' || (u8)c < ' ')
                 c = '-';
         }
-        return name;
+        return true;
     } catch (const ToolError&) {
-        return "";
+        name.clear();
+        return true;
     }
 }
 
@@ -531,11 +549,18 @@ void watchCable() {
     /// leave its games on the list until the cable was pulled and plugged back in.
     constexpr double AskAgainSeconds = 10;
     constexpr double AliveCheckSeconds = 3;
+    /// A probe that went unanswered is retried shortly, not half a minute later: the PC
+    /// service is usually started after the cable is plugged in, and its files must show up
+    /// at once. The CableGuard in askUsbName() already skips the whole probe when an install
+    /// owns the cable, so a long backoff only delayed discovery without protecting anything.
+    constexpr double FailedAgainSeconds = 2;
     /// A probe goes through the same endpoint as everything else, so it waits until the cable has
-    /// been quiet for this long, keeping out of the way of an install or a list scan.
+    /// been quiet for this long, keeping out of the way of an install or a list scan. The guard
+    /// in askUsbName() is what makes this safe; this is only about not holding up an install.
     constexpr double QuietSeconds = 2;
     bool asked = false;
     double askedAt = 0;
+    bool lastFailed = false;
     while (!g_stopping) {
         bool there = usbToPc();
         bool ask = false;
@@ -543,30 +568,32 @@ void watchCable() {
             sys::Lock lock(g_usbMutex);
             if (!there) {
                 asked = false;
+                lastFailed = false;
                 if (!g_usbName.empty())
                     g_changed = true;
                 g_usbName.clear();
             } else if (!asked) {
                 asked = true;
-                askedAt = sys::now();
                 ask = true;
             } else {
                 double now = sys::now();
-                double interval = g_usbName.empty() ? AskAgainSeconds : AliveCheckSeconds;
-                // Leave the timestamp alone until a probe really goes out, so a busy cable only
-                // delays it instead of putting it off for another whole interval.
+                double interval = lastFailed ? FailedAgainSeconds
+                                 : g_usbName.empty() ? AskAgainSeconds : AliveCheckSeconds;
                 if (now - askedAt >= interval &&
-                    now - g_lastUsbTraffic.load(std::memory_order_relaxed) >= QuietSeconds) {
-                    askedAt = now;
+                    now - g_lastUsbTraffic.load(std::memory_order_relaxed) >= QuietSeconds)
                     ask = true;
-                }
             }
         }
         if (ask) {
-            std::string name = askUsbName();
-            sys::Lock lock(g_usbMutex);
-            g_changed = g_changed || name != g_usbName;
-            g_usbName = name;
+            std::string name;
+            // A skipped probe leaves askedAt alone, so it's retried as soon as the cable is free.
+            if (askUsbName(name)) {
+                askedAt = sys::now();
+                lastFailed = name.empty();
+                sys::Lock lock(g_usbMutex);
+                g_changed = g_changed || name != g_usbName;
+                g_usbName = name;
+            }
         }
         for (int i = 0; i < 5 && !g_stopping; i++)
             sys::sleepMs(100);
