@@ -242,7 +242,7 @@ internal sealed class FormWindow : AppWindow
         string? chosen;
         if (option.Kind == OptionKind.Folder)
         {
-            chosen = FileDialogs.OpenFolders(Handle, $"Choose: {option.Label}", multiple: false).FirstOrDefault();
+            chosen = FileDialogs.OpenFolders(Handle, $"选择：{option.Label}", multiple: false).FirstOrDefault();
         }
         else if (option.Flag == "--output")
         {
@@ -251,7 +251,7 @@ internal sealed class FormWindow : AppWindow
         else
         {
             bool keys = option.Flag == "--keyset";
-            chosen = FileDialogs.OpenFiles(Handle, $"Choose: {option.Label}", keys ? "密钥" : "NSP 文件", keys ? "*.keys;*.txt;*.dat;*.ini" : "*.nsp", multiple: false).FirstOrDefault();
+            chosen = FileDialogs.OpenFiles(Handle, $"选择：{option.Label}", keys ? "密钥" : "NSP 文件", keys ? "*.keys;*.txt;*.dat;*.ini" : "*.nsp", multiple: false).FirstOrDefault();
         }
         if (chosen is null)
             return;
@@ -586,12 +586,12 @@ internal sealed class SearchWindow : AppWindow
     {
         var visible = _list.Files;
         int chosen = visible.Count(f => f.Chosen);
-        _addButton.Text = chosen == 1 ? "Add 1 file" : $"Add {chosen} files";
+        _addButton.Text = chosen == 1 ? "添加 1 个文件" : $"添加 {chosen} 个文件";
         _addButton.Enabled = chosen > 0;
         _selectAll.Text = visible.Count > 0 && chosen == visible.Count ? "取消全选" : "全选";
         long bytes = visible.Where(f => f.Chosen).Sum(f => f.Size);
-        string found = $"{visible.Count} found";
-        _status = (_searching ? "正在搜索…" : "") + found + (chosen > 0 ? $", {ProgressReporter.Format(bytes)} chosen" : "");
+        string found = $"共找到 {visible.Count} 个文件";
+        _status = (_searching ? "正在搜索…" : "") + found + (chosen > 0 ? $"，已选 {ProgressReporter.Format(bytes)}" : "");
         Relayout();
     }
 
