@@ -34,6 +34,25 @@ void randomBytes(void* out, size_t size) {
 
 static fs::path toPath(const std::string& path) { return fs::u8path(path); }
 
+/// For the tests: the system turning down every request about these files, '|' between them, while HBP_TEST_REFUSE names them, as a real
+/// console has been seen to with files in the app's own folder at start-up. As there, a file that isn't there is said not to be, unless its
+/// name has a ! in front: then making it is turned down too, as a tester's console did with log.txt each time the app opened.
+static std::string refusedNames() {
+    const char* refused = getenv("HBP_TEST_REFUSE");
+    return refused && *refused ? std::string("|") + refused + "|" : std::string();
+}
+
+static bool refusedEvenIfMissing(const std::string& path) { return refusedNames().find("|!" + path + "|") != std::string::npos; }
+
+static bool refusedForTest(const std::string& path) {
+    if (refusedEvenIfMissing(path))
+        return true;
+    if (refusedNames().find("|" + path + "|") == std::string::npos)
+        return false;
+    std::error_code error;
+    return fs::exists(toPath(path), error);
+}
+
 struct File::Impl {
     std::shared_ptr<remote::RemoteFile> remote;
     std::mutex lock;
@@ -44,17 +63,22 @@ struct File::Impl {
 File::File(const std::string& path, Mode mode, i64) : _impl(new Impl) {
     if (remote::isRemote(path)) {
         if (mode != Mode::Read)
-            throw ToolError("PC 上的文件只能读取");
+            throw ToolError("Files on a PC can only be read");
         _impl->path = path;
         _impl->remote = remote::open(path);
         return;
     }
+    if (refusedForTest(path)) {
+        delete _impl;
+        _impl = nullptr;
+        throw ToolError(format("Couldn't open '%s' (2001-0106)", path.c_str()));
+    }
     _impl->path = path;
 #ifdef _WIN32
-    const wchar_t* flags = mode == Mode::Read ? L"rb" : mode == Mode::Create || mode == Mode::CreateOnce || mode == Mode::Sized ? L"w+b" : L"r+b";
+    const wchar_t* flags = mode == Mode::Read ? L"rb" : mode == Mode::Create || mode == Mode::Sized ? L"w+b" : L"r+b";
     _impl->file = _wfopen(toPath(path).c_str(), flags);
 #else
-    const char* flags = mode == Mode::Read ? "rb" : mode == Mode::Create || mode == Mode::CreateOnce || mode == Mode::Sized ? "w+b" : "r+b";
+    const char* flags = mode == Mode::Read ? "rb" : mode == Mode::Create || mode == Mode::Sized ? "w+b" : "r+b";
     _impl->file = fopen(path.c_str(), flags);
 #endif
     if (!_impl->file) {
@@ -87,7 +111,15 @@ void File::setSize(i64 size) {
         throw ToolError(format("Couldn't resize '%s'", _impl->path.c_str()));
 }
 
-bool File::reserve(i64) { return false; }
+/// As the SD card does it, so that what sets room aside gets tested: the file is that size until it's put right at the end.
+bool File::reserve(i64 size) {
+    try {
+        setSize(size);
+        return true;
+    } catch (const ToolError&) {
+        return false;
+    }
+}
 
 static void seekTo(FILE* file, i64 offset) {
 #ifdef _WIN32
@@ -112,7 +144,7 @@ void File::read(i64 offset, void* buffer, size_t count) {
 
 void File::write(i64 offset, const void* buffer, size_t count) {
     if (_impl->remote)
-        throw ToolError("PC 上的文件只能读取");
+        throw ToolError("Files on a PC can only be read");
     if (count == 0)
         return;
     std::lock_guard<std::mutex> guard(_impl->lock);
@@ -139,23 +171,43 @@ void File::close() {
     _impl = nullptr;
 }
 
-bool exists(const std::string& path) {
+Presence presence(const std::string& path) {
     if (remote::isRemote(path))
-        return remote::isDirectory(path) || remote::fileSize(path) >= 0;
+        return remote::isDirectory(path) || remote::fileSize(path) >= 0 ? Presence::There : Presence::Missing;
+    if (refusedForTest(path))
+        return Presence::CantTell;
     std::error_code error;
-    return fs::exists(toPath(path), error);
+    return fs::exists(toPath(path), error) ? Presence::There : Presence::Missing;
 }
+
+bool exists(const std::string& path) { return presence(path) != Presence::Missing; }
 
 bool isDirectory(const std::string& path) {
     if (remote::isRemote(path))
         return remote::isDirectory(path);
+    if (refusedForTest(path))
+        return false;
     std::error_code error;
     return fs::is_directory(toPath(path), error);
 }
 
-std::vector<DirEntry> list(const std::string& path, bool sizes) {
+Presence folderPresence(const std::string& path) {
     if (remote::isRemote(path))
-        return remote::list(path);
+        return remote::folderPresence(path);
+    if (refusedForTest(path))
+        return Presence::CantTell;
+    std::error_code error;
+    return fs::is_directory(toPath(path), error) ? Presence::There : Presence::Missing;
+}
+
+std::vector<DirEntry> list(const std::string& path, bool sizes, bool* refused) {
+    if (remote::isRemote(path))
+        return remote::list(path, refused);
+    if (refusedForTest(path)) {
+        if (refused)
+            *refused = true;
+        return {};
+    }
     // For the tests: a folder with "slow" in its path takes this long to list, as one on a slow card or drive can.
     const char* slow = getenv("HBP_TEST_SLOW_LIST_MS");
     if (slow && *slow && path.find("slow") != std::string::npos)
@@ -175,6 +227,8 @@ std::vector<DirEntry> list(const std::string& path, bool sizes) {
 i64 fileSize(const std::string& path) {
     if (remote::isRemote(path))
         return remote::fileSize(path);
+    if (refusedForTest(path))
+        return -1;
     std::error_code error;
     auto size = fs::file_size(toPath(path), error);
     return error ? -1 : (i64)size;
@@ -187,7 +241,8 @@ void makeDirectories(const std::string& path) {
     fs::create_directories(toPath(path), error);
 }
 
-i64 outOfHandlesCount() { return 0; }
+Refusals refusals() { return {}; }
+std::vector<std::string> takeRefusalDetails() { return {}; }
 
 void makeDirectory(const std::string& path) {
     std::error_code error;
@@ -195,6 +250,8 @@ void makeDirectory(const std::string& path) {
 }
 
 bool removeFile(const std::string& path) {
+    if (refusedForTest(path))
+        return false;
     std::error_code error;
     return fs::remove(toPath(path), error);
 }
@@ -209,7 +266,29 @@ bool removeTree(const std::string& path) {
     return fs::remove_all(toPath(path), error) > 0;
 }
 
+/// For the tests: renaming anything to HBP_TEST_REFUSE_RENAME turned down the first HBP_TEST_REFUSE_RENAME_TIMES times, and then let through,
+/// as a card can turn a request down for a moment.
+static bool renameRefusedForTest(const std::string& to) {
+    static std::mutex lock;
+    static std::string counting;
+    static int left = 0;
+    const char* path = getenv("HBP_TEST_REFUSE_RENAME");
+    const char* times = getenv("HBP_TEST_REFUSE_RENAME_TIMES");
+    if (!path || !*path || to != path)
+        return false;
+    std::lock_guard<std::mutex> hold(lock);
+    // Counted afresh whenever what's asked for changes, the path or how many times.
+    std::string asked = to + "|" + (times ? times : "1");
+    if (counting != asked) {
+        counting = asked;
+        left = times ? atoi(times) : 1;
+    }
+    return left-- > 0;
+}
+
 void renameFile(const std::string& from, const std::string& to) {
+    if (refusedEvenIfMissing(from) || refusedEvenIfMissing(to) || renameRefusedForTest(to))
+        throw ToolError(format("Couldn't rename '%s' (2001-0106)", from.c_str()));
     std::error_code error;
     fs::rename(toPath(from), toPath(to), error);
     if (error)
@@ -243,6 +322,11 @@ i64 workMemory() {
     return wanted && *wanted ? atoll(wanted) : INT64_MAX;
 }
 
+// The PC's heap isn't the console's, so there's nothing about it worth putting in a log.
+HeapUse heapUse(bool) { return HeapUse(); }
+std::string refusedAllocations() { return std::string(); }
+void noteRefusalForLog(size_t) {}
+
 void commit(const std::string&) {}
 
 struct Mutex::Impl {
@@ -252,6 +336,7 @@ Mutex::Mutex() : _impl(new Impl) {}
 Mutex::~Mutex() { delete _impl; }
 void Mutex::lock() { _impl->value.lock(); }
 void Mutex::unlock() { _impl->value.unlock(); }
+bool Mutex::tryLock() { return _impl->value.try_lock(); }
 
 struct CondVar::Impl {
     std::condition_variable_any value;

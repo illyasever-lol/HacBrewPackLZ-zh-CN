@@ -1,4 +1,4 @@
-﻿# libusbhsfs
+# libusbhsfs
 USB Mass Storage Class Host + Filesystem Mounter static library for Nintendo Switch homebrew applications.
 
 Main features

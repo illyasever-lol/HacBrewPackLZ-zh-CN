@@ -26,6 +26,10 @@ internal sealed class Keyset
 
     public byte[]? TryTitleKey(string rightsId) => _titleKeys.GetValueOrDefault(rightsId);
 
+    /// <summary>Every key's value in hex, so that whatever's shared can be made sure not to hold any of them.</summary>
+    public IEnumerable<string> Secrets() =>
+        _keys.Values.Concat(_titleKeys.Values).Where(k => k.Length >= 8).Select(Convert.ToHexString);
+
     private static readonly string[] DefaultNames = ["keys.dat", "keys.txt", "keys.ini", "prod.keys"];
 
     /// <summary>Whether a dropped file is meant as a keyset rather than as something to convert.</summary>
@@ -63,6 +67,7 @@ internal sealed class Keyset
     {
         var keyset = new Keyset();
         ReadKeyFile(path, keyset._keys);
+        keyset.DeriveMissing();
         string titleKeys = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, "title.keys");
         if (File.Exists(titleKeys))
             ReadKeyFile(titleKeys, keyset._titleKeys);
@@ -83,6 +88,34 @@ internal sealed class Keyset
             if (value.Length % 2 != 0 || !value.All(Uri.IsHexDigit))
                 continue;
             keys[line[..eq].Trim()] = Convert.FromHexString(value);
+        }
+    }
+
+    /// <summary>The keys each master key leads to, worked out the way Lockpick and hactool do, for any that the file doesn't have but has what
+    /// they come from: a file can have every master key and only some of what comes from them, and the games then run but can't be read here.</summary>
+    private void DeriveMissing()
+    {
+        byte[]? Get(string name) => _keys.TryGetValue(name, out var key) && key.Length == 16 ? key : null;
+        var kekSeed = Get("aes_kek_generation_source");
+        var keySeed = Get("aes_key_generation_source");
+        var titleKekSource = Get("titlekek_source");
+        for (int generation = 0; generation < 0x40; generation++)
+        {
+            if (Get($"master_key_{generation:x2}") is not { } master)
+                continue;
+            if (titleKekSource is not null && Get($"titlekek_{generation:x2}") is null)
+                _keys[$"titlekek_{generation:x2}"] = NcaCrypto.EcbDecrypt(master, titleKekSource);
+            if (kekSeed is null || keySeed is null)
+                continue;
+            foreach (string kind in (string[])["application", "ocean", "system"])
+            {
+                string name = $"key_area_key_{kind}_{generation:x2}";
+                if (Get($"key_area_key_{kind}_source") is not { } source || Get(name) is not null)
+                    continue;
+                var kek = NcaCrypto.EcbDecrypt(master, kekSeed);
+                var sourceKek = NcaCrypto.EcbDecrypt(kek, source);
+                _keys[name] = NcaCrypto.EcbDecrypt(sourceKek, keySeed);
+            }
         }
     }
 

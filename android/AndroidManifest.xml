@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Reads games where they are and saves beside them, as on a PC. -->
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+  <!-- Sharing games with the Switch over Wi-Fi. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+  <!-- Keeps going with the screen off or the app in the background. -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <!-- Installs a newer version, once the person agrees. -->
+  <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+  <application android:label="hacBrewPackLZ" android:icon="@mipmap/icon" android:roundIcon="@mipmap/icon"
+      android:theme="@style/AppTheme" android:requestLegacyExternalStorage="true" android:supportsRtl="true">
+    <service android:name="hacbrewpacklz.WorkService" android:exported="false" android:foregroundServiceType="specialUse">
+      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="Compressing game files and sharing them with a game console, which can take hours and has to carry on with the screen off." />
+    </service>
+    <receiver android:name="hacbrewpacklz.InstallReceiver" android:exported="false" />
+  </application>
+</manifest>

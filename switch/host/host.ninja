@@ -1,0 +1,86 @@
+# The engine and the app built for a PC, for testing, as build.cmd builds them, with build_fast.cmd saying where the sources are ($sw).
+# Ninja keeps track of which headers each file includes as it compiles it, so a build in the same folder again only compiles what changed,
+# and every file that includes a header that changed.
+ninja_required_version = 1.7
+
+flags = /nologo /std:c++17 /EHsc /W3 /utf-8 /wd4267 /wd4244 /wd4996 /D_CRT_SECURE_NO_WARNINGS /D_SILENCE_CXX17_U8PATH_DEPRECATION_WARNING /DNOMINMAX /DWIN32_LEAN_AND_MEAN
+
+rule cxx
+  command = cl $flags /O2 /showIncludes /c $in /Fo$out
+  deps = msvc
+  description = $in
+
+# The test programs' own code only drives the engine and the app, so it isn't optimized: it compiles in seconds rather than minutes, and the
+# tests run as fast.
+rule cxx_test
+  command = cl $flags /Od /showIncludes /c $in /Fo$out
+  deps = msvc
+  description = $in
+
+rule cc
+  command = cl /nologo /O2 /W3 /std:c11 /showIncludes /c $in /Fo$out
+  deps = msvc
+  description = $in
+
+rule link
+  command = link /nologo /OUT:$out $in $libs
+  description = $out
+
+# The time the app says it was built is had afresh each time, as in the Switch build.
+build always: phony
+
+build obj/common.obj: cxx $sw/core/common.cpp
+build obj/crypto.obj: cxx $sw/core/crypto.cpp
+build obj/source.obj: cxx $sw/core/source.cpp
+build obj/lz4.obj: cxx $sw/core/lz4.cpp
+build obj/zstd.obj: cxx $sw/core/zstd.cpp
+build obj/ncz.obj: cxx $sw/core/ncz.cpp
+build obj/nca.obj: cxx $sw/core/nca.cpp
+build obj/nacp.obj: cxx $sw/core/nacp.cpp
+build obj/ncaout.obj: cxx $sw/core/ncaout.cpp
+build obj/title.obj: cxx $sw/core/title.cpp
+build obj/build.obj: cxx $sw/core/build.cpp
+build obj/console.obj: cxx $sw/core/console.cpp
+build obj/remote.obj: cxx $sw/core/remote.cpp
+build obj/host_sys.obj: cxx $sw/host/host_sys.cpp
+build obj/host_remote.obj: cxx $sw/host/host_remote.cpp
+
+build obj/canvas.obj: cxx $sw/app/canvas.cpp
+build obj/app.obj: cxx $sw/app/app.cpp
+build obj/app_saved.obj: cxx $sw/app/app_saved.cpp
+build obj/app_lists.obj: cxx $sw/app/app_lists.cpp
+build obj/app_work.obj: cxx $sw/app/app_work.cpp
+build obj/app_actions.obj: cxx $sw/app/app_actions.cpp
+build obj/app_input.obj: cxx $sw/app/app_input.cpp
+build obj/app_draw.obj: cxx $sw/app/app_draw.cpp
+build obj/app_help.obj: cxx $sw/app/app_help.cpp
+build obj/app_problems.obj: cxx $sw/app/app_problems.cpp
+build obj/app_inside.obj: cxx $sw/app/app_inside.cpp
+build obj/app_picture.obj: cxx $sw/app/app_picture.cpp
+build obj/app_mono_font.obj: cxx $sw/app/app_mono_font.cpp
+build obj/app_built.obj: cxx $sw/app/app_built.cpp | always
+build obj/qrcodegen.obj: cc $sw/third_party/qrcodegen/qrcodegen.c
+
+build obj/sim_console.obj: cxx $sw/host/sim_console.cpp
+build obj/hbptool.obj: cxx $sw/host/hbptool.cpp
+build obj/replace_test.obj: cxx_test $sw/host/replace_test.cpp
+build obj/app_test.obj: cxx_test $sw/host/app_test.cpp
+build obj/app_check.obj: cxx_test $sw/host/app_check.cpp
+
+build hbptool.exe: link obj/common.obj obj/crypto.obj obj/source.obj obj/lz4.obj obj/zstd.obj obj/ncz.obj obj/nca.obj obj/nacp.obj obj/ncaout.obj $
+    obj/title.obj obj/build.obj obj/console.obj obj/remote.obj obj/host_sys.obj obj/host_remote.obj obj/hbptool.obj
+
+build replace_test.exe: link obj/common.obj obj/crypto.obj obj/source.obj obj/lz4.obj obj/zstd.obj obj/ncz.obj obj/nca.obj obj/nacp.obj $
+    obj/ncaout.obj obj/title.obj obj/build.obj obj/console.obj obj/remote.obj obj/host_sys.obj obj/host_remote.obj obj/sim_console.obj $
+    obj/replace_test.obj
+
+build app_test.exe: link obj/common.obj obj/crypto.obj obj/source.obj obj/lz4.obj obj/zstd.obj obj/ncz.obj obj/nca.obj obj/nacp.obj $
+    obj/ncaout.obj obj/title.obj obj/build.obj obj/console.obj obj/remote.obj obj/host_sys.obj obj/host_remote.obj obj/sim_console.obj $
+    obj/canvas.obj obj/app.obj obj/app_saved.obj obj/app_lists.obj obj/app_work.obj obj/app_actions.obj obj/app_input.obj obj/app_draw.obj $
+    obj/app_help.obj obj/app_problems.obj obj/app_inside.obj obj/app_picture.obj obj/app_mono_font.obj obj/app_built.obj obj/qrcodegen.obj obj/app_test.obj $
+    obj/app_check.obj
+  # The tests' code isn't optimized, so each of the screens it looks at keeps a place of its own on the stack, which takes far more than
+  # the usual megabyte.
+  libs = ole32.lib oleaut32.lib windowscodecs.lib /STACK:67108864
+
+default hbptool.exe replace_test.exe app_test.exe

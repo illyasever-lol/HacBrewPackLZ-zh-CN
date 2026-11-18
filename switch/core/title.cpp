@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <set>
 
 #include "lz4.h"
@@ -26,12 +27,12 @@ ContentMeta ContentMeta::parse(Bytes bytes, const std::string& what) {
     constexpr int HeaderSize = 0x20;
     constexpr int RecordSize = 0x38;
     if (bytes.size() < HeaderSize)
-        throw ToolError(what + "的内容元数据已损坏");
+        throw ToolError(what + " 的内容元数据已损坏");
     const u8* r = bytes.data();
     int extended = rd16(r + 0x0E);
     int count = rd16(r + 0x10);
     if (HeaderSize + extended + count * (i64)RecordSize > (i64)bytes.size())
-        throw ToolError(what + "的内容元数据已损坏");
+        throw ToolError(what + " 的内容元数据已损坏");
 
     ContentMeta meta;
     for (int i = 0; i < count; i++) {
@@ -57,6 +58,9 @@ Bytes ContentMeta::rebuild(u32 newVersion, u32 required, const std::vector<Conte
     wr32(c + 8, newVersion);
     wr16(c + 0x10, (u16)list.size());
     wr16(c + 0x12, 0);
+    // A base game cut down to go with its update is marked as needing it. What's made here always has all of the game, so the mark goes:
+    // one that kept it had DBI warn that it needed its update, and didn't start.
+    c[0x14] &= (u8)~Cnmt::AttributeCompacted;
     if ((type == Cnmt::MetaApplication || type == Cnmt::MetaPatch) && extendedHeaderSize >= 0xC)
         wr32(c + 0x28, required);
     // A game asking for a newer version of itself than the one that's in here would only have the console say to update it before it starts.
@@ -108,6 +112,10 @@ std::string stemOf(const std::string& path) {
 }  // namespace
 
 bool FileArchive::isGameFile(const std::string& path) {
+    // A Mac copying files to a card leaves "._" files beside them, which hold what Finder knows about each and aren't games.
+    size_t slash = path.find_last_of("/\\");
+    if (path.compare(slash == std::string::npos ? 0 : slash + 1, 2, "._") == 0)
+        return false;
     return endsWithNoCase(path, ".nsp") || endsWithNoCase(path, ".nsz") || endsWithNoCase(path, ".xci") || endsWithNoCase(path, ".xcz");
 }
 
@@ -150,7 +158,7 @@ void FileArchive::readPartition() {
     int count = rdi32(head + 4);
     int nameTable = rdi32(head + 8);
     i64 tableSize = count * 0x18LL + nameTable;
-    if (count < 0 || count > MaxEntries || nameTable < 0 || 0x10 + tableSize > _length)
+    if (count < 0 || count > MaxEntries || nameTable < 0 || nameTable > MostTable || !fitsWithin(0x10, tableSize, _length))
         throw ToolError("'" + _path + "' 的 NSP 头已损坏");
 
     Bytes table((size_t)tableSize);
@@ -162,7 +170,7 @@ void FileArchive::readPartition() {
         i64 offset = rdi64(e);
         i64 size = rdi64(e + 8);
         int nameOffset = rdi32(e + 0x10);
-        if (offset < 0 || size < 0 || dataStart + offset + size > _length || nameOffset < 0 || nameOffset >= nameTable)
+        if (!fitsWithin(offset, size, _length - dataStart) || nameOffset < 0 || nameOffset >= nameTable)
             throw ToolError("'" + _path + "' 的 NSP 条目已损坏");
         _entries.push_back(Entry{std::string(names + nameOffset, strnlen(names + nameOffset, (size_t)(nameTable - nameOffset))), dataStart + offset, size});
     }
@@ -196,7 +204,7 @@ std::vector<Archive::Entry> FileArchive::readHfs0(i64 start, bool mustFit) {
     int count = rdi32(head + 4);
     int nameTable = rdi32(head + 8);
     i64 tableSize = count * (i64)Hfs0EntrySize + nameTable;
-    if (count < 0 || count > MaxEntries || nameTable < 0 || start + Hfs0HeaderSize + tableSize > _length)
+    if (count < 0 || count > MaxEntries || nameTable < 0 || nameTable > MostTable || !fitsWithin(start + Hfs0HeaderSize, tableSize, _length))
         throw ToolError("'" + _path + "' 的分区已损坏");
 
     Bytes table((size_t)tableSize);
@@ -211,7 +219,7 @@ std::vector<Archive::Entry> FileArchive::readHfs0(i64 start, bool mustFit) {
         int nameOffset = rdi32(e + 0x10);
         if (offset < 0 || size < 0 || nameOffset < 0 || nameOffset >= nameTable)
             throw ToolError("'" + _path + "' 的分区已损坏");
-        if (mustFit && dataStart + offset + size > _length)
+        if (mustFit && !fitsWithin(offset, size, _length - dataStart))
             throw ToolError("'" + _path + "' 被截断：分区内有文件超出文件范围");
         entries.push_back(Entry{std::string(names + nameOffset, strnlen(names + nameOffset, (size_t)(nameTable - nameOffset))), dataStart + offset, size});
     }
@@ -423,7 +431,7 @@ void TitleSet::add(const ArchivePtr& archive) {
                     section = nca->section(i);
             }
             if (!section)
-                throw ToolError(entry.name + "没有 PFS0 区段");
+                throw ToolError(entry.name + " 没有 PFS0 区段");
             auto pfs = nca->openPfs0(*section, nullptr);
             const Pfs0Archive::Entry* cnmt = nullptr;
             for (auto& file : pfs->files()) {
@@ -431,7 +439,7 @@ void TitleSet::add(const ArchivePtr& archive) {
                     cnmt = &file;
             }
             if (!cnmt)
-                throw ToolError(entry.name + "中没有 .cnmt 文件");
+                throw ToolError(entry.name + " 中没有 .cnmt 文件");
             auto item = std::make_shared<TitleItem>();
             item->archive = archive;
             item->metaName = entry.name;
@@ -552,6 +560,26 @@ void readNameAndIcon(NcaFile& nca, TitleSummary& out) {
         out.icon.resize((size_t)best->size);
         image->read(best->offset, out.icon.data(), out.icon.size());
     }
+    // What a copy this tool made says about what the game came to before.
+    for (auto& file : archive.files) {
+        if (file.path != CopyMark::FileName || file.size > 4096)
+            continue;
+        Bytes data((size_t)file.size);
+        image->read(file.offset, data.data(), data.size());
+        CopyMark mark;
+        if (CopyMark::parse(data, mark))
+            out.originalBytes = mark.originalBytes;
+    }
+}
+
+/// Whether this tool compressed a content: a compressed section of its game data with key generation 0, which its headers say.
+bool compressedHere(NcaFile& nca) {
+    for (int i = 0; i < NcaFile::SectionCount; i++) {
+        const NcaFsSection* section = nca.section(i);
+        if (section && section->hasCompression() && nca.isRebuiltCompressed(*section))
+            return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -567,10 +595,16 @@ std::vector<TitleSummary> TitleSet::summarize() {
         summary.bytes = inputBytesOf(item, nullptr);
         for (auto& record : item->meta.records) {
             try {
-                if (record.type == Cnmt::ContentTypeProgram && item->meta.type == Cnmt::MetaApplication)
-                    summary.holdsOnlyPart = summary.holdsOnlyPart || openContent(*item, record)->holdsOnlyPart();
-                else if (record.type == Cnmt::ContentTypeControl)
+                // What the game data is says whether this tool compressed it, rather than the file's name.
+                if (record.type == Cnmt::ContentTypeProgram || record.type == Cnmt::ContentTypeData) {
+                    NcaPtr nca = openContent(*item, record);
+                    if (record.type == Cnmt::ContentTypeProgram && item->meta.type == Cnmt::MetaApplication)
+                        summary.holdsOnlyPart = summary.holdsOnlyPart || nca->holdsOnlyPart();
+                    summary.madeHere = summary.madeHere || compressedHere(*nca);
+                    summary.solidBytes = std::max(summary.solidBytes, nca->solidBytes());
+                } else if (record.type == Cnmt::ContentTypeControl) {
                     readNameAndIcon(*openContent(*item, record), summary);
+                }
             } catch (const ToolError&) {
                 // A name and an icon are only niceties. Any real damage gets reported when the title itself is gone through.
             }
@@ -635,9 +669,13 @@ void TitleSet::addJob(const ItemPtr& main, const ItemPtr& update) {
             for (int i = 0; i < NcaFile::SectionCount; i++) {
                 SectionSource source;
                 if (content.sectionAt(i, source) && source.section->hasSparse())
-                    throw ToolError("这只包含游戏的一部分，其余内容在升级补丁里，两者缺一不可");
+                    throw ToolError("这只包含游戏的一部分，其余内容在更新补丁里，两者缺一不可");
             }
         }
+
+        // A base cut down to go with its update is the original, as far as it goes, and has the same version as the update.
+        if (update && !holdsOnlyPart(*main))
+            keepOriginal(contents, main, update);
 
         TitleJob job;
         job.main = main;
@@ -651,6 +689,126 @@ void TitleSet::addJob(const ItemPtr& main, const ItemPtr& update) {
     } catch (const std::exception& e) {
         problems.push_back(InputIssue{main->archive->path(), "'" + fileNameOf(main->archive->path()) + "': " + e.what()});
     }
+}
+
+void TitleSet::keepOriginal(std::vector<ContentPair>& contents, const ItemPtr& main, const ItemPtr& update) {
+    UpdateMap map;
+    bool have = false;
+    try {
+        for (auto& item : _items) {
+            if (have || item == update || item->meta.type != Cnmt::MetaPatch || item->meta.linkedId() != main->meta.titleId || item->meta.version != main->meta.version)
+                continue;
+            map.version = item->meta.version;
+            for (auto& record : item->meta.records) {
+                if (!isCopied(record))
+                    continue;
+                NcaPtr nca = openContent(*item, record);
+                for (int i = 0; i < NcaFile::SectionCount; i++) {
+                    const NcaFsSection* section = nca->section(i);
+                    if (section && section->hasIndirect() && section->fsType() == NcaFsSection::FsRomFs)
+                        map.sections.push_back(KeptSection{record.type, record.idOffset, i, nca->keptInImage(*section, nullptr)});
+                }
+            }
+            have = !map.sections.empty();
+        }
+        if (!have)
+            have = UpdateMap::inControl(contents, main->meta.version, map);
+    } catch (const ToolError&) {
+        // Without it, a copy that has an update in it already doesn't fit a newer one, which its hash tree says.
+        have = false;
+    }
+    if (!have)
+        return;
+    for (auto& section : map.sections) {
+        for (auto& content : contents) {
+            if (content.type == section.contentType && content.idOffset == section.idOffset && content.base)
+                content.base->keptOriginal.push_back(section);
+        }
+    }
+}
+
+bool UpdateMap::inControl(const std::vector<ContentPair>& contents, u32 version, UpdateMap& out) {
+    for (auto& content : contents) {
+        if (content.type != Cnmt::ContentTypeControl || !content.base)
+            continue;
+        for (int i = 0; i < NcaFile::SectionCount; i++) {
+            const NcaFsSection* section = content.base->section(i);
+            if (!section || section->fsType() != NcaFsSection::FsRomFs)
+                continue;
+            SourcePtr image = content.base->openRomFsImage(*section, nullptr);
+            RomFsArchive archive = RomFsArchive::open(image, content.base->name());
+            for (auto& file : archive.files) {
+                if (file.path != UpdateMap::FileName || file.size > (64 << 20))
+                    continue;
+                Bytes data((size_t)file.size);
+                image->read(file.offset, data.data(), data.size());
+                if (parse(data, out) && out.version == version)
+                    return true;
+            }
+        }
+    }
+    out = UpdateMap();
+    return false;
+}
+
+bool UpdateMap::forJob(const TitleJob& job, bool compress, UpdateMap& out) {
+    out = UpdateMap();
+    // A copy made again, compressed, with no update of its own keeps the map it was made with, as its next update needs it. Uncompressed, its
+    // control data goes in as it is, map and all.
+    if (!job.update)
+        return compress && inControl(job.contents, job.main->meta.version, out);
+    out.version = job.update->meta.version;
+    for (auto& content : job.contents) {
+        if (!content.base || !content.patch)
+            continue;
+        for (int i = 0; i < NcaFile::SectionCount; i++) {
+            const NcaFsSection* section = content.patch->section(i);
+            if (section && section->hasIndirect() && section->fsType() == NcaFsSection::FsRomFs)
+                out.sections.push_back(KeptSection{content.type, content.idOffset, i, content.patch->keptInImage(*section, content.base.get())});
+        }
+    }
+    return !out.sections.empty();
+}
+
+Bytes UpdateMap::toBytes() const {
+    std::string text = "hacBrewPackLZ update map 1\n";
+    text += format("update %u\n", version);
+    for (auto& section : sections) {
+        text += format("section %d %d %d %d\n", section.contentType, section.idOffset, section.index, (int)section.ranges.size());
+        for (auto& range : section.ranges)
+            text += format("%llx %llx %llx\n", (unsigned long long)range.original, (unsigned long long)range.image, (unsigned long long)range.length);
+    }
+    return Bytes(text.begin(), text.end());
+}
+
+bool UpdateMap::parse(const Bytes& data, UpdateMap& out) {
+    out = UpdateMap();
+    std::vector<std::string> lines;
+    std::string text(data.begin(), data.end());
+    for (size_t at = 0; at <= text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        lines.push_back(text.substr(at, end - at));
+        at = end + 1;
+    }
+    if (lines.size() < 2 || lines[0] != "hacBrewPackLZ update map 1" || sscanf(lines[1].c_str(), "update %u", &out.version) != 1)
+        return false;
+    size_t at = 2;
+    while (at < lines.size() && lines[at].rfind("section ", 0) == 0) {
+        int type, idOffset, index, count;
+        if (sscanf(lines[at++].c_str(), "section %d %d %d %d", &type, &idOffset, &index, &count) != 4 || count < 0 || at + (size_t)count > lines.size())
+            return false;
+        KeptSection section{(u8)type, (u8)idOffset, index, {}};
+        for (int i = 0; i < count; i++) {
+            unsigned long long o, m, n;
+            if (sscanf(lines[at++].c_str(), "%llx %llx %llx", &o, &m, &n) != 3)
+                return false;
+            section.ranges.push_back(KeptRange{(i64)o, (i64)m, (i64)n});
+        }
+        out.sections.push_back(std::move(section));
+    }
+    return true;
 }
 
 /// The size of the files a title came from, or if a file holds other titles too, just this title's share of it.
@@ -696,7 +854,7 @@ NcaPtr TitleSet::openContent(const TitleItem& item, const ContentMetaRecord& rec
     std::string compressed = record.id + ".ncz";
     const Archive::Entry* packed = item.archive->find(compressed);
     if (!packed)
-        throw ToolError("'" + fileNameOf(item.archive->path()) + "' 缺少" + name + "，而该内容在其内容元数据中有列出");
+        throw ToolError("'" + fileNameOf(item.archive->path()) + "' 缺少 " + name + "，而该内容在其内容元数据中有列出");
     auto source = std::make_shared<NczSource>(item.archive->open(*packed), compressed);
     if (source->length() != record.size)
         throw ToolError(format("%s would decompress to %lld bytes, but its content meta says %lld. The file is damaged", compressed.c_str(), (long long)source->length(), (long long)record.size));
@@ -744,16 +902,34 @@ constexpr int NcaNameLength = 36;      // 32 hex digits + ".nca"
 constexpr int MetaNcaNameLength = 41;  // 32 hex digits + ".cnmt.nca"
 }  // namespace
 
-i64 NspOutput::headerSize(int contentCount) {
-    int nameTable = (contentCount * (NcaNameLength + 1) + MetaNcaNameLength + 1 + 0x1F) & ~0x1F;
-    return 0x10 + (contentCount + 1) * PfsEntrySize + nameTable;
+i64 NspOutput::headerSize(int contentCount, int titleCount) {
+    int nameTable = (contentCount * (NcaNameLength + 1) + titleCount * (MetaNcaNameLength + 1) + 0x1F) & ~0x1F;
+    return 0x10 + (contentCount + titleCount) * PfsEntrySize + nameTable;
 }
 
-NspOutput::NspOutput(std::string path, int contentCount, i64 sizeHint)
-    : _path(std::move(path)), _partPath(_path + ".part"), _file(_partPath, sys::File::Mode::Create, sizeHint), _dataStart(headerSize(contentCount)), _expectedFiles(contentCount + 1), _position(_dataStart) {
+NspOutput::NspOutput(std::string path, int contentCount, i64 sizeHint, bool replace, int titleCount)
+    : _path(std::move(path)), _partPath(_path + ".part"), _file(_partPath, sys::File::Mode::Create, sizeHint), _dataStart(headerSize(contentCount, titleCount)),
+      _expectedFiles(contentCount + titleCount), _titlesLeft(titleCount), _position(_dataStart), _replace(replace) {
     Bytes reserved((size_t)_dataStart);
     _file.write(0, reserved.data(), reserved.size());
-    _reserved = sizeHint > 0 && _file.reserve(sizeHint);
+    _setsAside = sizeHint > 0;
+}
+
+namespace {
+/// Steps that keep the file in few pieces, while each change to the card's allocation table stays small.
+constexpr i64 SetAsideStep = 1LL << 30;
+constexpr i64 FlushEvery = 256LL << 20;
+}  // namespace
+
+void NspOutput::makeRoomFor(i64 end) {
+    if (!_setsAside || end <= _setAside)
+        return;
+    i64 wanted = std::max(end, _setAside + SetAsideStep);
+    // Near the end of what's free, it can still fit if it doesn't ask for more than it needs.
+    if (_file.reserve(wanted) || (wanted > end && _file.reserve(wanted = end)))
+        _setAside = wanted;
+    else
+        _setsAside = false;
 }
 
 NspOutput::~NspOutput() {
@@ -769,8 +945,14 @@ NcaStream& NspOutput::beginNca(const char*, i64, const char*) {
 }
 
 void NspOutput::write(const void* data, size_t size) {
+    makeRoomFor(_position + (i64)size);
     _file.write(_position, data, size);
     _position += (i64)size;
+    _unflushed += (i64)size;
+    if (_unflushed >= FlushEvery) {
+        _file.flush();
+        _unflushed = 0;
+    }
 }
 
 void NspOutput::overwrite(i64 offset, const void* data, size_t size) { _file.write(_ncaStart + offset, data, size); }
@@ -780,6 +962,9 @@ void NspOutput::readBack(i64 offset, void* data, size_t size) { _file.read(_ncaS
 void NspOutput::endNca(const NcaInfo& info, const char* extension) { _files.push_back(FileRecord{info.id() + extension, _ncaStart - _dataStart, info.size}); }
 
 void NspOutput::finish(const ContentMeta&, const NcaInfo&) {
+    // A game's DLC goes on in the same file after it.
+    if (--_titlesLeft > 0)
+        return;
     if ((int)_files.size() != _expectedFiles)
         throw ToolError(format("Internal error: an NSP reserved %d files but received %d", _expectedFiles, (int)_files.size()));
 
@@ -807,12 +992,26 @@ void NspOutput::finish(const ContentMeta&, const NcaInfo&) {
     }
     memcpy(h + 0x10 + _files.size() * PfsEntrySize, strings.data(), strings.size());
     _file.write(0, header.data(), header.size());
-    if (_reserved)
+    if (_setAside > 0)
         _file.setSize(_position);
     _file.flush();
     _file.close();
-    sys::removeFile(_path);
-    sys::renameFile(_partPath, _path);
+    // Nothing that's there already is deleted to make way for it, unless that was asked for: if the name were then turned down, both would
+    // be gone, as an unfinished file is deleted.
+    if (_replace)
+        sys::removeFile(_path);
+    // The whole job's work is in it by now, so a request the card turns down is asked again a few times, a moment apart, before it's given up.
+    constexpr int RenameTries = 4;
+    for (int tries = 1;; tries++) {
+        try {
+            sys::renameFile(_partPath, _path);
+            break;
+        } catch (const ToolError& e) {
+            if (tries >= RenameTries || !refusedBySystem(e.what()))
+                throw;
+            sys::sleepMs(1000 * tries);
+        }
+    }
     sys::commit(_path);
     _finished = true;
 }
@@ -863,7 +1062,9 @@ std::string outputFileName(const TitleJob& job, const TitleSet& set, const Conve
 // -------------------------------------------------------------------------------------------------------------------
 // Converting
 
-static constexpr u32 CompressionMinSystemVersion = 12u << 26;
+/// Less game data than this isn't worth compressing: the tables saying where each piece went take more room than it could save, as with
+/// a DLC that's only a few bytes, which came out at 48 KB.
+static constexpr i64 MinGameDataToCompress = 1 << 20;
 
 TitleConverter::TitleConverter(ConvertOptions options, const Keyset& keyset) : _options(std::move(options)) {
     if (_options.threads <= 0)
@@ -886,6 +1087,10 @@ TitleConverter::Plan TitleConverter::plan(const ContentPair& content, const Sect
     if (section.fsType() == NcaFsSection::FsRomFs) {
         if (options.keepCompressed && holdsGameData && section.hasCompression() && !isPatched)
             return Plan::PassThrough;
+        // Too little to gain anything, it stays as it is, compressed by Nintendo or not, unless an update has to be made part of it.
+        i64 data = section.dataLevelSize();
+        if (holdsGameData && options.compress && data > 0 && data < MinGameDataToCompress)
+            return isPatched ? Plan::RebuildRomFs : Plan::PassThrough;
         if (holdsGameData && options.compress)
             return Plan::CompressRomFs;
         return isPatched || (holdsGameData && section.hasCompression()) ? Plan::RebuildRomFs : Plan::PassThrough;
@@ -904,11 +1109,16 @@ void TitleConverter::run(const TitleJob& job, TitleOutput& output) {
 
     bool compressed = false;
     std::vector<ContentRecord> records;
+    // The map goes in compressed or not: a newer update is made part of either with it, here over what's installed.
+    _hasMap = UpdateMap::forJob(job, _options.compress, _map);
+    _hasMark = _options.compress;
+    if (_hasMark)
+        _mark = CopyMark::forJob(job, _options);
     for (auto& content : job.contents)
         records.push_back(ContentRecord{writeContent(output, content, compressed), content.type, content.idOffset});
 
     const ContentMeta& meta = job.main->meta;
-    u32 required = std::max(meta.requiredSystemVersion(), job.update ? job.update->meta.requiredSystemVersion() : 0u);
+    u32 required = std::min(std::max(meta.requiredSystemVersion(), job.update ? job.update->meta.requiredSystemVersion() : 0u), _options.consoleRequiredSystem);
     if (compressed)
         required = std::max(required, CompressionMinSystemVersion);
     Bytes cnmt = meta.rebuild(version, required, records);
@@ -991,10 +1201,15 @@ NcaInfo TitleConverter::writeContent(TitleOutput& output, const ContentPair& con
     for (int i : order) {
         SectionSource source;
         content.sectionAt(i, source);
-        if (plan(content, source, _options) == Plan::CompressRomFs)
-            compressInto(builder, i, source.owner->openRomFsImage(*source.section, source.original), "正在压缩游戏数据");
-        else
+        if (plan(content, source, _options) == Plan::CompressRomFs) {
+            std::vector<KeptRange> kept;
+            bool merged = source.original && source.section->hasIndirect();
+            if (merged)
+                kept = source.owner->keptInImage(*source.section, source.original);
+            compressInto(builder, i, source.owner->openRomFsImage(*source.section, source.original), "正在压缩游戏数据", merged ? &kept : nullptr);
+        } else {
             builder.add(i, buildSection(content, source, sign));
+        }
     }
     NcaInfo info = builder.finish(primary.contentType(), primary.programId(), sign, primary.contentIndex(), primary.sdkVersion());
     output.endNca(info, ".nca");
@@ -1035,20 +1250,53 @@ Bytes patchedNacp(const ExtractedGame& game) {
 
 static Bytes patchNpdm(Bytes npdm, const std::string& what) {
     if (npdm.size() < 0x80 || memcmp(npdm.data(), "META", 4) != 0)
-        throw ToolError(what + "不是有效的 NPDM（META 魔数错误）");
+        throw ToolError(what + " 不是有效的 NPDM（META 魔数错误）");
     int aci0 = rdi32(&npdm[0x70]);
     int acid = rdi32(&npdm[0x78]);
     if (aci0 < 0 || (size_t)aci0 + 0x18 > npdm.size() || memcmp(&npdm[(size_t)aci0], "ACI0", 4) != 0)
-        throw ToolError(what + "不是有效的 NPDM（ACI0 区段错误）");
+        throw ToolError(what + " 不是有效的 NPDM（ACI0 区段错误）");
     if (acid < 0 || (size_t)acid + 0x204 > npdm.size() || memcmp(&npdm[(size_t)acid + 0x200], "ACID", 4) != 0)
-        throw ToolError(what + "不是有效的 NPDM（ACID 区段错误）");
+        throw ToolError(what + " 不是有效的 NPDM（ACID 区段错误）");
     memcpy(&npdm[(size_t)acid + 0x100], signingModulus(), 0x100);
     return npdm;
+}
+
+namespace {
+
+/// The control data's files as a copy has them: whatever it had of the map and the mark before goes, and this one's go in. The estimate builds
+/// the same with nothing in the files, as only their sizes count there.
+std::map<std::string, Bytes> controlFiles(const RomFsArchive& archive, const SourcePtr& image, const UpdateMap* map, const CopyMark* mark) {
+    std::map<std::string, Bytes> files;
+    for (auto& file : archive.files) {
+        if (file.path == UpdateMap::FileName || file.path == CopyMark::FileName)
+            continue;
+        Bytes data((size_t)file.size);
+        if (image)
+            image->read(file.offset, data.data(), data.size());
+        files[file.path] = std::move(data);
+    }
+    if (map)
+        files[UpdateMap::FileName] = map->toBytes();
+    if (mark)
+        files[CopyMark::FileName] = mark->toBytes();
+    return files;
+}
+
+}  // namespace
+
+bool TitleConverter::controlWithNotes(const SectionSource& source, NcaSection& out) {
+    SourcePtr image = source.owner->openRomFsImage(*source.section, source.original);
+    RomFsArchive archive = RomFsArchive::open(image, format("%s section %d", source.owner->name().c_str(), source.section->index));
+    out = Sections::romFs(buildRomFsImageOf(controlFiles(archive, image, _hasMap ? &_map : nullptr, _hasMark ? &_mark : nullptr), archive.directories), true, nullptr);
+    return true;
 }
 
 NcaSection TitleConverter::buildSection(const ContentPair& content, const SectionSource& source, bool& sign) {
     NcaFile& owner = *source.owner;
     const NcaFsSection& section = *source.section;
+    NcaSection control;
+    if ((_hasMap || _hasMark) && content.type == Cnmt::ContentTypeControl && section.fsType() == NcaFsSection::FsRomFs && controlWithNotes(source, control))
+        return control;
     switch (plan(content, source, _options)) {
         case Plan::RebuildRomFs: {
             SourcePtr image = owner.openRomFsImage(section, source.original);
@@ -1080,12 +1328,15 @@ NcaSection TitleConverter::buildSection(const ContentPair& content, const Sectio
     }
 }
 
-void TitleConverter::compressInto(NcaBuilder& builder, int index, const SourcePtr& image, const char* label) {
+void TitleConverter::compressInto(NcaBuilder& builder, int index, const SourcePtr& image, const char* label, const std::vector<KeptRange>* kept) {
     Progress progress(label, image->length());
     CompressedData data;
-    builder.addCompressed(index, image, _options.blockSize, _options.level, _options.threads, true, progress, &data);
+    builder.addCompressed(index, image, _options.blockSize, _options.level, _options.threads, true, progress, &data, kept);
     progress.done();
     sink().message(format("Game data of %s stored as %s (%.1f%%)", formatSize(data.virtualSize).c_str(), formatSize(data.dataSize).c_str(), data.dataSize * 100.0 / (double)std::max<i64>(data.virtualSize, 1)));
+    if (data.sharedBytes > 0)
+        sink().message(format("%s of it is held more than once, stored once", formatSize(data.sharedBytes).c_str()));
+    _foundBytes += data.foundBytes;
 }
 
 NcaInfo TitleConverter::writeFolderNca(TitleOutput& output, const char* label, NcaContentType type, const std::string& folder, u64 titleId, const std::map<std::string, Bytes>& replacements) {
@@ -1230,7 +1481,7 @@ std::string targetPath(const std::string& folder, const std::string& relative, s
     for (char& c : lower)
         c = (char)tolower((u8)c);
     if (!seen.insert(lower).second)
-        throw ToolError("'" + relative + "' 会覆盖该文件系统上的另一文件（其文件名不区分大小写或无法容纳所有字符）");
+        throw ToolError("'" + relative + "' would overwrite another file on this file system, whose names ignore case or can't hold every character");
     return path;
 }
 
@@ -1489,6 +1740,13 @@ ExtractResult extractTitle(const TitleJob& job, const TitleSet& set, const std::
     u32 version = job.update ? job.update->meta.version : job.main->meta.version;
     std::string root = parent + "/" + job.stem(version, set.sharesFile(job));
     sys::makeDirectories(root);
+    // Said first, so that whatever happens part of the way through, the folder never looks like a whole game (ExtractedGame::NotFinished).
+    std::string notFinished = root + "/" + ExtractedGame::NotFinished;
+    {
+        sys::File note(notFinished, sys::File::Mode::Create);
+        note.write(0, ExtractedGame::NotFinishedText, strlen(ExtractedGame::NotFinishedText));
+        note.flush();
+    }
     NczSource::setSpoolFolder(parent);
 
     struct Release {
@@ -1509,11 +1767,19 @@ ExtractResult extractTitle(const TitleJob& job, const TitleSet& set, const std::
 
             if (source.section->fsType() == NcaFsSection::FsPartition) {
                 auto archive = source.owner->openPfs0(*source.section, source.original);
+                i64 total = 0;
+                for (auto& file : archive->files())
+                    total += file.size;
+                // Said as the game data is, as a game can keep most of itself in its program.
+                Progress progress(isExefs(content, *source.section) ? "正在解包其程序" : "正在解包其他部分", total);
+                i64 done = 0;
                 for (auto& file : archive->files()) {
-                    copyOut(*archive->data(), file.offset, file.size, targetPath(folder, file.name, seen), buffer.get(), CopyBufferSize, nullptr, 0);
+                    copyOut(*archive->data(), file.offset, file.size, targetPath(folder, file.name, seen), buffer.get(), CopyBufferSize, &progress, done);
+                    done += file.size;
                     result.bytes += file.size;
                     result.files++;
                 }
+                progress.done();
                 continue;
             }
 
@@ -1566,6 +1832,13 @@ ExtractResult extractTitle(const TitleJob& job, const TitleSet& set, const std::
             result.files += (i64)ordered.size();
         }
     }
+    // All of it's out. A card that turns taking the note away down is asked again a moment later: with it there, the game isn't listed.
+    for (int tries = 1; !sys::removeFile(notFinished) && sys::presence(notFinished) != sys::Presence::Missing; tries++) {
+        if (tries >= 4)
+            throw ToolError("'" + notFinished + "' couldn't be deleted, and while it's there, the game isn't taken as all there. Extract it again in a moment");
+        sys::sleepMs(1000 * tries);
+    }
+    sys::commit(root);
     return result;
 }
 
@@ -1603,6 +1876,8 @@ struct RegionResult {
     int stored;
     int lz4Blocks;
     int rawBlocks;
+    /// What of it was compressed, which is all of it but any piece that's held again.
+    int counted;
 };
 
 struct SampleResult {
@@ -1621,36 +1896,293 @@ i64 greatestCommonDivisor(i64 a, i64 b) {
     return a;
 }
 
-SampleResult summarize(const std::vector<RegionResult>& samples, i64 imageSize, i64 regions) {
-    double sampled = 0, storedTotal = 0;
+/// A later copy of a file the file table shows, where it is, and how much of it compressing finds held before.
+struct FileCopy {
+    i64 offset = 0;
+    i64 length = 0;
+    i64 held = 0;
+    bool nearCopy = false;
+};
+
+/// What the file table shows a game holds again: later copies of its files, whole or nearly so, which compressing finds and stores once, as
+/// FileCopies does on the PC, which says why each of these is what it is. It reads what the PC reads, in the same order, so both come to the
+/// same copies within the same number of reads.
+namespace copies {
+constexpr i64 Smallest = 1 << 20;
+constexpr int Piece = 0x1000;
+constexpr int LaterEnd = 0x10000;
+constexpr int EarlierEnd = 0x40000;
+constexpr double EndsAlike = 0.8;
+constexpr size_t FewestSpots = 4;
+constexpr double CloseInSize = 0.2;
+constexpr double VersionsSpread = 1.2;
+constexpr double NearHeld = 0.95;
+constexpr int MostReads = 128;
+constexpr int FirstReads = 16;
+constexpr double TimeShare = 0.25;
+
+using Files = std::vector<RomFsArchive::Entry>;
+
+/// Groups in the order their first file comes, each key worked out once, in order, as LINQ's GroupBy has them on the PC.
+template <typename Key>
+std::vector<Files> groupBy(const Files& files, Key key) {
+    std::vector<Files> groups;
+    std::map<decltype(key(files.front())), size_t> index;
+    for (auto& file : files) {
+        auto k = key(file);
+        auto known = index.find(k);
+        if (known == index.end()) {
+            index.emplace(k, groups.size());
+            groups.push_back({file});
+        } else {
+            groups[known->second].push_back(file);
+        }
+    }
+    groups.erase(std::remove_if(groups.begin(), groups.end(), [](const Files& g) { return g.size() < 2; }), groups.end());
+    return groups;
+}
+
+std::string nameOf(const std::string& path) {
+    size_t slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+/// What of a file the update's map already has held again: those places are stored once without any of this.
+i64 mapBytes(const std::vector<i64>& repeats, int blockSize, const RomFsArchive::Entry& file) {
+    i64 end = file.offset + file.size, total = 0;
+    for (auto it = std::lower_bound(repeats.begin(), repeats.end(), file.offset - blockSize + 1); it != repeats.end() && *it < end; ++it)
+        total += std::min<i64>(*it + blockSize, end) - std::max<i64>(*it, file.offset);
+    return total;
+}
+
+/// A group of files the same size, or a later file with the same name as an earlier one, and how much it could find held again.
+struct Check {
+    i64 potential = 0;
+    i64 offset = 0;
+    const Files* group = nullptr;
+    bool named = false;
+    RomFsArchive::Entry later{};
+    RomFsArchive::Entry earlier{};
+};
+
+std::vector<FileCopy> find(const SourcePtr& image, const std::vector<i64>& repeats, int blockSize, double seconds) {
+    double started = sys::now();
+    std::vector<FileCopy> found;
+    Files files;
+    try {
+        for (auto& file : RomFsArchive::open(image, "The game data").files) {
+            if (file.size >= Smallest)
+                files.push_back(file);
+        }
+    } catch (const ToolError&) {
+        // Compressing will say what's wrong with it.
+        return found;
+    }
+    std::stable_sort(files.begin(), files.end(), [](const RomFsArchive::Entry& a, const RomFsArchive::Entry& b) { return a.offset < b.offset; });
+    // Two files in the same place are the same bytes, stored once already.
+    files.erase(std::unique(files.begin(), files.end(), [](const RomFsArchive::Entry& a, const RomFsArchive::Entry& b) { return a.offset == b.offset; }), files.end());
+
+    // Every check there is to make, the one that could find the most first, so a game with many files the same size still gets to its
+    // biggest copies within the reads allowed.
+    auto sizes = groupBy(files, [](const RomFsArchive::Entry& f) { return f.size; });
+    auto names = groupBy(files, [](const RomFsArchive::Entry& f) { return nameOf(f.path); });
+    std::vector<Check> checks;
+    for (auto& group : sizes) {
+        Check check;
+        check.potential = group[0].size * (i64)(group.size() - 1);
+        check.offset = group[0].offset;
+        check.group = &group;
+        checks.push_back(check);
+    }
+    for (auto& group : names) {
+        if (group.size() >= 3) {
+            i64 most = group[0].size, least = group[0].size;
+            for (auto& f : group) {
+                most = std::max(most, f.size);
+                least = std::min(least, f.size);
+            }
+            if ((double)most > VersionsSpread * (double)least)
+                continue;
+        }
+        for (size_t i = 1; i < group.size(); i++) {
+            const RomFsArchive::Entry& later = group[i];
+            size_t closest = 0;
+            for (size_t j = 1; j < i; j++) {
+                if (std::llabs(group[j].size - later.size) < std::llabs(group[closest].size - later.size))
+                    closest = j;
+            }
+            const RomFsArchive::Entry& earlier = group[closest];
+            if ((double)std::llabs(later.size - earlier.size) > CloseInSize * (double)std::max(later.size, earlier.size))
+                continue;
+            Check check;
+            check.potential = std::min(later.size, earlier.size);
+            check.offset = later.offset;
+            check.group = &group;
+            check.named = true;
+            check.later = later;
+            check.earlier = earlier;
+            checks.push_back(check);
+        }
+    }
+    std::stable_sort(checks.begin(), checks.end(), [](const Check& a, const Check& b) { return a.potential != b.potential ? a.potential > b.potential : a.offset < b.offset; });
+
+    int reads = 0;
+    Bytes buffer((size_t)EarlierEnd);
+    auto pieceAt = [&](i64 at, u64 seed) {
+        image->read(at, buffer.data(), (size_t)Piece);
+        reads++;
+        return RomFsCompressor::blockHash(buffer.data(), (size_t)Piece, seed);
+    };
+
+    // An end is read once, however many files it's compared with.
+    std::map<std::pair<i64, int>, std::vector<u64>> spotsRead;
+    auto spotsAt = [&](i64 at, int length) -> const std::vector<u64>& {
+        auto key = std::make_pair(at, length);
+        auto known = spotsRead.find(key);
+        if (known != spotsRead.end())
+            return known->second;
+        image->read(at, buffer.data(), (size_t)length);
+        reads++;
+        return spotsRead[key] = RomFsCompressor::spotsIn(buffer.data(), (size_t)length, blockSize);
+    };
+    auto endsAlike = [&](const RomFsArchive::Entry& later, const RomFsArchive::Entry& earlier, bool end) {
+        int mine = (int)std::min<i64>(LaterEnd, later.size), theirs = (int)std::min<i64>(EarlierEnd, earlier.size);
+        const std::vector<u64>& spots = spotsAt(end ? later.offset + later.size - mine : later.offset, mine);
+        if (spots.size() < FewestSpots)
+            return false;
+        const std::vector<u64>& against = spotsAt(end ? earlier.offset + earlier.size - theirs : earlier.offset, theirs);
+        size_t common = 0;
+        for (u64 spot : spots)
+            common += std::binary_search(against.begin(), against.end(), spot) ? 1 : 0;
+        return (double)common >= EndsAlike * (double)spots.size();
+    };
+
+    // Before every read, as one group of files the same size can take many: once the time's up, what's left is left out.
+    auto outOfTime = [&] { return reads >= FirstReads && sys::now() - started > seconds; };
+
+    // Where each later copy is in the list, so a near copy that turns out to be a whole one is counted as that instead.
+    std::map<i64, size_t> copied;
+    for (auto& check : checks) {
+        if (outOfTime())
+            break;
+        if (!check.named) {
+            // The same size, then the same 4 KB from the middle, then from the start and the end: a copy of the whole file.
+            const Files& group = *check.group;
+            if (reads + (int)group.size() > MostReads)
+                continue;
+            std::map<const RomFsArchive::Entry*, u64> middle;
+            for (auto& file : group) {
+                if (outOfTime())
+                    return found;
+                middle[&file] = pieceAt(file.offset + file.size / 2 / Piece * Piece, 0);
+            }
+            auto middles = groupBy(group, [&](const RomFsArchive::Entry& f) { return middle[&f]; });
+            for (auto& alike : middles) {
+                if (reads + 2 * (int)alike.size() > MostReads)
+                    break;
+                std::map<const RomFsArchive::Entry*, u64> both;
+                for (auto& file : alike) {
+                    if (outOfTime())
+                        return found;
+                    u64 start = pieceAt(file.offset, 0);
+                    both[&file] = start ^ pieceAt(file.offset + file.size - Piece, 1);
+                }
+                auto ends = groupBy(alike, [&](const RomFsArchive::Entry& f) { return both[&f]; });
+                for (auto& same : ends) {
+                    for (size_t i = 1; i < same.size(); i++) {
+                        FileCopy copy{same[i].offset, same[i].size, std::max<i64>(0, same[i].size - blockSize - mapBytes(repeats, blockSize, same[i])), false};
+                        auto known = copied.find(same[i].offset);
+                        if (known != copied.end()) {
+                            found[known->second] = copy;
+                            continue;
+                        }
+                        copied[same[i].offset] = found.size();
+                        found.push_back(copy);
+                    }
+                }
+            }
+        } else {
+            // The same name, about the same size, and the end or the start much the same as the earlier one's: a near copy.
+            if (copied.count(check.later.offset) || reads + 4 > MostReads)
+                continue;
+            if (!endsAlike(check.later, check.earlier, true) && (outOfTime() || !endsAlike(check.later, check.earlier, false)))
+                continue;
+            i64 held = (i64)(NearHeld * (double)std::min(check.later.size, check.earlier.size)) - blockSize - mapBytes(repeats, blockSize, check.later);
+            copied[check.later.offset] = found.size();
+            found.push_back(FileCopy{check.later.offset, check.later.size, std::max<i64>(0, held), true});
+        }
+    }
+    return found;
+}
+}  // namespace copies
+
+/// A stretch of the image the sample leaves out, as it's stored somewhere else.
+struct Skip {
+    i64 start;
+    i64 end;
+};
+
+/// The blocks the update's map has held again and the later copies of files, in order, any that touch made one.
+std::vector<Skip> leftOut(const std::vector<i64>& repeats, int blockSize, const std::vector<FileCopy>& found) {
+    std::vector<Skip> all;
+    for (i64 repeat : repeats)
+        all.push_back(Skip{repeat, repeat + blockSize});
+    for (auto& copy : found)
+        all.push_back(Skip{copy.offset, copy.offset + copy.length});
+    std::stable_sort(all.begin(), all.end(), [](const Skip& a, const Skip& b) { return a.start < b.start; });
+    std::vector<Skip> merged;
+    for (auto& skip : all) {
+        if (!merged.empty() && skip.start <= merged.back().end)
+            merged.back().end = std::max(merged.back().end, skip.end);
+        else
+            merged.push_back(skip);
+    }
+    return merged;
+}
+
+/// counted is how much of the image is stored where it is: all of it but what's held again. How well that compresses comes only from what of
+/// it the sample has, as what's held again can compress better or worse than the rest.
+SampleResult summarize(const std::vector<RegionResult>& samples, i64 counted) {
+    double sampled = 0, read = 0, storedTotal = 0;
     i64 lz4 = 0, raw = 0;
     for (auto& s : samples) {
-        sampled += s.length;
+        read += s.length;
+        sampled += s.counted;
         storedTotal += s.stored;
         lz4 += s.lz4Blocks;
         raw += s.rawBlocks;
     }
-    if (sampled == 0)
+    if (read == 0)
         throw ToolError("无法读取任何游戏数据用于采样");
+    SampleResult result;
+    // All it came to was pieces held again: what's left is taken as not compressing at all, give or take all of it.
+    if (sampled == 0) {
+        result.stored = counted;
+        result.margin = (double)counted;
+        return result;
+    }
     double ratio = storedTotal / sampled;
-    double scale = (double)imageSize / sampled;
+    double scale = (double)counted / sampled;
 
     // Neighbouring regions tend to hold similar data, so differences between neighbours give the honest spread for an evenly
     // spread sample. An image small enough to read completely has none.
-    std::vector<RegionResult> ordered = samples;
+    std::vector<RegionResult> ordered;
+    for (auto& s : samples) {
+        if (s.counted > 0)
+            ordered.push_back(s);
+    }
     std::stable_sort(ordered.begin(), ordered.end(), [](auto& a, auto& b) { return a.region < b.region; });
     double squares = 0;
     for (size_t i = 1; i < ordered.size(); i++) {
-        double difference = ordered[i].stored / (double)ordered[i].length - ordered[i - 1].stored / (double)ordered[i - 1].length;
+        double difference = ordered[i].stored / (double)ordered[i].counted - ordered[i - 1].stored / (double)ordered[i - 1].counted;
         squares += difference * difference;
     }
     double count = (double)ordered.size();
-    double unsampled = 1 - count / (double)regions;
+    double unsampled = std::max(0.0, 1 - sampled / (double)counted);
     double variance = count > 1 ? unsampled / count * squares / (2.0 * (count - 1)) : 0;
 
-    SampleResult result;
-    result.stored = (i64)(ratio * (double)imageSize);
-    result.margin = Confidence95 * sqrt(variance) * (double)imageSize;
+    result.stored = (i64)(ratio * (double)counted);
+    result.margin = Confidence95 * sqrt(variance) * (double)counted;
     result.lz4Blocks = (i64)((double)lz4 * scale);
     result.rawBlocks = (i64)((double)raw * scale);
     return result;
@@ -1667,7 +2199,11 @@ SampleResult summarize(const std::vector<RegionResult>& samples, i64 imageSize, 
 ///
 /// What's kept to the minimum on a slow disk is how many times it has to go looking. Reading more at each place doesn't make up for that, as
 /// regions next to each other say much the same: on a hard drive, four in a row each time took as long as one, and narrowed the margin not at all.
-SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool inOrder) {
+///
+/// skips are what's stored somewhere else, in order: where a piece of the original game is held again, and later copies of files. A region
+/// counts nothing for what it has of one, however that would compress. counted is how much of the image is stored where it is, and spent the
+/// time already taken looking for copies, out of the time allowed.
+SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool inOrder, const std::vector<Skip>& skips, i64 counted, double spent) {
     i64 length = image->length();
     i64 regions = (length + RegionSize - 1) / RegionSize;
     if (regions == 0)
@@ -1679,7 +2215,7 @@ SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool 
 
     // A small image takes up less of the answer, and doesn't need as close a look.
     int minimum = (int)std::min<i64>(MinRegions, std::max<i64>(regions / 16, SmallestSample));
-    double budget = TimeBudgetSeconds * std::min(1.0, (double)length / (1LL << 30));
+    double budget = std::max(0.0, TimeBudgetSeconds * std::min(1.0, (double)length / (1LL << 30)) - spent);
 
     const i64 reportedTotal = (i64)minimum * RegionSize;
     Progress progress("正在对游戏数据采样", reportedTotal);
@@ -1705,10 +2241,19 @@ SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool 
         buffers.emplace_back(new u8[RegionSize]);
     }
 
+    // What's around a piece held again is compressed in blocks from where it starts, as the compressor cuts them.
     auto compressRegion = [&](const u8* data, int regionLength, i64 region, int worker) {
-        int stored = 0, lz4 = 0, raw = 0;
-        for (int done = 0; done < regionLength; done += options.blockSize) {
-            int n = std::min(options.blockSize, regionLength - done);
+        int stored = 0, lz4 = 0, raw = 0, counted = 0;
+        i64 offset = region * RegionSize;
+        auto skip = std::partition_point(skips.begin(), skips.end(), [&](const Skip& s) { return s.end <= offset; });
+        for (int done = 0; done < regionLength;) {
+            if (skip != skips.end() && skip->start <= offset + done) {
+                done = (int)std::min<i64>(regionLength, skip->end - offset);
+                ++skip;
+                continue;
+            }
+            int until = skip != skips.end() ? (int)std::min<i64>(regionLength, skip->start - offset) : regionLength;
+            int n = std::min(options.blockSize, until - done);
             int size = encoders[(size_t)worker]->compress(data + done, n, scratch[(size_t)worker].get(), RomFsCompressor::compressCapacity(n), options.level);
             if (size > 0) {
                 stored += size + RomFsCompressor::AveragePadding;
@@ -1717,8 +2262,10 @@ SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool 
                 stored += n;
                 raw++;
             }
+            counted += n;
+            done += n;
         }
-        return RegionResult{region, regionLength, stored, lz4, raw};
+        return RegionResult{region, regionLength, stored, lz4, raw, counted};
     };
 
     // A go at each way of reading, and then whichever got more done.
@@ -1811,7 +2358,7 @@ SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool 
             if (r.length > 0)
                 samples.push_back(r);
         }
-        result = summarize(samples, length, regions);
+        result = summarize(samples, counted);
         checkStop();
         if (samples.size() >= (size_t)std::min<i64>(regions, MaxRegions))
             break;
@@ -1825,15 +2372,60 @@ SampleResult sample(const SourcePtr& image, const ConvertOptions& options, bool 
     return result;
 }
 
-i64 compressedRomFsSize(const SourcePtr& image, const ConvertOptions& options, Tally& tally, bool inOrder) {
-    SampleResult s = sample(image, options, inOrder);
+i64 compressedRomFsSize(const SourcePtr& image, const ConvertOptions& options, Tally& tally, bool inOrder, const RomFsCompressor::SharedPlan* shared = nullptr) {
+    // What's held again is stored where it's held first, so the sample leaves it out wherever it's held again, and how well the rest
+    // compresses goes for all of the rest alone, as what's held again can compress better or worse. Each place it's held again takes a
+    // table entry of its own. That's what the update's map has held again, and the copies of files the file table shows: of those, only
+    // what isn't held before is stored, and how well it compresses goes by the rest. A solid NCZ can only be read in order, so it has no
+    // look for copies.
+    double started = sys::now();
+    std::vector<i64> repeats;
+    if (shared) {
+        for (auto& block : shared->blocks) {
+            if (block.piece >= 0 && !block.first)
+                repeats.push_back(block.offset);
+        }
+    }
+    double seconds = copies::TimeShare * TimeBudgetSeconds * std::min(1.0, (double)image->length() / (1LL << 30));
+    std::vector<FileCopy> found = inOrder ? std::vector<FileCopy>{} : copies::find(image, repeats, options.blockSize, seconds);
+    i64 held = 0, nearHeld = 0;
+    for (auto& copy : found) {
+        held += copy.held;
+        nearHeld += copy.nearCopy ? copy.held : 0;
+    }
+    if (!found.empty())
+        sink().message(format("The file table shows %d copies of files, %s of them held again, %s of that in near copies, found in %.2f s", (int)found.size(),
+                              formatSize(held).c_str(), formatSize(nearHeld).c_str(), sys::now() - started));
+    i64 counted = std::max<i64>(0, image->length() - (i64)repeats.size() * options.blockSize - held);
+    SampleResult s = sample(image, options, inOrder, leftOut(repeats, options.blockSize, found), counted, sys::now() - started);
     tally.romFs += image->length();
     tally.stored += s.stored;
-    tally.variance += s.margin * s.margin;
+    // How much of a near copy is held before is taken from what others came to, so it's give or take a little of it.
+    double nearMargin = 0.05 * (double)nearHeld * (counted > 0 ? (double)s.stored / (double)counted : 1.0);
+    tally.variance += s.margin * s.margin + nearMargin * nearMargin;
 
     // Raw blocks in a row share one table entry, so there can't be more raw entries than gaps between compressed blocks.
-    i64 entries = s.lz4Blocks + std::min(s.rawBlocks, s.lz4Blocks + 1);
+    i64 entries = s.lz4Blocks + std::min(s.rawBlocks, s.lz4Blocks + 1) + (i64)repeats.size() + held / options.blockSize;
     return Sections::compressedRomFsSectionSize(s.stored, (int)std::max<i64>(std::min<i64>(entries, INT32_MAX), 1));
+}
+
+/// All of the image read once, as compressing reads it, and what it comes to counted rather than written.
+i64 measuredRomFsSize(const SourcePtr& image, const ConvertOptions& options, Tally& tally, const std::vector<KeptRange>* kept) {
+    double started = sys::now();
+    Progress progress("正在测量游戏数据", image->length());
+    RomFsCompressor::Measurement measured = RomFsCompressor::measure(image, options.blockSize, options.level, options.threads, progress, kept, std::max(options.measureEvery, 1));
+    progress.done();
+    tally.romFs += image->length();
+    tally.stored += measured.stored;
+    // Kept from being fused into one multiply-add, which the PC doesn't do, so the margin comes out the same on both.
+    volatile double square = measured.margin * measured.margin;
+    tally.variance += square;
+    sink().message(format("Measured %s of game data in %.1f s: %s of it held again, the rest comes to %s, give or take %s", formatSize(image->length()).c_str(),
+                          sys::now() - started, formatSize(measured.heldBytes).c_str(), formatSize(measured.stored).c_str(), formatSize((i64)ceil(measured.margin)).c_str()));
+
+    // Raw blocks in a row share one table entry, so there can't be more raw entries than gaps between compressed blocks.
+    i64 entries = measured.lz4Blocks + std::min(measured.rawBlocks, measured.lz4Blocks + 1) + measured.held;
+    return Sections::compressedRomFsSectionSize(measured.stored, (int)std::max<i64>(std::min<i64>(entries, INT32_MAX), 1));
 }
 
 i64 plainRomFsSize(i64 image, Tally& tally) {
@@ -1842,13 +2434,21 @@ i64 plainRomFsSize(i64 image, Tally& tally) {
     return Sections::romFsSectionSize(image);
 }
 
-i64 sectionSize(const ContentPair& content, const SectionSource& source, const ConvertOptions& options, Tally& tally) {
+i64 sectionSize(const ContentPair& content, const SectionSource& source, const ConvertOptions& options, Tally& tally, bool measure) {
     NcaFile& owner = *source.owner;
     const NcaFsSection& section = *source.section;
     switch (TitleConverter::plan(content, source, options)) {
         case TitleConverter::Plan::CompressRomFs: {
             bool inOrder = owner.readsInOrder() || (source.original && source.original->readsInOrder());
-            return compressedRomFsSize(owner.openRomFsImage(section, source.original, false), options, tally, inOrder);
+            std::vector<KeptRange> kept;
+            bool merged = source.original && section.hasIndirect();
+            if (merged)
+                kept = owner.keptInImage(section, source.original);
+            if (measure)
+                return measuredRomFsSize(owner.openRomFsImage(section, source.original), options, tally, merged ? &kept : nullptr);
+            SourcePtr image = owner.openRomFsImage(section, source.original, false);
+            RomFsCompressor::SharedPlan shared = RomFsCompressor::planShared(image->length(), options.blockSize, merged ? &kept : nullptr);
+            return compressedRomFsSize(image, options, tally, inOrder, &shared);
         }
         case TitleConverter::Plan::RebuildRomFs:
             return plainRomFsSize(owner.openRomFsImage(section, source.original, false)->length(), tally);
@@ -1871,10 +2471,15 @@ i64 metaNcaSize(const std::string& cnmtName, i64 cnmtSize) {
 
 }  // namespace
 
-SizeEstimate estimateTitle(const TitleJob& job, const ConvertOptions& given) {
+namespace {
+
+SizeEstimate workOut(const TitleJob& job, const ConvertOptions& given, bool measure) {
     ConvertOptions options = given;
     if (options.threads <= 0)
         options.threads = sys::workerCount();
+    // Read as compressing reads it, which can need somewhere to put a solid NCZ's earlier data.
+    if (measure)
+        NczSource::setSpoolFolder(options.tempDir);
 
     struct Release {
         const TitleJob& job;
@@ -1883,12 +2488,27 @@ SizeEstimate estimateTitle(const TitleJob& job, const ConvertOptions& given) {
 
     Tally tally;
     i64 output = NspOutput::headerSize((int)job.contents.size());
+    // A game made one with its update has the map of what the update kept in its control data, compressed or not, as a newer update is
+    // made part of either with it, and a compressed copy has its mark there too: the control data is made again with them, as converting
+    // makes it.
+    UpdateMap map;
+    bool hasMap = UpdateMap::forJob(job, options.compress, map);
+    CopyMark mark;
+    if (options.compress)
+        mark = CopyMark::forJob(job, options);
     for (auto& content : job.contents) {
         i64 nca = NcaWriter::HeaderRegionSize;
         for (int i : content.sectionsInFileOrder()) {
             SectionSource source = {};
             content.sectionAt(i, source);
-            nca += NcaWriter::alignToSector(sectionSize(content, source, options, tally));
+            if ((hasMap || options.compress) && content.type == Cnmt::ContentTypeControl && source.section->fsType() == NcaFsSection::FsRomFs) {
+                SourcePtr image = source.owner->openRomFsImage(*source.section, source.original, false);
+                RomFsArchive archive = RomFsArchive::open(image, format("%s section %d", source.owner->name().c_str(), source.section->index));
+                nca += NcaWriter::alignToSector(Sections::romFsSectionSize(buildRomFsImageOf(
+                    controlFiles(archive, nullptr, hasMap ? &map : nullptr, options.compress ? &mark : nullptr), archive.directories)->length()));
+                continue;
+            }
+            nca += NcaWriter::alignToSector(sectionSize(content, source, options, tally, measure));
         }
         output += nca;
     }
@@ -1902,8 +2522,23 @@ SizeEstimate estimateTitle(const TitleJob& job, const ConvertOptions& given) {
     estimate.marginBytes = (i64)ceil(sqrt(tally.variance));
     estimate.romFsBytes = tally.romFs;
     estimate.romFsStoredBytes = tally.stored;
+    estimate.measured = measure;
+    // An NSZ is smaller than what it unpacks to, which is what installing it any other way takes.
+    bool packed = false;
+    for (auto& content : job.contents)
+        packed = packed || (content.base && content.base->packed()) || (content.patch && content.patch->packed());
+    if (packed) {
+        estimate.packedBytes = job.inputBytes;
+        estimate.installedBytes = CopyMark::installedBytes(job);
+    }
     return estimate;
 }
+
+}  // namespace
+
+SizeEstimate estimateTitle(const TitleJob& job, const ConvertOptions& options) { return workOut(job, options, false); }
+
+SizeEstimate measureTitle(const TitleJob& job, const ConvertOptions& options) { return workOut(job, options, true); }
 
 bool isAlreadyCompressed(const TitleJob& job, const ConvertOptions& options) {
     if (!options.compress || job.update)
@@ -1918,9 +2553,209 @@ bool isAlreadyCompressed(const TitleJob& job, const ConvertOptions& options) {
                 return false;
         }
     }
+    // A copy an older version made can come out smaller made again, which is for the console's own games to say. Which version made it is
+    // in a game's control data, which DLC doesn't have, so DLC this tool made is taken as it is, whichever version made it.
+    bool hasControl = false;
+    for (auto& content : job.contents)
+        hasControl = hasControl || content.type == Cnmt::ContentTypeControl;
+    if (options.improveOlderCopies && hasControl && isMadeByThisTool(job)) {
+        CopyMark mark;
+        if (!CopyMark::in(job, mark) || !mark.isCurrent())
+            return false;
+    }
+    // So can one its developer compressed, made again here, which is worked out like any other game. Its updates then need its original,
+    // which is for whoever ticks it to know.
+    if (options.improveOlderCopies && hasControl && !isMadeByThisTool(job) && hasCompressedGameData(job))
+        return false;
     // Nothing compressing would touch, such as a game that keeps all its data in its program, is as small as it gets too. Otherwise its
     // compressed copy would come back on the list each time it's analyzed.
     return !job.contents.empty();
+}
+
+bool isMadeByThisTool(const TitleJob& job) {
+    for (auto& content : job.contents) {
+        NcaFile& nca = content.primary();
+        for (int i = 0; i < NcaFile::SectionCount; i++) {
+            const NcaFsSection* section = nca.section(i);
+            if (section && section->hasCompression() && nca.isRebuiltCompressed(*section))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool hasCompressedGameData(const TitleJob& job) {
+    for (auto& content : job.contents) {
+        NcaFile& nca = content.primary();
+        for (int i = 0; i < NcaFile::SectionCount; i++) {
+            const NcaFsSection* section = nca.section(i);
+            if (section && section->hasCompression())
+                return true;
+        }
+    }
+    return false;
+}
+
+i64 unpackedBytes(const TitleJob& job, const ConvertOptions& options) {
+    ConvertOptions plain = options;
+    plain.compress = false;
+    Tally tally;
+    i64 total = 0;
+    for (auto& content : job.contents) {
+        i64 nca = NcaWriter::HeaderRegionSize;
+        for (int i : content.sectionsInFileOrder()) {
+            SectionSource source = {};
+            content.sectionAt(i, source);
+            nca += NcaWriter::alignToSector(sectionSize(content, source, plain, tally, false));
+        }
+        total += nca;
+    }
+    return total;
+}
+
+i64 freedBy(const TitleJob& job, const ConvertOptions& options) {
+    CopyMark mark;
+    i64 original = CopyMark::in(job, mark) ? mark.originalBytes : unpackedBytes(job, options);
+    return std::max<i64>(0, original - job.inputBytes);
+}
+
+SizeEstimate alreadyCompressedEstimate(const TitleJob& job, const ConvertOptions& options) {
+    SizeEstimate same;
+    same.inputBytes = same.outputBytes = job.inputBytes;
+    same.alreadyCompressed = true;
+    bool ours = isMadeByThisTool(job);
+    if (ours)
+        same.freedBytes = freedBy(job, options);
+    same.byMakers = !ours && hasCompressedGameData(job);
+    return same;
+}
+
+bool CopyMark::isCurrent() const { return compareVersions(madeBy, StoresRepeatsOnce) >= 0; }
+
+Bytes CopyMark::toBytes() const {
+    std::string text = format("hacBrewPackLZ copy 1\nmade by %s\noriginal %lld\n", madeBy.c_str(), (long long)originalBytes);
+    return Bytes(text.begin(), text.end());
+}
+
+bool CopyMark::parse(const Bytes& data, CopyMark& out) {
+    std::string text(data.begin(), data.end());
+    std::vector<std::string> lines;
+    for (size_t at = 0; at <= text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        lines.push_back(text.substr(at, end - at));
+        at = end + 1;
+    }
+    if (lines.size() < 3 || lines[0] != "hacBrewPackLZ copy 1" || lines[1].rfind("made by ", 0) != 0 || lines[2].rfind("original ", 0) != 0)
+        return false;
+    std::string digits = lines[2].substr(9);
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos || digits.size() > 18)
+        return false;
+    out.madeBy = lines[1].substr(8);
+    out.originalBytes = std::stoll(digits);
+    return true;
+}
+
+bool CopyMark::in(const TitleJob& job, CopyMark& out) {
+    for (auto& content : job.contents) {
+        if (content.type != Cnmt::ContentTypeControl)
+            continue;
+        NcaFile& nca = content.primary();
+        for (int i = 0; i < NcaFile::SectionCount; i++) {
+            const NcaFsSection* section = nca.section(i);
+            if (!section || section->fsType() != NcaFsSection::FsRomFs || section->hasIndirect())
+                continue;
+            SourcePtr image = nca.openRomFsImage(*section, nullptr, false);
+            RomFsArchive archive = RomFsArchive::open(image, format("%s section %d", nca.name().c_str(), i));
+            for (auto& file : archive.files) {
+                if (file.path != FileName || file.size > 4096)
+                    continue;
+                Bytes data((size_t)file.size);
+                image->read(file.offset, data.data(), data.size());
+                return parse(data, out);
+            }
+        }
+    }
+    return false;
+}
+
+CopyMark CopyMark::forJob(const TitleJob& job, const ConvertOptions& options) {
+    CopyMark mark;
+    mark.madeBy = EngineVersion;
+    // For the tests, a copy as an older version would have made it, which then comes up to be made again.
+    if (const char* test = getenv("HBP_TEST_MADE_BY"); test && *test)
+        mark.madeBy = test;
+    CopyMark before;
+    if (in(job, before))
+        mark.originalBytes = before.originalBytes;
+    else if (isMadeByThisTool(job))
+        mark.originalBytes = unpackedBytes(job, options);
+    else
+        mark.originalBytes = installedBytes(job);
+    return mark;
+}
+
+i64 CopyMark::installedBytes(const TitleJob& job) {
+    i64 total = 0;
+    for (const ItemPtr& item : {job.main, job.update}) {
+        if (!item)
+            continue;
+        for (auto& record : item->meta.records) {
+            if (record.type != Cnmt::ContentTypeMeta && record.type != Cnmt::ContentTypeDeltaFragment)
+                total += record.size;
+        }
+    }
+    return total;
+}
+
+int CopyMark::compareVersions(const std::string& a, const std::string& b) {
+    auto parts = [](const std::string& version) {
+        std::vector<int> numbers;
+        std::string plain = version.substr(0, version.find('-'));
+        for (size_t at = 0; at <= plain.size();) {
+            size_t end = plain.find('.', at);
+            if (end == std::string::npos)
+                end = plain.size();
+            std::string part = plain.substr(at, end - at);
+            numbers.push_back(!part.empty() && part.find_first_not_of("0123456789") == std::string::npos && part.size() < 9 ? std::stoi(part) : 0);
+            at = end + 1;
+        }
+        return numbers;
+    };
+    std::vector<int> x = parts(a), y = parts(b);
+    for (size_t i = 0; i < std::max(x.size(), y.size()); i++) {
+        int p = i < x.size() ? x[i] : 0, q = i < y.size() ? y[i] : 0;
+        if (p != q)
+            return p < q ? -1 : 1;
+    }
+    return 0;
+}
+
+bool updateFits(const TitleJob& job) {
+    constexpr int Samples = 32;
+    try {
+        for (auto& content : job.contents) {
+            if (!content.base || !content.patch)
+                continue;
+            for (int i = 0; i < NcaFile::SectionCount; i++) {
+                const NcaFsSection* section = content.patch->section(i);
+                if (!section || !section->hasIndirect() || section->fsType() != NcaFsSection::FsRomFs || !content.base->section(i))
+                    continue;
+                SourcePtr image = content.patch->openRomFsImage(*section, content.base.get(), true);
+                Bytes buffer((size_t)IvfcBuilder::BlockSize);
+                for (int sample = 0; sample < Samples; sample++) {
+                    i64 at = image->length() * sample / Samples / IvfcBuilder::BlockSize * IvfcBuilder::BlockSize;
+                    image->read(at, buffer.data(), (size_t)std::min<i64>((i64)buffer.size(), image->length() - at));
+                }
+                image->release();
+            }
+        }
+        return true;
+    } catch (const MismatchError&) {
+        // Anything else, such as a card that won't be read or a key that's missing, is said as it is, rather than as an update that doesn't fit.
+        return false;
+    }
 }
 
 void checkTitle(const TitleJob& job, const std::string& tempDir) {
@@ -1965,7 +2800,7 @@ void checkTitle(const TitleJob& job, const std::string& tempDir) {
     progress.done();
 }
 
-SizeEstimate estimateBuild(const ExtractedGame& game, const ConvertOptions& given) {
+SizeEstimate estimateBuild(const ExtractedGame& game, const ConvertOptions& given, bool measure) {
     ConvertOptions options = given;
     if (options.threads <= 0)
         options.threads = sys::workerCount();
@@ -1978,7 +2813,9 @@ SizeEstimate estimateBuild(const ExtractedGame& game, const ConvertOptions& give
         program += NcaWriter::alignToSector(Sections::pfs0SectionSize(buildPfs0FromFolder(game.folder + "/logo")->length(), Sections::LogoHashBlockSize));
     if (game.hasRomFs) {
         SourcePtr image = game.romFsImage;
-        program += NcaWriter::alignToSector(options.compress ? compressedRomFsSize(image, options, tally, false) : plainRomFsSize(image->length(), tally));
+        program += NcaWriter::alignToSector(!options.compress ? plainRomFsSize(image->length(), tally)
+                                            : measure       ? measuredRomFsSize(image, options, tally, nullptr)
+                                                            : compressedRomFsSize(image, options, tally, false));
     }
 
     auto romFsNcaSize = [](i64 imageSize) { return NcaWriter::HeaderRegionSize + NcaWriter::alignToSector(Sections::romFsSectionSize(imageSize)); };
@@ -1995,6 +2832,7 @@ SizeEstimate estimateBuild(const ExtractedGame& game, const ConvertOptions& give
     estimate.marginBytes = (i64)ceil(sqrt(tally.variance));
     estimate.romFsBytes = tally.romFs;
     estimate.romFsStoredBytes = tally.stored;
+    estimate.measured = measure;
     return estimate;
 }
 
@@ -2002,13 +2840,30 @@ namespace SavingRule {
 
 bool applies(const ConvertOptions& options) { return options.compress && options.minSavingPercent > 0; }
 
-bool worthCompressing(const SizeEstimate& estimate, const ConvertOptions& options) { return !applies(options) || estimate.savedFraction() * 100 >= options.minSavingPercent; }
+/// The minimum goes by what it's sure to save.
+bool worthCompressing(const SizeEstimate& estimate, const ConvertOptions& options) { return !applies(options) || estimate.sureSavedFraction() * 100 >= options.minSavingPercent; }
+
+bool notSure(const SizeEstimate& estimate, const ConvertOptions& options) {
+    // Sure to save less than this is nothing, whatever the minimum: it's within the margin of error. As the app and the PC have it.
+    constexpr double NothingToGainShare = 0.005;
+    // What compressing can't shrink is stored as it is, so a first look putting a game over its size is no fact about it: such games,
+    // compressed, came to a few kilobytes less, and may save more. Only growing that is a fact leaves a game out on its say (sureToGrow): an
+    // NSZ made into a file, compared with that file, which is packed tighter than LZ4 packs. As SavingRule.NotSure on the PC.
+    if (!options.compress || estimate.measured || estimate.alreadyCompressed || estimate.sureToGrow(options.compress))
+        return false;
+    return estimate.savedBytes() < 0 || estimate.sureSavedFraction() < NothingToGainShare || !worthCompressing(estimate, options);
+}
 
 std::string reason(const SizeEstimate& estimate, const ConvertOptions& options) {
-    double percent = estimate.savedFraction() * 100;
-    if (estimate.savedBytes() >= 0)
-        return format("仅节省 %.0f%%，低于 %d%% 的最低要求", percent, options.minSavingPercent);
-    return format("反而增大 %.0f%%，低于 %d%% 的最低要求", -percent, options.minSavingPercent);
+    if (estimate.savedBytes() < 0)
+        return applies(options) ? format("会增加 %.0f%%，低于 %d%% 的下限", -estimate.savedFraction() * 100, options.minSavingPercent)
+                                : format("会增加 %.0f%%", -estimate.savedFraction() * 100);
+    double percent = estimate.sureSavedFraction() * 100;
+    // Rounded, just under the minimum would read as the minimum itself.
+    bool close = percent >= options.minSavingPercent - 0.5;
+    std::string figure = format(close ? "%.1f%%" : "%.0f%%", close ? floor(percent * 10) / 10 : percent);
+    return format(estimate.atLeast() && !estimate.measured ? "仅能确定节省 %s，低于 %d%% 的下限" : "仅节省 %s，低于 %d%% 的下限", figure.c_str(),
+                  options.minSavingPercent);
 }
 
 }  // namespace SavingRule

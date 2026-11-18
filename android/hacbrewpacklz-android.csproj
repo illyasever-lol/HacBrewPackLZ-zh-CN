@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>HacBrewPackLz</RootNamespace>
+    <AssemblyName>hacbrewpacklz-android</AssemblyName>
+    <ApplicationId>io.gitlab.ismaellozanoperezserrano.hacbrewpacklz</ApplicationId>
+    <ApplicationTitle>hacBrewPackLZ</ApplicationTitle>
+    <Version>1.5.1</Version>
+    <ApplicationDisplayVersion>$(Version)</ApplicationDisplayVersion>
+    <!-- Android only installs a larger number over a smaller one. A release is its number times 100 and 99, so 1.5.0 is 1050099, and a
+         test version such as 1.5.0-test.2 has its test number in place of the 99: after the test versions before it, before its release. -->
+    <ReleaseNumber>$(Version)</ReleaseNumber>
+    <ReleaseNumber Condition="$(Version.Contains('-test.'))">$(Version.Substring(0, $(Version.IndexOf('-test.'))))</ReleaseNumber>
+    <TestNumber>99</TestNumber>
+    <TestNumber Condition="$(Version.Contains('-test.'))">$(Version.Substring($([MSBuild]::Add($(Version.IndexOf('-test.')), 6))))</TestNumber>
+    <ApplicationVersion>$([MSBuild]::Add($([MSBuild]::Multiply($([MSBuild]::Add($([MSBuild]::Add($([MSBuild]::Multiply($([System.Version]::Parse($(ReleaseNumber)).Major), 10000)), $([MSBuild]::Multiply($([System.Version]::Parse($(ReleaseNumber)).Minor), 100)))), $([System.Version]::Parse($(ReleaseNumber)).Build))), 100)), $(TestNumber)))</ApplicationVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <AndroidManifest>AndroidManifest.xml</AndroidManifest>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- Compressing is all number crunching, so all of it is compiled ahead of time rather than only what starting up needs. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <RunAOTCompilation>true</RunAOTCompilation>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <AndroidLinkMode>SdkOnly</AndroidLinkMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="..\src\**\*.cs" Exclude="..\src\Program.cs;..\src\Tui.cs;..\src\TuiInside.cs" />
+  </ItemGroup>
+
+</Project>

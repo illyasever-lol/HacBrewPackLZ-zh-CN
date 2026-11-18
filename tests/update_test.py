@@ -3,12 +3,16 @@
 usage: update_test.py <hacbrewpacklz.exe> <private key.pem> <folder to work in>"""
 import hashlib
 import http.server
+import json
 import os
 import shutil
 import subprocess
 import sys
 import threading
 
+# Nothing a test does may reach the real report service.
+os.environ['HACBREWPACKLZ_REPORT_SITE'] = 'none'
+os.environ['HBP_TEST_REPORT_SITE'] = 'none'
 HERE = os.path.dirname(os.path.abspath(__file__))
 exe, key, work = sys.argv[1:]
 if not os.path.isfile(key) or os.path.isfile(work):
@@ -46,8 +50,29 @@ with open(os.path.join(site, 'releases'), 'w') as f:
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
+    """The files of the pretend site, with a list of releases cut to its first per_page, newest by date first, as GitLab does."""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=site, **kwargs)
+
+    def do_GET(self):
+        path, _, query = self.path.partition('?')
+        listing = os.path.join(site, *path.strip('/').split('/'))
+        if path.endswith('/releases') and os.path.isfile(listing):
+            with open(listing) as f:
+                releases = json.load(f)
+            for part in query.split('&'):
+                if part.startswith('per_page='):
+                    releases = releases[:int(part[len('per_page='):])]
+            # Without spaces, as GitLab sends it.
+            body = json.dumps(releases, separators=(',', ':')).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
 
     def log_message(self, *args):
         pass
@@ -65,9 +90,53 @@ def fresh():
     shutil.copy(exe, copy)
 
 
-def update():
-    p = subprocess.run([copy, 'update'], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+def update(pretend=None):
+    run_env = dict(env, HACBREWPACKLZ_UPDATE_AS=pretend) if pretend else env
+    p = subprocess.run([copy, 'update'], env=run_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     return p.returncode, p.stdout.strip().splitlines()[-1]
+
+
+def publish(folder, version, before_newest=False):
+    """A signed release of the newer program at site/<folder>/: the project's newest, or, as a test version is, dated just before its newest
+    release, so it comes second in the list."""
+    downloads = os.path.join(site, folder, f'v{version}', 'downloads')
+    os.makedirs(downloads, exist_ok=True)
+    with open(os.path.join(downloads, name), 'wb') as f:
+        f.write(newer)
+    subprocess.run([sys.executable, os.path.join(HERE, '..', 'tools', 'sign_release.py'), key, version, downloads, os.path.join(downloads, name)],
+                   check=True, stdout=subprocess.DEVNULL)
+    listing = os.path.join(site, folder, 'releases')
+    releases = []
+    if os.path.isfile(listing):
+        with open(listing) as f:
+            releases = json.load(f)
+    releases.insert(1 if before_newest and releases else 0, {'name': f'hacBrewPackLZ {version}', 'tag_name': f'v{version}', 'description': 'whatever'})
+    with open(listing, 'w') as f:
+        json.dump(releases, f)
+
+
+def test_versions():
+    """Test versions are published in the same project, dated just before its newest release: every copy but a test version's only asks for the
+    newest release by date, as every copy before 1.5 does, and a test version's copy looks through them all."""
+    publish('main', '1.4.3')
+    publish('main', '1.5.0-test.2', before_newest=True)
+    global env
+    saved = env
+    env = dict(env, HACBREWPACKLZ_UPDATE_SITE=env['HACBREWPACKLZ_UPDATE_SITE'] + '/main')
+    try:
+        fresh()
+        rc, out = update('1.5.0-test.1')
+        report('a test version gets the next test version', rc == 0 and sha(copy) == hashlib.sha256(newer).hexdigest() and '1.5.0-test.2' in out, out)
+        for version, who in [('1.5.0', 'a release'), ('1.4.3', 'an older release')]:
+            fresh()
+            rc, out = update(version)
+            report(f"{who} doesn't see test versions", sha(copy) == sha(exe) and 'latest version' in out, out)
+        publish('main', '1.5.0')
+        fresh()
+        rc, out = update('1.5.0-test.2')
+        report('the last test version gets the release', rc == 0 and sha(copy) == hashlib.sha256(newer).hexdigest() and '1.5.0' in out and 'test' not in out, out)
+    finally:
+        env = saved
 
 
 def tamper(path, change):
@@ -107,6 +176,7 @@ with open(os.path.join(site, 'releases'), 'w') as f:
 rc, out = update()
 report('an older release gets left alone', rc == 0 and sha(copy) == original_hash and 'latest' in out, out)
 
+test_versions()
 server.shutdown()
 print('all passed' if failures == 0 else f'{failures} failed')
 sys.exit(1 if failures else 0)

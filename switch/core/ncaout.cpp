@@ -1,8 +1,13 @@
 #include "ncaout.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <deque>
 #include <exception>
+#include <map>
 #include <new>
+#include <unordered_map>
 
 #include "lz4.h"
 #include "remote.h"
@@ -102,7 +107,9 @@ IvfcResult IvfcBuilder::finish(i64 dataSize, bool dataFirst) {
 }
 
 i64 memoryToRebuild(i64 imageBytes, int blockSize) {
-    constexpr i64 PerBlock = sizeof(BucketTree::Entry) + BucketTree::EntrySize;
+    // Each block also has to be remembered, so what comes after it can point at it if it holds the same, and where it was stored.
+    constexpr i64 ToFindItAgain = 160;
+    constexpr i64 PerBlock = sizeof(BucketTree::Entry) + BucketTree::EntrySize + ToFindItAgain;
     return imageBytes / IvfcBuilder::BlockSize * 2 * HashSize + imageBytes / blockSize * PerBlock;
 }
 
@@ -203,14 +210,39 @@ constexpr int MaxStoredRun = 0x4000000;
 constexpr int MinimumSaving = 64;
 constexpr int BatchCount = 4;
 
+using PieceHash = std::array<u64, 2>;
+
 struct Batch {
-    Batch(size_t capacity, size_t blocks) : input(new u8[capacity]), output(new u8[capacity]), outputLength(blocks) {}
+    Batch(size_t capacity, size_t blocks) : input(new u8[capacity]), output(new u8[capacity]), outputLength(blocks), hashes(blocks) { this->blocks.reserve(blocks); }
     std::unique_ptr<u8[]> input;
     std::unique_ptr<u8[]> output;
     std::vector<int> outputLength;
+    std::vector<PieceHash> hashes;
+    /// The blocks of the plan it holds.
+    std::vector<SharedBlock> blocks;
     i64 virtualOffset = 0;
     size_t bytes = 0;
 };
+
+/// Where a shared piece was stored, and what it held.
+struct StoredPiece {
+    i64 physical = 0;
+    int physicalSize = 0;
+    bool compressed = false;
+    bool known = false;
+    PieceHash hash{};
+};
+
+/// The compressed size, or 0 if it's to be stored as it is.
+int compressOne(Lz4Encoder& encoder, u8* check, const u8* input, int length, u8* output, int level, i64 virtualOffset) {
+    int compressed = encoder.compress(input, length, output, compressCapacity(length), level);
+    if (compressed > 0) {
+        int decoded = lz4Decode(output, compressed, check, Lz4Encoder::MaxBlockSize);
+        if (decoded != length || memcmp(check, input, (size_t)length) != 0)
+            throw ToolError(format("Internal error: LZ4 round trip failed at RomFS offset 0x%llx", (long long)virtualOffset));
+    }
+    return std::max(compressed, 0);
+}
 
 using BatchQueue = Handover<Batch>;
 
@@ -223,13 +255,37 @@ public:
 
     i64 position() const { return _position; }
 
-    void addCompressed(i64 virtualOffset, const u8* buffer, int length) {
+    /// Returns where it's stored.
+    i64 addCompressed(i64 virtualOffset, const u8* buffer, int length) {
         align(PhysicalAlignment);
-        _entries.push_back(BucketTree::Entry{virtualOffset, _position, 3, length});
+        i64 physical = _position;
+        _entries.push_back(BucketTree::Entry{virtualOffset, physical, 3, length});
         write(buffer, (size_t)length);
+        _storedRunEnd = -1;
+        return physical;
     }
 
-    void addStored(i64 virtualOffset, const u8* buffer, int length) {
+    /// A piece stored before, held here too, found while compressing or through the update.
+    void addReference(i64 virtualOffset, const StoredPiece& piece, int length, bool found) {
+        _sharedBytes += length;
+        _foundBytes += found ? length : 0;
+        if (piece.compressed) {
+            _entries.push_back(BucketTree::Entry{virtualOffset, piece.physical, 3, piece.physicalSize});
+            _storedRunEnd = -1;
+            return;
+        }
+        // Stored as it is, it carries on a run of stored bytes that ends where it starts, as anything stored does.
+        if (_storedRunEnd == piece.physical && _storedRunSize + length <= MaxStoredRun) {
+            _storedRunSize += length;
+        } else {
+            _entries.push_back(BucketTree::Entry{virtualOffset, piece.physical, 0, -1});
+            _storedRunSize = length;
+        }
+        _storedRunEnd = piece.physical + length;
+    }
+
+    /// Returns where it's stored.
+    i64 addStored(i64 virtualOffset, const u8* buffer, int length) {
         // Consecutive stored blocks share one entry: raw entries are random accessible and have no size limit. As in retail NCAs,
         // a raw entry's physical size is -1, because the firmware never reads it.
         if (_storedRunEnd == _position && _storedRunSize + length <= MaxStoredRun) {
@@ -239,8 +295,10 @@ public:
             _entries.push_back(BucketTree::Entry{virtualOffset, _position, 0, -1});
             _storedRunSize = length;
         }
+        i64 physical = _position;
         write(buffer, (size_t)length);
         _storedRunEnd = _position;
+        return physical;
     }
 
     CompressedData finish(i64 virtualSize) {
@@ -255,6 +313,8 @@ public:
         data.tableSize = (i64)table.size();
         data.dataSize = _position;
         data.entryCount = (int)_entries.size();
+        data.sharedBytes = _sharedBytes;
+        data.foundBytes = _foundBytes;
         data.ivfc = _ivfc.finish(_position, true);
         return data;
     }
@@ -279,15 +339,450 @@ private:
     i64 _position = 0;
     i64 _storedRunEnd = -1;
     i64 _storedRunSize = 0;
+    i64 _sharedBytes = 0;
+    i64 _foundBytes = 0;
+};
+
+/// Where the update's map has a piece of the original that's held more than once.
+struct Place {
+    i64 image;
+    int piece;
+    bool first;
+};
+
+/// Every place the update's map has a piece of the original that's held more than once, in order, and how many pieces that is.
+std::vector<Place> mapPlaces(i64 imageLength, int blockSize, const std::vector<KeptRange>* kept, int& pieces) {
+    // Every whole piece of the original that the image holds, and where. They can't overlap, as the image only holds one thing in each
+    // place, but anything that would is left out rather than trusted.
+    std::vector<std::pair<i64, i64>> places;
+    if (kept) {
+        for (auto& range : *kept) {
+            i64 first = (range.original + blockSize - 1) / blockSize * blockSize;
+            for (i64 piece = first; piece + blockSize <= range.original + range.length; piece += blockSize) {
+                i64 image = range.image + (piece - range.original);
+                if (image >= 0 && image + blockSize <= imageLength)
+                    places.emplace_back(image, piece);
+            }
+        }
+    }
+    std::sort(places.begin(), places.end());
+    std::vector<std::pair<i64, i64>> apart;
+    for (auto& place : places) {
+        if (apart.empty() || place.first >= apart.back().first + blockSize)
+            apart.push_back(place);
+    }
+    std::map<i64, int> held;
+    for (auto& place : apart)
+        held[place.second]++;
+
+    // Pieces are numbered as they're first come to.
+    std::map<i64, int> numbers;
+    std::vector<Place> shared;
+    for (auto& place : apart) {
+        if (held[place.second] < 2)
+            continue;
+        auto known = numbers.find(place.second);
+        bool first = known == numbers.end();
+        int number = first ? (int)numbers.size() : known->second;
+        if (first)
+            numbers[place.second] = number;
+        shared.push_back(Place{place.first, number, first});
+    }
+    pieces = (int)numbers.size();
+    return shared;
+}
+
+u64 splitMix(u64& state) {
+    u64 z = state += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/// A fixed value for each byte, the same in every copy of the program. 64 bytes of one value come to that value's negative, which is never let
+/// be a spot, however small the blocks, so zeros and other padding have none.
+const u64* gear() {
+    static const std::array<u64, 256> table = [] {
+        std::array<u64, 256> values{};
+        u64 state = 0x2545F4914F6CDD1DULL;
+        for (auto& value : values) {
+            do {
+                value = splitMix(state);
+            } while (((0 - value) >> 56) == 0);
+        }
+        return values;
+    }();
+    return table.data();
+}
+
+/// Plans the blocks as the image is read, in order, and finds on the way what the game holds again by itself, as SharedPieces.Planner does
+/// on the PC, which says how. Every place the update's map gives is a block of its own, as planShared has it. Between them, a block's worth
+/// that's the same as a whole block stored before points at that block instead of being stored again, wherever it is, and the blocks go on
+/// from after it.
+class Planner {
+public:
+    Planner(const SourcePtr& image, int blockSize, const std::vector<KeptRange>* kept)
+        : _image(image), _length(image->length()), _blockSize(blockSize) {
+        int bits = 0;
+        while ((1 << bits) < blockSize)
+            bits++;
+        // A spot every 1/16 of a block on average.
+        _shift = 64 - (bits - 4);
+        _map = mapPlaces(_length, blockSize, kept, _pieces);
+        // The two blocks looked through, and a read: it only reads while it has less than those.
+        _bufferSize = 2 * (size_t)blockSize + ReadSize;
+        _buffer.reset(new u8[_bufferSize]);
+        // Nearly every block is remembered, and having the room from the start never takes twice it (memoryToRebuild counts on that).
+        _targets.reserve((size_t)(_length / blockSize) + 1);
+        _keys.reserve((size_t)(_length / blockSize) + 1);
+    }
+
+    /// The highest piece number there can be, plus one.
+    int pieceCount() const { return _pieces + (int)(_length / _blockSize) + 1; }
+
+    /// The next blocks, up to most, with their bytes copied to the start of input. False once there are none left.
+    bool next(u8* input, size_t most, std::vector<SharedBlock>& blocks, i64& start, size_t& bytes) {
+        blocks.clear();
+        start = !_planned.empty() ? _planned.front().offset : _position;
+        bytes = 0;
+        while (blocks.size() < most && (!_planned.empty() || _position < _length)) {
+            if (_planned.empty())
+                step();
+            // Copied as it's planned, so the buffer only has to hold what's looked through.
+            const SharedBlock& block = _planned.front();
+            memcpy(input + bytes, _buffer.get() + (block.offset - _bufferStart), (size_t)block.length);
+            bytes += (size_t)block.length;
+            blocks.push_back(block);
+            _planned.pop_front();
+        }
+        return !blocks.empty();
+    }
+
+private:
+    /// The bytes the rolling hash takes in: a spot depends on these alone, wherever they are.
+    static constexpr int Span = 64;
+    /// A key many blocks have is kept for the first ones, as many blocks can start alike.
+    static constexpr int BlocksPerKey = 256;
+    /// Words from across a block that a candidate has to have the same before all of it is hashed.
+    static constexpr int SampleWords = 16;
+    static constexpr int ReadSize = 1 << 22;
+
+    struct Target {
+        i64 offset = 0;
+        int keyOffset = 0;
+        /// -1 if the block has only the one spot.
+        int secondOffset = -1;
+        u64 secondValue = 0;
+        u64 sample = 0;
+        u64 hash = 0;
+        int piece = -1;
+        /// Where it was last looked for. Within a block of that, it isn't looked for again, which keeps data that repeats every few bytes
+        /// from being hashed at every one.
+        i64 lastTried = INT64_MIN / 2;
+        /// The next block with the same key, or -1.
+        int next = -1;
+    };
+
+    /// Plans the block at the position, or a block held again and what's before it.
+    void step() {
+        fill(_position, std::min(_position + 2 * (i64)_blockSize, _length));
+        while (_firstSpot < _spotAt.size() && _spotAt[_firstSpot] < _position)
+            _firstSpot++;
+        if (_firstSpot >= 0x10000) {
+            _spotAt.erase(_spotAt.begin(), _spotAt.begin() + (std::ptrdiff_t)_firstSpot);
+            _spotValue.erase(_spotValue.begin(), _spotValue.begin() + (std::ptrdiff_t)_firstSpot);
+            _firstSpot = 0;
+        }
+
+        i64 limit = _length;
+        if (_nextMap < _map.size()) {
+            const Place& place = _map[_nextMap];
+            if (place.image == _position) {
+                _planned.push_back(SharedBlock{_position, _blockSize, place.piece, place.first, false});
+                if (place.first)
+                    remember(_position, place.piece);
+                _position += _blockSize;
+                _nextMap++;
+                return;
+            }
+            limit = place.image;
+        }
+
+        i64 at = 0;
+        int piece = -1;
+        if (limit - _position >= _blockSize && find(limit, at, piece)) {
+            if (at > _position)
+                _planned.push_back(SharedBlock{_position, (int)(at - _position), -1, false, false});
+            _planned.push_back(SharedBlock{at, _blockSize, piece, false, true});
+            _position = at + _blockSize;
+            return;
+        }
+
+        int length = (int)std::min<i64>(_blockSize, limit - _position);
+        bool remembered = length == _blockSize && remember(_position, _pieces);
+        _planned.push_back(SharedBlock{_position, length, remembered ? _pieces : -1, remembered, false});
+        if (remembered)
+            _pieces++;
+        _position += length;
+    }
+
+    /// The earliest place in the next block's worth that holds a whole block stored before.
+    bool find(i64 limit, i64& at, int& piece) {
+        i64 x = _position;
+        i64 w = _blockSize;
+        _candidates.clear();
+        // A block's key is at least 63 bytes into it, and less than a block.
+        for (size_t i = firstSpotFrom(x + Span - 1); i < _spotAt.size() && _spotAt[i] < x + 2 * w - 1; i++) {
+            auto key = _keys.find(_spotValue[i]);
+            if (key == _keys.end())
+                continue;
+            for (int t = key->second; t >= 0; t = _targets[(size_t)t].next) {
+                const Target& target = _targets[(size_t)t];
+                i64 q = _spotAt[i] - target.keyOffset;
+                if (q >= x && q < x + w && q >= target.offset + w && q + w <= limit)
+                    _candidates.emplace_back(q, t);
+            }
+        }
+        std::sort(_candidates.begin(), _candidates.end());
+        for (auto& candidate : _candidates) {
+            i64 q = candidate.first;
+            Target& target = _targets[(size_t)candidate.second];
+            if (target.secondOffset >= 0 && !hasSpot(q + target.secondOffset, target.secondValue))
+                continue;
+            if (sample(q) != target.sample)
+                continue;
+            if (q < target.lastTried + w)
+                continue;
+            target.lastTried = q;
+            if (blockHash(window(q), (size_t)_blockSize, 0) != target.hash)
+                continue;
+            at = q;
+            piece = target.piece;
+            return true;
+        }
+        return false;
+    }
+
+    /// Takes note of a whole block stored here, so later data can point at it. False if it has no spot, or its key has enough blocks.
+    bool remember(i64 offset, int piece) {
+        i64 end = offset + _blockSize;
+        size_t i = firstSpotFrom(offset + Span - 1);
+        if (i >= _spotAt.size() || _spotAt[i] >= end)
+            return false;
+        u64 key = _spotValue[i];
+        int last = -1, count = 0;
+        auto known = _keys.find(key);
+        if (known != _keys.end()) {
+            for (int t = known->second; t >= 0; t = _targets[(size_t)t].next) {
+                last = t;
+                count++;
+            }
+        }
+        if (count >= BlocksPerKey)
+            return false;
+        bool second = i + 1 < _spotAt.size() && _spotAt[i + 1] < end;
+        Target target;
+        target.offset = offset;
+        target.keyOffset = (int)(_spotAt[i] - offset);
+        target.secondOffset = second ? (int)(_spotAt[i + 1] - offset) : -1;
+        target.secondValue = second ? _spotValue[i + 1] : 0;
+        target.sample = sample(offset);
+        target.hash = blockHash(window(offset), (size_t)_blockSize, 0);
+        target.piece = piece;
+        _targets.push_back(target);
+        int added = (int)_targets.size() - 1;
+        if (last >= 0)
+            _targets[(size_t)last].next = added;
+        else
+            _keys[key] = added;
+        return true;
+    }
+
+    const u8* window(i64 offset) const { return _buffer.get() + (offset - _bufferStart); }
+
+    /// A hash of a word from the middle of each 1/16 of the block here: far quicker than all of it, and blocks that only start alike differ.
+    u64 sample(i64 offset) const {
+        u8 words[SampleWords * 8];
+        const u8* start = window(offset);
+        int step = _blockSize / SampleWords;
+        for (int k = 0; k < SampleWords; k++)
+            memcpy(words + k * 8, start + k * step + step / 2, 8);
+        return blockHash(words, sizeof(words), 3);
+    }
+
+    bool hasSpot(i64 at, u64 value) const {
+        size_t i = firstSpotFrom(at);
+        return i < _spotAt.size() && _spotAt[i] == at && _spotValue[i] == value;
+    }
+
+    size_t firstSpotFrom(i64 at) const {
+        return (size_t)(std::lower_bound(_spotAt.begin() + (std::ptrdiff_t)_firstSpot, _spotAt.end(), at) - _spotAt.begin());
+    }
+
+    /// Reads on until the buffer holds the image up to need, keeping what's from keep on.
+    void fill(i64 keep, i64 need) {
+        while (_bufferStart + (i64)_bufferFill < need) {
+            i64 end = _bufferStart + (i64)_bufferFill;
+            size_t wanted = (size_t)std::min<i64>(ReadSize, _length - end);
+            if (_bufferSize - _bufferFill < wanted) {
+                size_t drop = (size_t)(keep - _bufferStart);
+                memmove(_buffer.get(), _buffer.get() + drop, _bufferFill - drop);
+                _bufferStart = keep;
+                _bufferFill -= drop;
+            }
+            _image->read(end, _buffer.get() + _bufferFill, wanted);
+            roll(_bufferFill, wanted, end);
+            _bufferFill += wanted;
+        }
+    }
+
+    /// The rolling hash over bytes just read, noting every spot.
+    void roll(size_t offset, size_t count, i64 at) {
+        const u64* values = gear();
+        const u8* bytes = _buffer.get() + offset;
+        u64 h = _rolling;
+        int shift = _shift;
+        for (size_t i = 0; i < count; i++) {
+            h = (h << 1) + values[bytes[i]];
+            if ((h >> shift) == 0) {
+                _spotAt.push_back(at + (i64)i);
+                _spotValue.push_back(h);
+            }
+        }
+        _rolling = h;
+    }
+
+    SourcePtr _image;
+    i64 _length;
+    int _blockSize;
+    int _shift = 52;
+    std::vector<Place> _map;
+    size_t _nextMap = 0;
+    int _pieces = 0;
+    i64 _position = 0;
+
+    std::unique_ptr<u8[]> _buffer;
+    size_t _bufferSize = 0;
+    i64 _bufferStart = 0;
+    size_t _bufferFill = 0;
+    u64 _rolling = 0;
+
+    std::vector<i64> _spotAt;
+    std::vector<u64> _spotValue;
+    size_t _firstSpot = 0;
+
+    std::unordered_map<u64, int> _keys;
+    std::vector<Target> _targets;
+    std::deque<SharedBlock> _planned;
+    std::vector<std::pair<i64, int>> _candidates;
 };
 
 }  // namespace
 
+std::vector<u64> spotsIn(const u8* data, size_t length, int blockSize) {
+    int bits = 0;
+    while ((1 << bits) < blockSize)
+        bits++;
+    int shift = 64 - (bits - 4);
+    const u64* values = gear();
+    std::vector<u64> spots;
+    u64 h = 0;
+    for (size_t i = 0; i < length; i++) {
+        h = (h << 1) + values[data[i]];
+        if (i >= 63 && (h >> shift) == 0)
+            spots.push_back(h);
+    }
+    std::sort(spots.begin(), spots.end());
+    spots.erase(std::unique(spots.begin(), spots.end()), spots.end());
+    return spots;
+}
+
+SharedPlan planShared(i64 imageLength, int blockSize, const std::vector<KeptRange>* kept) {
+    int pieces = 0;
+    std::vector<Place> shared = mapPlaces(imageLength, blockSize, kept, pieces);
+    SharedPlan plan;
+    plan.blocks.reserve((size_t)(imageLength / blockSize) + shared.size() * 2 + 1);
+    size_t next = 0;
+    for (i64 position = 0; position < imageLength;) {
+        if (next < shared.size() && shared[next].image == position) {
+            plan.blocks.push_back(SharedBlock{position, blockSize, shared[next].piece, shared[next].first});
+            plan.references += shared[next].first ? 0 : 1;
+            position += blockSize;
+            next++;
+            continue;
+        }
+        i64 limit = next < shared.size() ? shared[next].image : imageLength;
+        int length = (int)std::min<i64>(blockSize, limit - position);
+        plan.blocks.push_back(SharedBlock{position, length, -1, false});
+        position += length;
+    }
+    plan.sharedBytes = (i64)plan.references * blockSize;
+    return plan;
+}
+
+namespace {
+constexpr u64 Prime1 = 0x9E3779B185EBCA87ULL;
+constexpr u64 Prime2 = 0xC2B2AE3D27D4EB4FULL;
+constexpr u64 Prime3 = 0x165667B19E3779F9ULL;
+constexpr u64 Prime4 = 0x85EBCA77C2B2AE63ULL;
+constexpr u64 Prime5 = 0x27D4EB2F165667C5ULL;
+
+inline u64 rotateLeft(u64 value, int bits) { return (value << bits) | (value >> (64 - bits)); }
+inline u64 word(const u8* at) {
+    u64 value;
+    memcpy(&value, at, 8);
+    return value;
+}
+inline u64 hashRound(u64 accumulator, u64 input) { return rotateLeft(accumulator + input * Prime2, 31) * Prime1; }
+inline u64 hashMerge(u64 h, u64 value) { return (h ^ hashRound(0, value)) * Prime1 + Prime4; }
+}  // namespace
+
+u64 blockHash(const u8* data, size_t length, u64 seed) {
+    size_t position = 0;
+    u64 h;
+    if (length >= 32) {
+        u64 v1 = seed + Prime1 + Prime2, v2 = seed + Prime2, v3 = seed, v4 = seed - Prime1;
+        for (; position + 32 <= length; position += 32) {
+            v1 = hashRound(v1, word(data + position));
+            v2 = hashRound(v2, word(data + position + 8));
+            v3 = hashRound(v3, word(data + position + 16));
+            v4 = hashRound(v4, word(data + position + 24));
+        }
+        h = rotateLeft(v1, 1) + rotateLeft(v2, 7) + rotateLeft(v3, 12) + rotateLeft(v4, 18);
+        h = hashMerge(h, v1);
+        h = hashMerge(h, v2);
+        h = hashMerge(h, v3);
+        h = hashMerge(h, v4);
+    } else {
+        h = seed + Prime5;
+    }
+    h += (u64)length;
+    for (; position + 8 <= length; position += 8)
+        h = rotateLeft(h ^ hashRound(0, word(data + position)), 27) * Prime1 + Prime4;
+    if (position + 4 <= length) {
+        u32 value;
+        memcpy(&value, data + position, 4);
+        h = rotateLeft(h ^ ((u64)value * Prime1), 23) * Prime2 + Prime3;
+        position += 4;
+    }
+    for (; position < length; position++)
+        h = rotateLeft(h ^ ((u64)data[position] * Prime5), 11) * Prime1;
+    h ^= h >> 33;
+    h *= Prime2;
+    h ^= h >> 29;
+    h *= Prime3;
+    h ^= h >> 32;
+    return h;
+}
+
 int compressCapacity(int length) { return length - std::max(length / 256, MinimumSaving); }
 
-CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int level, int threads, Progress& progress) {
+CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int level, int threads, Progress& progress, const std::vector<KeptRange>* kept) {
     int blocksPerBatch = std::max(threads * 32, 64) * (0x10000 / blockSize);
     size_t capacity = (size_t)blocksPerBatch * (size_t)blockSize;
+    Planner planner(image, blockSize, kept);
+    std::vector<StoredPiece> pieces;
+    pieces.reserve((size_t)planner.pieceCount());
 
     std::vector<std::unique_ptr<Batch>> batches;
     BatchQueue free, toCompress, toWrite;
@@ -315,15 +810,13 @@ CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int
     sys::Thread reading;
     reading.start([&] {
         failure.guard([&] {
-            for (i64 position = 0; position < total;) {
+            // As many blocks as there's room for, planned as they're read.
+            while (true) {
                 Batch* batch = free.take();
                 if (!batch)
                     return;
-                size_t n = (size_t)std::min<i64>(total - position, (i64)capacity);
-                image->read(position, batch->input.get(), n);
-                batch->virtualOffset = position;
-                batch->bytes = n;
-                position += (i64)n;
+                if (!planner.next(batch->input.get(), (size_t)blocksPerBatch, batch->blocks, batch->virtualOffset, batch->bytes))
+                    break;
                 toCompress.add(batch);
             }
             image->release();
@@ -337,15 +830,31 @@ CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int
     sys::Thread writing;
     writing.start([&] {
         failure.guard([&] {
+            Lz4Encoder encoder;
+            std::unique_ptr<u8[]> check(new u8[Lz4Encoder::MaxBlockSize]);
             while (Batch* batch = toWrite.take()) {
-                size_t i = 0;
-                for (size_t offset = 0; offset < batch->bytes; i++, offset += (size_t)blockSize) {
-                    int length = (int)std::min((size_t)blockSize, batch->bytes - offset);
-                    i64 virtualOffset = batch->virtualOffset + (i64)offset;
-                    if (batch->outputLength[i] > 0)
-                        writer.addCompressed(virtualOffset, batch->output.get() + offset, batch->outputLength[i]);
-                    else
-                        writer.addStored(virtualOffset, batch->input.get() + offset, length);
+                for (size_t i = 0; i < batch->blocks.size(); i++) {
+                    const SharedBlock& block = batch->blocks[i];
+                    size_t offset = (size_t)(block.offset - batch->virtualOffset);
+                    int compressed = batch->outputLength[i];
+                    if (block.piece >= 0 && !block.first) {
+                        if ((size_t)block.piece >= pieces.size() || !pieces[(size_t)block.piece].known)
+                            throw ToolError(format("Internal error: a piece held again at RomFS offset 0x%llx wasn't stored before", (long long)block.offset));
+                        const StoredPiece& piece = pieces[(size_t)block.piece];
+                        if (piece.hash == batch->hashes[i]) {
+                            writer.addReference(block.offset, piece, block.length, block.found);
+                            continue;
+                        }
+                        // Not the same after all, so it's stored as anything else is.
+                        compressed = compressOne(encoder, check.get(), batch->input.get() + offset, block.length, batch->output.get() + offset, level, block.offset);
+                    }
+                    i64 physical = compressed > 0 ? writer.addCompressed(block.offset, batch->output.get() + offset, compressed)
+                                                  : writer.addStored(block.offset, batch->input.get() + offset, block.length);
+                    if (block.piece >= 0 && block.first) {
+                        if ((size_t)block.piece >= pieces.size())
+                            pieces.resize((size_t)block.piece + 1);
+                        pieces[(size_t)block.piece] = StoredPiece{physical, compressed, compressed > 0, true, batch->hashes[i]};
+                    }
                 }
                 progress.report(batch->virtualOffset + (i64)batch->bytes, writer.position());
                 free.add(batch);
@@ -357,17 +866,21 @@ CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int
 
     failure.guard([&] {
         while (Batch* batch = toCompress.take()) {
-            int blocks = (int)((batch->bytes + (size_t)blockSize - 1) / (size_t)blockSize);
-            parallelFor(threads, blocks, [&](int index, int worker) {
-                size_t offset = (size_t)index * (size_t)blockSize;
-                int length = (int)std::min((size_t)blockSize, batch->bytes - offset);
-                int compressed = encoders[(size_t)worker]->compress(batch->input.get() + offset, length, batch->output.get() + offset, compressCapacity(length), level);
-                if (compressed > 0) {
-                    int decoded = lz4Decode(batch->output.get() + offset, compressed, checks[(size_t)worker].get(), Lz4Encoder::MaxBlockSize);
-                    if (decoded != length || memcmp(checks[(size_t)worker].get(), batch->input.get() + offset, (size_t)length) != 0)
-                        throw ToolError(format("Internal error: LZ4 round trip failed at RomFS offset 0x%llx", (long long)(batch->virtualOffset + (i64)offset)));
+            parallelFor(threads, (int)batch->blocks.size(), [&](int index, int worker) {
+                const SharedBlock& block = batch->blocks[(size_t)index];
+                size_t offset = (size_t)(block.offset - batch->virtualOffset);
+                // Two hashes the planner didn't use, so nothing points at a piece without all three agreeing.
+                if (block.piece >= 0) {
+                    const u8* bytes = batch->input.get() + offset;
+                    batch->hashes[(size_t)index] = PieceHash{blockHash(bytes, (size_t)block.length, 1), blockHash(bytes, (size_t)block.length, 2)};
                 }
-                batch->outputLength[(size_t)index] = std::max(compressed, 0);
+                // Where a piece is held again, it's only compared with what was stored.
+                if (block.piece >= 0 && !block.first) {
+                    batch->outputLength[(size_t)index] = 0;
+                    return;
+                }
+                batch->outputLength[(size_t)index] = compressOne(*encoders[(size_t)worker], checks[(size_t)worker].get(), batch->input.get() + offset, block.length,
+                                                                 batch->output.get() + offset, level, block.offset);
             });
             toWrite.add(batch);
         }
@@ -382,6 +895,151 @@ CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int
     failure.raise();
     checkStop();
     return writer.finish(total);
+}
+
+Measurement measure(const SourcePtr& image, int blockSize, int level, int threads, Progress& progress, const std::vector<KeptRange>* kept, int every) {
+    int blocksPerBatch = std::max(threads * 32, 64) * (0x10000 / blockSize);
+    size_t capacity = (size_t)blocksPerBatch * (size_t)blockSize;
+    Planner planner(image, blockSize, kept);
+
+    // One being read while the other is gone through.
+    std::vector<std::unique_ptr<Batch>> batches;
+    BatchQueue free, full;
+    for (int i = 0; i < 2; i++) {
+        batches.emplace_back(new Batch(capacity, (size_t)blocksPerBatch));
+        free.add(batches.back().get());
+    }
+    std::vector<std::unique_ptr<Lz4Encoder>> encoders;
+    std::vector<std::unique_ptr<u8[]>> scratch;
+    for (int i = 0; i < std::max(threads, 1); i++) {
+        encoders.emplace_back(new Lz4Encoder);
+        scratch.emplace_back(new u8[Lz4Encoder::MaxBlockSize]);
+    }
+    // What a block comes to compressed, with the padding before it, as the estimate counts it, or 0 if it would be stored as it is.
+    auto storedSize = [&](const u8* data, int length, int worker) {
+        int size = encoders[(size_t)worker]->compress(data, length, scratch[(size_t)worker].get(), compressCapacity(length), level);
+        return size > 0 ? size + AveragePadding : 0;
+    };
+
+    Failure failure;
+    auto shutDown = [&] {
+        free.close();
+        full.close();
+    };
+    sys::Thread reading;
+    reading.start([&] {
+        failure.guard([&] {
+            while (true) {
+                Batch* batch = free.take();
+                if (!batch)
+                    return;
+                if (!planner.next(batch->input.get(), (size_t)blocksPerBatch, batch->blocks, batch->virtualOffset, batch->bytes))
+                    break;
+                full.add(batch);
+            }
+            image->release();
+        });
+        if (failure.failed())
+            shutDown();
+        else
+            full.close();
+    }, sys::workerCore(0), 1 << 20, true);
+
+    std::vector<PieceHash> pieces;
+    std::vector<char> known;
+    i64 counted = 0, sampledStored = 0, sampledLength = 0, sampledLz4 = 0, sampledRaw = 0, notSampled = 0;
+    i64 exactStored = 0, exactLz4 = 0, exactRaw = 0, held = 0, heldBytes = 0;
+    // The successive differences between the blocks compressed to measure by, in order, for the margin.
+    double previous = 0, squares = 0;
+    i64 measured = 0;
+    std::vector<char> compress;
+    failure.guard([&] {
+        while (Batch* batch = full.take()) {
+            const std::vector<SharedBlock>& blocks = batch->blocks;
+            compress.assign(blocks.size(), 0);
+            for (size_t i = 0; i < blocks.size(); i++) {
+                if (blocks[i].piece < 0 || blocks[i].first)
+                    compress[i] = counted++ % every == 0 ? 1 : 0;
+            }
+            parallelFor(threads, (int)blocks.size(), [&](int index, int worker) {
+                const SharedBlock& block = blocks[(size_t)index];
+                const u8* bytes = batch->input.get() + (size_t)(block.offset - batch->virtualOffset);
+                if (block.piece >= 0)
+                    batch->hashes[(size_t)index] = PieceHash{blockHash(bytes, (size_t)block.length, 1), blockHash(bytes, (size_t)block.length, 2)};
+                batch->outputLength[(size_t)index] = compress[(size_t)index] ? storedSize(bytes, block.length, worker) : -1;
+            });
+
+            for (size_t i = 0; i < blocks.size(); i++) {
+                const SharedBlock& block = blocks[i];
+                size_t piece = (size_t)block.piece;
+                if (block.piece >= 0 && !block.first) {
+                    if (piece < known.size() && known[piece] && pieces[piece] == batch->hashes[i]) {
+                        held++;
+                        heldBytes += block.length;
+                        continue;
+                    }
+                    // Not the same after all, so it's stored as anything else is. That's rare enough to work out on its own.
+                    int size = storedSize(batch->input.get() + (size_t)(block.offset - batch->virtualOffset), block.length, 0);
+                    exactStored += size > 0 ? size : block.length;
+                    if (size > 0)
+                        exactLz4++;
+                    else
+                        exactRaw++;
+                    continue;
+                }
+                if (block.piece >= 0) {
+                    if (piece >= known.size()) {
+                        known.resize(piece + 1, 0);
+                        pieces.resize(piece + 1);
+                    }
+                    pieces[piece] = batch->hashes[i];
+                    known[piece] = 1;
+                }
+                int compressed = batch->outputLength[i];
+                if (compressed < 0) {
+                    notSampled += block.length;
+                    continue;
+                }
+                i64 stored = compressed > 0 ? compressed : block.length;
+                sampledStored += stored;
+                sampledLength += block.length;
+                if (compressed > 0)
+                    sampledLz4++;
+                else
+                    sampledRaw++;
+                double ratio = (double)stored / (double)block.length;
+                if (measured > 0) {
+                    // Kept from being fused into one multiply-add, which the PC doesn't do, so the sum comes out the same on both.
+                    volatile double square = (ratio - previous) * (ratio - previous);
+                    squares += square;
+                }
+                previous = ratio;
+                measured++;
+            }
+            progress.report(batch->virtualOffset + (i64)batch->bytes, 0);
+            free.add(batch);
+        }
+    });
+    if (failure.failed())
+        shutDown();
+    reading.join();
+    failure.raise();
+    checkStop();
+
+    // What's stored where it is goes by the blocks compressed to measure by. The margin is for a sample taken evenly across, with the share
+    // of it that was compressed taken off.
+    Measurement result;
+    i64 total = sampledLength + notSampled;
+    double scale = sampledLength > 0 ? (double)total / (double)sampledLength : 0;
+    double share = total > 0 ? (double)sampledLength / (double)total : 1;
+    double variance = measured > 1 ? (1 - share) / (double)measured * squares / (2.0 * (double)(measured - 1)) : 0;
+    result.stored = exactStored + (i64)((double)sampledStored * scale);
+    result.margin = 1.96 * sqrt(variance) * (double)total;
+    result.lz4Blocks = exactLz4 + (i64)((double)sampledLz4 * scale);
+    result.rawBlocks = exactRaw + (i64)((double)sampledRaw * scale);
+    result.held = held;
+    result.heldBytes = heldBytes;
+    return result;
 }
 
 }  // namespace RomFsCompressor
@@ -745,9 +1403,10 @@ void NcaBuilder::add(int index, NcaSection section) {
     endSection(index, std::move(section.fsHeader));
 }
 
-void NcaBuilder::addCompressed(int index, const SourcePtr& image, int blockSize, int level, int threads, bool encrypted, Progress& progress, CompressedData* details) {
+void NcaBuilder::addCompressed(int index, const SourcePtr& image, int blockSize, int level, int threads, bool encrypted, Progress& progress, CompressedData* details,
+                               const std::vector<KeptRange>* kept) {
     startSection(encrypted, 0);
-    CompressedData data = RomFsCompressor::run(image, *this, blockSize, level, threads, progress);
+    CompressedData data = RomFsCompressor::run(image, *this, blockSize, level, threads, progress, kept);
     write(data.ivfc.hashLevels.data(), data.ivfc.hashLevels.size());
     endSection(index, Sections::compressedRomFsHeader(data, encrypted));
     if (details) {
@@ -780,7 +1439,7 @@ NcaInfo NcaBuilder::finish(NcaContentType contentType, u64 titleId, bool sign, i
     }
 
     if (position < _position) {
-        Progress progress(_compare ? _output.readBackLabel() : "正在计算其哈希", _position - position);
+        Progress progress(_compare ? _output.readBackLabel() : "Getting it ready for the console", _position - position);
         i64 start = position;
 
         if (_compare) {

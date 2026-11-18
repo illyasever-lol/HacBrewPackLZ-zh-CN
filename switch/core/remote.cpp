@@ -1,7 +1,6 @@
 #include "remote.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -48,11 +47,17 @@ constexpr size_t BlockSize = 1 << 20;
 constexpr size_t LargestRead = 8 << 20;
 constexpr i64 LargestAnswer = 64LL << 20;
 /// Streaming: how much each request asks for, how many are out at once, how many pieces are held at most, received or on their way, and
-/// how much of a file has to be left for it to be worth it.
+/// how much of a file has to be left for it to be worth it. Over the cable, with the one way through, one request is out at a time, and the
+/// pieces are as large as the PC sends at once, which leaves as little as there can be of each request's going there and back.
 constexpr i64 StreamPiece = 4 << 20;
+constexpr i64 CablePiece = 8 << 20;
 constexpr int StreamAhead = 2;
 constexpr int StreamHeld = 4;
 constexpr i64 StreamWorthIt = 8 << 20;
+/// Files that came to at least this from a PC say in the log how fast they came.
+constexpr i64 WorthLogging = 16 << 20;
+
+std::atomic<bool> g_wifiFirst{false};
 
 struct Link {
     std::function<std::unique_ptr<Transport>()> connect;
@@ -196,12 +201,27 @@ bool estimate(const std::vector<std::string>& paths, const std::string& settings
     return true;
 }
 
-void preferCable(std::vector<Peer>& peers) {
+void keepOneWayEach(std::vector<Peer>& peers) {
     auto cable = std::find_if(peers.begin(), peers.end(), [](const Peer& peer) { return peer.id == "USB"; });
     if (cable == peers.end() || cable->machine.empty())
         return;
     std::string machine = cable->machine;
+    if (g_wifiFirst) {
+        bool onNetwork = std::any_of(peers.begin(), peers.end(), [&](const Peer& peer) { return peer.id != "USB" && peer.machine == machine; });
+        if (onNetwork)
+            peers.erase(cable);
+        return;
+    }
     peers.erase(std::remove_if(peers.begin(), peers.end(), [&](const Peer& peer) { return peer.id != "USB" && peer.machine == machine; }), peers.end());
+}
+
+void setWifiFirst(bool wifiFirst) { g_wifiFirst = wifiFirst; }
+
+bool wifiFirst() { return g_wifiFirst; }
+
+void forgetLinks() {
+    sys::Lock lock(g_linksMutex);
+    g_links.clear();
 }
 
 bool isRemote(const std::string& path) { return path.compare(0, 3, "pc:") == 0; }
@@ -212,11 +232,15 @@ std::function<bool()> giveWay() { return t_giveWay; }
 
 bool shouldGiveWay() { return t_giveWay && t_giveWay(); }
 
-std::vector<sys::DirEntry> list(const std::string& path) {
+std::vector<sys::DirEntry> list(const std::string& path, bool* failed) {
     Bytes answer;
     std::vector<sys::DirEntry> entries;
-    if (ask(path, List, 0, 0, answer) != Done)
+    Status status = ask(path, List, 0, 0, answer);
+    if (status != Done) {
+        if (failed && status != NotThere)
+            *failed = true;
         return entries;
+    }
     std::string text = textOf(answer);
     size_t start = 0;
     while (start < text.size()) {
@@ -259,6 +283,14 @@ bool isDirectory(const std::string& path) {
     return ask(path, Stat, 0, 0, answer) == Done && !answer.empty() && answer[0] == 'D';
 }
 
+sys::Presence folderPresence(const std::string& path) {
+    Bytes answer;
+    Status status = ask(path, Stat, 0, 0, answer);
+    if (status == Done)
+        return !answer.empty() && answer[0] == 'D' ? sys::Presence::There : sys::Presence::Missing;
+    return status == NotThere ? sys::Presence::Missing : sys::Presence::CantTell;
+}
+
 std::shared_ptr<RemoteFile> open(const std::string& path) {
     i64 size = fileSize(path);
     if (size < 0)
@@ -270,9 +302,12 @@ std::shared_ptr<RemoteFile> open(const std::string& path) {
 /// never waits on what's being done with what came before.
 struct RemoteFile::Stream {
     std::shared_ptr<Link> link;
+    /// Null over the cable, where each piece is asked for on the link's own way through, between whatever else is asked.
     std::unique_ptr<Transport> transport;
     std::string inside;
     i64 size;
+    i64 piece;
+    RemoteFile::Tally& tally;
     sys::Mutex mutex;
     sys::CondVar changed;
     /// What's come in, in order, each with where it starts.
@@ -283,9 +318,13 @@ struct RemoteFile::Stream {
     bool stop = false, failed = false;
     sys::Thread thread;
 
-    Stream(std::shared_ptr<Link> link_, std::unique_ptr<Transport> transport_, std::string inside_, i64 size_, i64 from)
-        : link(std::move(link_)), transport(std::move(transport_)), inside(std::move(inside_)), size(size_), asked(from), arrived(from) {
-        thread.start([this] { run(); }, -1, 1 << 16, true);
+    Stream(std::shared_ptr<Link> link_, std::unique_ptr<Transport> transport_, std::string inside_, i64 size_, i64 from, RemoteFile::Tally& tally_)
+        : link(std::move(link_)), transport(std::move(transport_)), inside(std::move(inside_)), size(size_), piece(transport ? StreamPiece : CablePiece),
+          tally(tally_), asked(from), arrived(from) {
+        if (transport)
+            thread.start([this] { run(); }, -1, 1 << 16, true);
+        else
+            thread.start([this] { runTakingTurns(); }, -1, 1 << 16, true);
     }
 
     ~Stream() {
@@ -324,16 +363,19 @@ struct RemoteFile::Stream {
                     continue;
                 }
                 // Answers come in the order they were asked for. Once stopping, they're still taken in, to leave the connection clear.
-                Bytes piece;
+                Bytes got;
                 i64 expected;
                 {
                     sys::Lock lock(mutex);
                     expected = std::min(StreamPiece, size - arrived);
                 }
-                if (receiveAnswer(*transport, piece) != Done || (i64)piece.size() != expected)
+                double started = sys::now();
+                if (receiveAnswer(*transport, got) != Done || (i64)got.size() != expected)
                     throw ToolError("无法从 PC 读取文件");
+                tally.bytes += expected;
+                tally.micros += (i64)((sys::now() - started) * 1e6);
                 sys::Lock lock(mutex);
-                pieces.emplace_back(arrived, std::move(piece));
+                pieces.emplace_back(arrived, std::move(got));
                 arrived += expected;
                 out--;
                 changed.wakeAll();
@@ -344,11 +386,76 @@ struct RemoteFile::Stream {
             changed.wakeAll();
         }
     }
+
+    /// Over the cable: the next piece is asked for while the one before is worked on, which is all that can be had with one way through, as
+    /// the PC answers each request before it reads the next. Anything else asked meanwhile, such as another file of the game, goes between.
+    void runTakingTurns() {
+        try {
+            for (;;) {
+                i64 offset = 0, length = 0;
+                {
+                    sys::Lock lock(mutex);
+                    while (!stop && !(asked < size && (int)pieces.size() < StreamHeld))
+                        changed.wait(mutex);
+                    if (stop)
+                        return;
+                    offset = asked;
+                    length = std::min(piece, size - asked);
+                    asked += length;
+                }
+                Bytes got;
+                double started = sys::now();
+                {
+                    sys::Lock lock(link->mutex);
+                    try {
+                        if (!link->transport)
+                            link->transport = link->connect();
+                        sendRequest(*link->transport, Read, offset, length, inside);
+                        if (receiveAnswer(*link->transport, got) != Done || (i64)got.size() != length)
+                            throw ToolError("无法从 PC 读取文件");
+                    } catch (...) {
+                        // Where it got to isn't known, so whatever's asked next starts again.
+                        link->transport.reset();
+                        throw;
+                    }
+                }
+                tally.bytes += length;
+                tally.micros += (i64)((sys::now() - started) * 1e6);
+                sys::Lock lock(mutex);
+                pieces.emplace_back(offset, std::move(got));
+                arrived = offset + length;
+                changed.wakeAll();
+            }
+        } catch (const ToolError&) {
+            sys::Lock lock(mutex);
+            failed = true;
+            changed.wakeAll();
+        } catch (const Cancelled&) {
+            sys::Lock lock(mutex);
+            failed = true;
+            changed.wakeAll();
+        }
+    }
 };
 
 RemoteFile::RemoteFile(std::string path, i64 size) : _path(std::move(path)), _size(size) {}
 
-RemoteFile::~RemoteFile() = default;
+/// How it came, for the log, which is what tells a slow cable from a slow card: how much, over what, how fast the way through gave it, and
+/// how fast it was worked through.
+RemoteFile::~RemoteFile() {
+    _stream.reset();
+    if (_given < WorthLogging)
+        return;
+    std::string id, inside;
+    split(_path, id, inside);
+    size_t slash = inside.rfind('/');
+    std::string name = slash == std::string::npos ? inside : inside.substr(slash + 1);
+    double seconds = std::max(_lastAt - _firstAt, 0.001);
+    double linkSeconds = std::max((double)_tally.micros / 1e6, 0.001);
+    std::string from = id == "USB" ? std::string("the PC on the USB cable") : _overCable ? id + ", through the USB cable" : id + ", over the network";
+    sink().message(format("Read %s of %s from %s in %.0f s, %.1f MB/s, with the PC sending at %.1f MB/s", formatSize(_given).c_str(), name.c_str(), from.c_str(),
+                          seconds, (double)_given / seconds / (1 << 20), (double)_tally.bytes / linkSeconds / (1 << 20)));
+}
 
 /// Takes what it can from what's been streamed, waiting for it if it's on its way. False if it's stopped short: what's left is somewhere
 /// the stream isn't, or the stream's broken, and the stream's dropped if it can't be any more use.
@@ -378,7 +485,7 @@ bool RemoteFile::fromStream(i64& offset, u8*& out, size_t& count) {
             if (found)
                 continue;
             i64 held = stream.pieces.empty() ? stream.arrived : stream.pieces.front().first;
-            if (stream.failed || offset >= stream.arrived + StreamHeld * StreamPiece) {
+            if (stream.failed || offset >= stream.arrived + StreamHeld * stream.piece) {
                 keep = false;
                 break;
             }
@@ -398,8 +505,14 @@ void RemoteFile::read(i64 offset, void* buffer, size_t count) {
         throw ToolError("内部错误：读取超出 PC 上文件的范围");
     u8* out = (u8*)buffer;
     sys::Lock lock(_mutex);
+    double now = sys::now();
+    if (_given == 0)
+        _firstAt = now;
+    _lastAt = now;
+    _given += (i64)count;
 
-    // Read from front to back for a while, a file gets streamed from there on.
+    // Read from front to back for a while, a file gets streamed from there on: over the network on a second connection, and over the cable
+    // a piece ahead on the one way through.
     _inARow = offset == _lastEnd ? _inARow + 1 : 0;
     _lastEnd = offset + (i64)count;
     if (!_stream && _inARow >= 2 && _size - offset >= StreamWorthIt) {
@@ -407,7 +520,15 @@ void RemoteFile::read(i64 offset, void* buffer, size_t count) {
             std::string id, inside;
             split(_path, id, inside);
             auto link = linkFor(id);
-            if (link->streams) {
+            bool cable;
+            {
+                sys::Lock linkLock(link->mutex);
+                cable = link->transport ? link->transport->onePipe() : !link->streams;
+            }
+            _overCable = cable;
+            if (cable) {
+                _stream = std::make_unique<Stream>(link, nullptr, inside, _size, offset, _tally);
+            } else {
                 std::unique_ptr<Transport> transport;
                 {
                     sys::Lock spare(link->spareMutex);
@@ -415,7 +536,14 @@ void RemoteFile::read(i64 offset, void* buffer, size_t count) {
                 }
                 if (!transport)
                     transport = link->connect();
-                _stream = std::make_unique<Stream>(link, std::move(transport), inside, _size, offset);
+                // A PC heard over the network that turned out to be on the cable is read through the cable, the one way there is.
+                if (transport->onePipe()) {
+                    _overCable = true;
+                    transport.reset();
+                    _stream = std::make_unique<Stream>(link, nullptr, inside, _size, offset, _tally);
+                } else {
+                    _stream = std::make_unique<Stream>(link, std::move(transport), inside, _size, offset, _tally);
+                }
             }
         } catch (const ToolError&) {
             // Then it's read the way it was, which works just as well, only slower.
@@ -434,10 +562,13 @@ void RemoteFile::read(i64 offset, void* buffer, size_t count) {
             continue;
         }
         Bytes answer;
+        double started = sys::now();
         if (count >= BlockSize) {
             size_t n = std::min(count, LargestRead);
             if (ask(_path, Read, offset, (i64)n, answer) != Done || answer.size() != n)
                 throw ToolError("无法读取 '" + _path + "'（来自 PC）");
+            _tally.bytes += (i64)n;
+            _tally.micros += (i64)((sys::now() - started) * 1e6);
             memcpy(out, answer.data(), n);
             out += n;
             offset += (i64)n;
@@ -448,6 +579,8 @@ void RemoteFile::read(i64 offset, void* buffer, size_t count) {
         size_t n = (size_t)std::min<i64>((i64)BlockSize, _size - start);
         if (ask(_path, Read, start, (i64)n, answer) != Done || answer.size() != n)
             throw ToolError("无法读取 '" + _path + "'（来自 PC）");
+        _tally.bytes += (i64)n;
+        _tally.micros += (i64)((sys::now() - started) * 1e6);
         _block = std::move(answer);
         _blockStart = start;
     }

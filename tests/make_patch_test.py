@@ -4,11 +4,27 @@
 The update uses what retail ones do: a ticket and title key, AES-CTR-Ex regions with their own counters, and an indirect
 table that takes unchanged 16 KiB blocks from the base. usage: make_patch_test.py keys tool title_dir out_dir variant
 Variants: plain, compressed_update, compressed_both. Writes base.nsp, update.nsp, dlc.nsp, romfs_new/ and exefs_new/.
+A fourth, shared, is a game of its own (0100ABCD9ABC0000, "Shared Pieces Test") with a RomFS of its own, small enough to be analyzed whole,
+whose update holds data/incompressible.bin twice more, read from the base each time, as updates often read the same part of the original game
+from more than one place. Its blocks come from wherever the base holds them, not only from the same place. A fifth, repeats (0100ABCD9ABE0000,
+"Repeats Test"), is the same with a game that also holds some of its own data again, which compressing finds as it reads. A sixth, copies
+(0100ABCD9AC00000, "File Copies Test"), holds copies of its own files, which the estimate sees from the file table: a whole copy under another
+name, and a pack with the same name and the same parts in another order. It also has files the estimate mustn't take for copies: versions of a
+menu for three languages, which end the same but differ in size, two unrelated files with the same name, and two files the same size.
 
 Two more kinds of file retail games come as: base_sparse.nsp, a base game cut down to what update.nsp still reads from it, with the same version
 as that update, and update_same.nsp, an update that changes nothing in the game data, which has no data of its own and an empty AES-CTR-Ex table.
+update_v2.nsp and update_same_v2.nsp are the same two as a newer version (131072), for a game that has update.nsp in it already.
+
+A last, programs (0100ABCD9AC20000, "Two Programs Test"), writes only programs.nsp: a collection, one game with two programs in it, which
+have different program IDs and the same content index, each with a RomFS of its own. Both hold data/same.bin with different bytes, and only
+the second holds data/only_in_two.bin.
+
+dlcs writes what plain does, plus dlc_small.nsp, a second DLC (0100ABCD12341002) with under 64 KB of game data, too little to compress,
+merged.nsp, which holds the game, its update and both DLC in one file, the small DLC first, and dlc_small2.nsp, a third DLC
+(0100ABCD12341003) as small as the second.
 """
-import hashlib, os, shutil, struct, subprocess, sys
+import hashlib, os, random, shutil, struct, subprocess, sys
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 KEYS_PATH, TOOL, TITLE, OUT, VARIANT = sys.argv[1:6]
@@ -130,8 +146,36 @@ def bktr(entries, entry_size, end):
     return table, struct.pack('<4sIii', b'BKTR', 1, len(entries), 0)
 
 
-def patch_section(new, old, file_offset, new_fs):
-    """Takes every 16 KiB block of the new section that the old one holds from there, the rest from the update's own data."""
+def romfs_files(section, fs):
+    """Where each file's data is in a RomFS section, by its path: (offset in the section, size)."""
+    image = struct.unpack_from('<Q', fs, 0x90)[0]
+    _, _, _, dir_meta, _, _, _, file_meta, _, data = struct.unpack_from('<10Q', section, image)
+    files = {}
+
+    def name_at(entry, length):
+        size = struct.unpack_from('<I', section, entry + length - 4)[0]
+        return section[entry + length:entry + length + size].decode()
+
+    def walk(directory, path):
+        _, _, child, file, _, _ = struct.unpack_from('<6I', section, image + dir_meta + directory)
+        while file != 0xFFFFFFFF:
+            entry = image + file_meta + file
+            _, sibling, offset, size, _, _ = struct.unpack_from('<IIQQII', section, entry)
+            files[path + name_at(entry, 0x20)] = (image + data + offset, size)
+            file = sibling
+        while child != 0xFFFFFFFF:
+            entry = image + dir_meta + child
+            sibling = struct.unpack_from('<I', section, entry + 4)[0]
+            walk(child, path + name_at(entry, 0x18) + '/')
+            child = sibling
+
+    walk(0, '')
+    return files
+
+
+def patch_section(new, old, file_offset, new_fs, moved=()):
+    """Takes every 16 KiB block of the new section that the old one holds from there, the rest from the update's own data. moved says where
+    else the old one may hold a block: (start, end, how far from there) for each file of the new one."""
     known = {}
     for offset in range(0, len(old) - CHUNK + 1, CHUNK):
         known.setdefault(old[offset:offset + CHUNK], offset)
@@ -142,6 +186,10 @@ def patch_section(new, old, file_offset, new_fs):
     for virtual in range(0, len(new), CHUNK):
         chunk = new[virtual:virtual + CHUNK]
         source = known.get(chunk) if len(chunk) == CHUNK else None
+        for start, end, shift in moved if source is None and len(chunk) == CHUNK else ():
+            if start <= virtual < end and virtual + shift >= 0 and old[virtual + shift:virtual + shift + CHUNK] == chunk:
+                source = virtual + shift
+                break
         if source is None:
             kind, physical = 1, len(own)
             own += chunk
@@ -244,6 +292,12 @@ def build(work, name, romfs, control, compress):
             '--controldir', control, '--nosignncasig2', '--nopatchnacplogo', '--nspdir', os.path.join(work, name)]
     if not compress:
         args.append('--nocompress')
+    if VARIANT == 'shared':
+        args += ['--titleid', '0100ABCD9ABC0000', '--titlename', 'Shared Pieces Test']
+    if VARIANT == 'repeats':
+        args += ['--titleid', '0100ABCD9ABE0000', '--titlename', 'Repeats Test']
+    if VARIANT == 'copies':
+        args += ['--titleid', '0100ABCD9AC00000', '--titlename', 'File Copies Test']
     subprocess.check_call(args, stdout=subprocess.DEVNULL)
     return os.path.join(work, name, os.listdir(os.path.join(work, name))[0])
 
@@ -262,9 +316,9 @@ def meta_nca(title_id, cnmt_name, cnmt):
     return make_nca(1, title_id, {0: (bytes(fs), ctr(KEY_AREA_KEY, data, 0xC00, 0))})
 
 
-def record(nca, content_type):
+def record(nca, content_type, id_offset=0):
     digest = hashlib.sha256(nca).digest()
-    return digest + digest[:16] + len(nca).to_bytes(6, 'little') + bytes([content_type, 0])
+    return digest + digest[:16] + len(nca).to_bytes(6, 'little') + bytes([content_type, id_offset])
 
 
 def nca_name(nca, extension='.nca'):
@@ -275,17 +329,103 @@ def cnmt(title_id, version, meta_type, extended, records):
     return struct.pack('<QIBBHHHBBBBII', title_id, version, meta_type, 0, len(extended), len(records), 0, 0, 0, 0, 0, 0, 0) + extended + b''.join(records) + b'\0' * 0x20
 
 
+def make_programs():
+    """A collection: one game with two programs, which have the same content index (0) and the same kinds of files, as in a collection of
+    games, and a RomFS each. data/same.bin is in both with different bytes, so a program read against the other one's files is caught."""
+    rnd = random.Random(0x5A1A)
+    words = [('word%04d ' % i).encode() for i in range(2000)]
+    built = []
+    for offset in (0, 1):
+        romfs = os.path.join(work, f'romfs_program{offset}')
+        os.makedirs(os.path.join(romfs, 'data'))
+        open(os.path.join(romfs, 'data', 'same.bin'), 'wb').write(b''.join(rnd.choice(words) for _ in range(160_000))[:1_300_000])
+        if offset:
+            open(os.path.join(romfs, 'data', 'only_in_two.bin'), 'wb').write(b''.join(rnd.choice(words) for _ in range(160_000))[:1_100_000])
+        args = [TOOL, '-k', KEYS_PATH, '--exefsdir', os.path.join(TITLE, 'exefs'), '--romfsdir', romfs, '--logodir', os.path.join(TITLE, 'logo'),
+                '--controldir', os.path.join(TITLE, 'control'), '--nosignncasig2', '--nopatchnacplogo', '--nocompress', '--titleid',
+                f'0100ABCD9AC2000{offset}', '--titlename', 'Two Programs Test', '--nspdir', os.path.join(work, f'program{offset}')]
+        subprocess.check_call(args, stdout=subprocess.DEVNULL)
+        built.append(read_nsp(os.path.join(work, f'program{offset}', os.listdir(os.path.join(work, f'program{offset}'))[0])))
+    ncas = [[v for k, v in files.items() if k.endswith('.nca') and not k.endswith('.cnmt.nca')] for files in built]
+    programs = [next(v for v in group if Nca(v).content_type == 0) for group in ncas]
+    control = next(v for v in ncas[0] if Nca(v).content_type == 2)
+    title_id = 0x0100ABCD9AC20000
+    for offset, program in enumerate(programs):
+        assert struct.unpack_from('<Q', Nca(program).header, 0x210)[0] == title_id + offset
+    meta = meta_nca(title_id, f'Application_{title_id:016x}.cnmt',
+                    cnmt(title_id, 0, 0x80, struct.pack('<QII', title_id + 0x800, 0, 0),
+                         [record(programs[0], 1, 0), record(programs[1], 1, 1), record(control, 3)]))
+    open(os.path.join(OUT, 'programs.nsp'), 'wb').write(write_pfs0(
+        [(nca_name(n), n) for n in (programs[0], programs[1], control)] + [(nca_name(meta, '.cnmt.nca'), meta)]))
+
+
 last_runs = []
 os.makedirs(OUT, exist_ok=True)
 work = os.path.join(OUT, 'work')
 shutil.rmtree(work, ignore_errors=True)
 os.makedirs(work)
+if VARIANT == 'programs':
+    make_programs()
+    shutil.rmtree(work, ignore_errors=True)
+    print('ready', OUT)
+    sys.exit(0)
 
 # The update changes some files, adds one and removes one: most of the RomFS stays the same.
 romfs_old = os.path.join(TITLE, 'romfs')
+if VARIANT == 'shared':
+    # Small enough for analyzing to read all of it, so what it says it comes to has no guessing in it: under 6 MB with the update.
+    romfs_old = os.path.join(OUT, 'romfs_old')
+    shutil.rmtree(romfs_old, ignore_errors=True)
+    rnd = random.Random(0x5A17)
+    words = [('word%04d ' % i).encode() for i in range(2000)]
+    for name, data in (('data/text.bin', b''.join(rnd.choice(words) for _ in range(240_000))[:2_100_000]),
+                       ('data/incompressible.bin', rnd.randbytes(1_000_000)), ('b/short', b'x'), ('readme.txt', b'Shared Pieces Test\n')):
+        os.makedirs(os.path.dirname(os.path.join(romfs_old, name)), exist_ok=True)
+        open(os.path.join(romfs_old, name), 'wb').write(data)
+if VARIANT == 'repeats':
+    # The same, but the game also holds some of its own data again, as games do: copies a multiple of 16 bytes away and 5 bytes off, which
+    # compressing stores once wherever a whole block of the first is held again, and zeros and a short repeating pattern.
+    romfs_old = os.path.join(OUT, 'romfs_old')
+    shutil.rmtree(romfs_old, ignore_errors=True)
+    rnd = random.Random(0x5A18)
+    words = [('word%04d ' % i).encode() for i in range(2000)]
+    text = b''.join(rnd.choice(words) for _ in range(240_000))[:2_100_000]
+    incompressible = rnd.randbytes(600_000)
+    for name, data in (('data/text.bin', text), ('data/incompressible.bin', incompressible),
+                       ('data/again_aligned.bin', incompressible[96_000:416_000]), ('data/again_shifted.bin', b'!' * 5 + incompressible[200_000:350_000]),
+                       ('data/text_again.bin', text[400_000:700_000]), ('data/zeros.bin', bytes(100_000)),
+                       ('data/pattern.bin', b'0123456789abcdef' * 6_250), ('b/short', b'x'), ('readme.txt', b'Repeats Test\n')):
+        os.makedirs(os.path.dirname(os.path.join(romfs_old, name)), exist_ok=True)
+        open(os.path.join(romfs_old, name), 'wb').write(data)
+if VARIANT == 'copies':
+    # Mostly data that doesn't compress, so what's held again shows plainly in what it comes to: 1 MB parts, so compressing finds nearly
+    # all of a part again wherever it is.
+    romfs_old = os.path.join(OUT, 'romfs_old')
+    shutil.rmtree(romfs_old, ignore_errors=True)
+    rnd = random.Random(0x5A19)
+    words = [('word%04d ' % i).encode() for i in range(2000)]
+    parts = [rnd.randbytes(1 << 20) for _ in range(6)]
+    one = rnd.randbytes(2_000_000)
+    shared_end = rnd.randbytes(1 << 16)
+    files = [('data/text.bin', b''.join(rnd.choice(words) for _ in range(240_000))[:2_100_000]),
+             ('data/one.bin', one), ('data/two.bin', one),
+             ('a/pack.pak', rnd.randbytes(1 << 14) + b''.join(parts)),
+             ('b/pack.pak', rnd.randbytes(1 << 14) + b''.join(parts[i] for i in (0, 3, 2, 1, 4, 5))),
+             ('x/notes.bin', rnd.randbytes(1_200_000)), ('y/notes.bin', rnd.randbytes(1_200_000)),
+             ('z/a.bin', rnd.randbytes(1_500_000)), ('z/b.bin', rnd.randbytes(1_500_000)),
+             ('b/short', b'x'), ('readme.txt', b'File Copies Test\n')]
+    for language, size in (('de', 1_200_000), ('en', 1_600_000), ('fr', 2_000_000)):
+        files.append((f'lang/{language}/menu.pak', rnd.randbytes(size - len(shared_end)) + shared_end))
+    for name, data in files:
+        os.makedirs(os.path.dirname(os.path.join(romfs_old, name)), exist_ok=True)
+        open(os.path.join(romfs_old, name), 'wb').write(data)
 romfs_new = os.path.join(OUT, 'romfs_new')
 shutil.rmtree(romfs_new, ignore_errors=True)
 shutil.copytree(romfs_old, romfs_new)
+if VARIANT in ('shared', 'repeats'):
+    os.makedirs(os.path.join(romfs_new, 'shared'))
+    for name in ('again1.bin', 'again2.bin'):
+        shutil.copyfile(os.path.join(romfs_old, 'data', 'incompressible.bin'), os.path.join(romfs_new, 'shared', name))
 with open(os.path.join(romfs_new, 'data', 'text.bin'), 'r+b') as f:
     f.seek(2_000_000)
     f.write(b'UPDATED' * 1000)
@@ -294,7 +434,7 @@ with open(os.path.join(romfs_new, 'added_by_update.bin'), 'wb') as f:
 os.remove(os.path.join(romfs_new, 'b', 'short'))
 
 base_path = build(work, 'base', romfs_old, os.path.join(TITLE, 'control'), VARIANT == 'compressed_both')
-new_path = build(work, 'new', romfs_new, os.path.join(TITLE, 'control'), VARIANT != 'plain')
+new_path = build(work, 'new', romfs_new, os.path.join(TITLE, 'control'), VARIANT not in ('plain', 'shared', 'repeats', 'copies', 'dlcs'))
 
 base_files = read_nsp(base_path)
 new_files = read_nsp(new_path)
@@ -309,7 +449,15 @@ title_id = struct.unpack_from('<Q', new_program.header, 0x210)[0]
 exefs_fs, exefs_plain = new_program.sections[0]
 sections = {0: (exefs_fs, ctr(TITLE_KEY, exefs_plain, 0xC00, 0))}
 romfs_fs, romfs_plain = new_program.sections[1]
-sections[1] = patch_section(romfs_plain, base_program.sections[1][1], 0xC00 + len(exefs_plain), romfs_fs)
+# Each file the update has goes on from wherever the base has it, a copy from what it's a copy of.
+moved = []
+if VARIANT in ('shared', 'repeats'):
+    old_files = romfs_files(base_program.sections[1][1], base_program.sections[1][0])
+    for path, (start, size) in romfs_files(romfs_plain, romfs_fs).items():
+        source = 'data/incompressible.bin' if path.startswith('shared/') else path
+        if source in old_files:
+            moved.append((start, start + size, old_files[source][0] - start))
+sections[1] = patch_section(romfs_plain, base_program.sections[1][1], 0xC00 + len(exefs_plain), romfs_fs, moved)
 
 rights_id = title_id.to_bytes(8, 'big')[:6] + b'\x08\x00' + b'\0' * 8
 patch_program = make_nca(0, title_id, sections, rights_id)
@@ -357,26 +505,52 @@ open(os.path.join(OUT, 'update_same.nsp'), 'wb').write(write_pfs0([
     (rights_id.hex() + '.tik', bytes(ticket)),
 ]))
 
+# Both again as a newer version, as a later update comes, made against the original game too. To a game made one with update.nsp,
+# update_v2.nsp reads only what update.nsp kept of the original, and update_same_v2.nsp all of it, which such a game doesn't have.
+for name, program in (('update_v2.nsp', patch_program), ('update_same_v2.nsp', same_program)):
+    newer_meta = meta_nca(title_id + 0x800, f'Patch_{title_id + 0x800:016x}.cnmt',
+                          cnmt(title_id + 0x800, 131072, 0x81, extended, [record(program, 1), record(new_control_raw, 3)]))
+    open(os.path.join(OUT, name), 'wb').write(write_pfs0([
+        (nca_name(program), program),
+        (nca_name(new_control_raw), new_control_raw),
+        (nca_name(newer_meta, '.cnmt.nca'), newer_meta),
+        (rights_id.hex() + '.tik', bytes(ticket)),
+    ]))
+
 shutil.rmtree(os.path.join(OUT, 'exefs_new'), ignore_errors=True)
 shutil.copytree(os.path.join(TITLE, 'exefs'), os.path.join(OUT, 'exefs_new'))
 
-# DLC: a single Data NCA holding a RomFS, under its own title ID.
-dlc_id = title_id + 0x1001
+def make_dlc(name, dlc_id, folder):
+    """A DLC: a single Data NCA holding a RomFS of the folder, under its own title ID."""
+    built = read_nsp(build(work, name, romfs_old, folder, False))
+    raw = next(v for k, v in built.items() if k.endswith('.nca') and not k.endswith('.cnmt.nca') and Nca(v).content_type == 2)
+    header = bytearray(xts(raw[:0xC00], False))
+    header[0x205] = 4
+    struct.pack_into('<Q', header, 0x210, dlc_id)
+    nca = xts(bytes(header), True) + raw[0xC00:]
+    meta = meta_nca(dlc_id, f'AddOnContent_{dlc_id:016x}.cnmt', cnmt(dlc_id, 0, 0x82, struct.pack('<QII', title_id, 0, 0), [record(nca, 2)]))
+    open(os.path.join(OUT, name + '.nsp'), 'wb').write(write_pfs0([(nca_name(nca), nca), (nca_name(meta, '.cnmt.nca'), meta)]))
+
+
 dlc_dir = os.path.join(work, 'dlc_romfs')
 shutil.copytree(os.path.join(TITLE, 'control'), dlc_dir)
 with open(os.path.join(dlc_dir, 'dlc_data.bin'), 'wb') as f:
     f.write(b'DLC content that compresses well. ' * 40000)
-dlc_build = read_nsp(build(work, 'dlc', romfs_old, dlc_dir, False))
-dlc_raw = next(v for k, v in dlc_build.items() if k.endswith('.nca') and not k.endswith('.cnmt.nca') and Nca(v).content_type == 2)
-dlc_header = bytearray(xts(dlc_raw[:0xC00], False))
-dlc_header[0x205] = 4
-struct.pack_into('<Q', dlc_header, 0x210, dlc_id)
-dlc_nca = xts(bytes(dlc_header), True) + dlc_raw[0xC00:]
-dlc_meta = meta_nca(dlc_id, f'AddOnContent_{dlc_id:016x}.cnmt',
-                    cnmt(dlc_id, 0, 0x82, struct.pack('<QII', title_id, 0, 0), [record(dlc_nca, 2)]))
-open(os.path.join(OUT, 'dlc.nsp'), 'wb').write(write_pfs0([(nca_name(dlc_nca), dlc_nca), (nca_name(dlc_meta, '.cnmt.nca'), dlc_meta)]))
+make_dlc('dlc', title_id + 0x1001, dlc_dir)
 shutil.rmtree(os.path.join(OUT, 'dlc_romfs'), ignore_errors=True)
 shutil.copytree(dlc_dir, os.path.join(OUT, 'dlc_romfs'))
+
+if VARIANT == 'dlcs':
+    small_dir = os.path.join(work, 'dlc_small_romfs')
+    shutil.copytree(os.path.join(TITLE, 'control'), small_dir)
+    open(os.path.join(small_dir, 'dlc_small.bin'), 'wb').write(b'A small DLC. ' * 100)
+    make_dlc('dlc_small', title_id + 0x1002, small_dir)
+    open(os.path.join(OUT, 'merged.nsp'), 'wb').write(write_pfs0(
+        [f for name in ('dlc_small', 'base', 'update', 'dlc') for f in read_nsp(os.path.join(OUT, name + '.nsp')).items()]))
+    small2_dir = os.path.join(work, 'dlc_small2_romfs')
+    shutil.copytree(os.path.join(TITLE, 'control'), small2_dir)
+    open(os.path.join(small2_dir, 'dlc_small2.bin'), 'wb').write(b'Another small DLC. ' * 100)
+    make_dlc('dlc_small2', title_id + 0x1003, small2_dir)
 
 shutil.rmtree(work, ignore_errors=True)
 print('ready', OUT)

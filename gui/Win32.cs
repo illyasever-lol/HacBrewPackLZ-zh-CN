@@ -158,11 +158,13 @@ internal static unsafe class Win32
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
     public const uint WM_LBUTTONDBLCLK = 0x0203;
+    public const uint WM_RBUTTONUP = 0x0205;
     public const uint WM_MOUSEWHEEL = 0x020A;
     public const uint WM_CAPTURECHANGED = 0x0215;
     public const uint WM_MOUSELEAVE = 0x02A3;
     public const uint WM_DPICHANGED = 0x02E0;
     public const uint WM_APP = 0x8000;
+    public const uint WM_TIMER = 0x0113;
 
     public const uint EM_SETSEL = 0x00B1;
     public const uint EM_SCROLLCARET = 0x00B7;
@@ -178,6 +180,10 @@ internal static unsafe class Win32
     public const uint WS_VSCROLL = 0x00200000;
     public const uint WS_HSCROLL = 0x00100000;
     public const uint WS_EX_TOOLWINDOW = 0x00000080;
+    public const uint WS_EX_LAYERED = 0x00080000;
+    public const uint LWA_ALPHA = 0x2;
+    public const int GWL_EXSTYLE = -20;
+    public const uint SPI_GETCLIENTAREAANIMATION = 0x1042;
 
     public const uint ES_MULTILINE = 0x0004;
     public const uint ES_AUTOVSCROLL = 0x0040;
@@ -188,6 +194,7 @@ internal static unsafe class Win32
     public const uint CS_DROPSHADOW = 0x00020000;
 
     public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOSIZE = 0x0001;
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;
     public const uint SWP_HIDEWINDOW = 0x0080;
@@ -199,11 +206,13 @@ internal static unsafe class Win32
     public const uint SRCCOPY = 0x00CC0020;
     public const int TRANSPARENT = 1;
     public const uint MB_OK = 0;
+    public const uint MB_OKCANCEL = 1;
     public const uint MB_YESNOCANCEL = 3;
     public const uint MB_YESNO = 4;
     public const uint MB_ICONERROR = 0x10;
     public const uint MB_ICONWARNING = 0x30;
     public const uint MB_ICONINFORMATION = 0x40;
+    public const int IDOK = 1;
     public const int IDCANCEL = 2;
     public const int IDYES = 6;
 
@@ -259,6 +268,28 @@ internal static unsafe class Win32
     public static extern bool DestroyWindow(IntPtr window);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetWindowLongPtrW(IntPtr window, int index);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetTimer(IntPtr window, IntPtr id, uint milliseconds, IntPtr callback);
+
+    [DllImport("user32.dll")]
+    public static extern bool KillTimer(IntPtr window, IntPtr id);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetLayeredWindowAttributes(IntPtr window, uint key, byte alpha, uint flags);
+
+    /// <param name="blend">BLENDFUNCTION: AC_SRC_OVER, with how much of the source shows, from 0 to 255, in bits 16 to 23.</param>
+    [DllImport("gdi32.dll")]
+    public static extern bool GdiAlphaBlend(IntPtr target, int x, int y, int width, int height, IntPtr source, int sourceX, int sourceY, int sourceWidth, int sourceHeight, uint blend);
+
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfoW(uint action, uint parameter, out int value, uint update);
+
+    [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr window, int command);
 
     [DllImport("user32.dll")]
@@ -284,6 +315,9 @@ internal static unsafe class Win32
 
     [DllImport("user32.dll")]
     public static extern bool PostMessageW(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsHungAppWindow(IntPtr window);
 
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessageW(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
@@ -479,6 +513,12 @@ internal static unsafe class Win32
 
     [DllImport("gdiplus.dll")]
     public static extern int GdipDisposeImage(IntPtr image);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipGetImageWidth(IntPtr image, out uint width);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipGetImageHeight(IntPtr image, out uint height);
 
     [DllImport("gdiplus.dll")]
     public static extern int GdipDrawImageRectI(IntPtr graphics, IntPtr image, int x, int y, int width, int height);

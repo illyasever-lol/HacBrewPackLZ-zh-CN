@@ -1,0 +1,30 @@
+# Builds on GitLab: the command line on Linux, and the Switch app. Keys are never on GitLab, so the tests, which need them, run on a
+# PC (tools/check.py). Releases are built and signed on the maintainer's PC too, never here.
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+
+stages:
+  - build
+
+command-line:
+  stage: build
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  script:
+    # The SDK global.json names, which the image may not have yet.
+    - curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+    - bash dotnet-install.sh --jsonfile global.json --install-dir "$HOME/.dotnet"
+    - export PATH="$HOME/.dotnet:$PATH"
+    - dotnet build hacbrewpacklz.csproj -c Release -o out
+
+switch-app:
+  stage: build
+  image: devkitpro/devkita64
+  script:
+    # The image has devkitPro's Switch libraries: curl for the network, and NTFS and ext4 for USB drives. devkitPro's own server
+    # turns builders like GitLab's away, so this only checks they're there.
+    - dkp-pacman -Q switch-curl switch-ntfs-3g switch-lwext4
+    - make -C switch -j4

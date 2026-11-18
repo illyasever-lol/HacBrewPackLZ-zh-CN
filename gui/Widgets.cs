@@ -392,9 +392,6 @@ internal sealed class LogView : Widget
 
     public override void Attached()
     {
-        // Without ES_AUTOHSCROLL a multiline EDIT word-wraps, and re-wraps every line
-        // on each width change: dragging the window crawled once a long transfer had
-        // filled the log. Long lines get a horizontal scrollbar instead.
         _edit = Win32.CreateWindowExW(0, "EDIT", "", Win32.WS_CHILD | Win32.WS_VSCROLL | Win32.WS_HSCROLL | Win32.ES_MULTILINE | Win32.ES_READONLY | Win32.ES_AUTOVSCROLL | Win32.ES_AUTOHSCROLL,
             0, 0, 10, 10, Window.Handle, IntPtr.Zero, Win32.GetModuleHandleW(null), IntPtr.Zero);
         Win32.SendMessageW(_edit, Win32.EM_SETLIMITTEXT, 0x400000, IntPtr.Zero);
@@ -402,7 +399,7 @@ internal sealed class LogView : Widget
         ApplyFont();
     }
 
-    public void ApplyTheme() => Win32.SetWindowTheme(_edit, Theme.IsDark ? "DarkMode_Explorer" : "资源管理器", null);
+    public void ApplyTheme() => Win32.SetWindowTheme(_edit, Theme.IsDark ? "DarkMode_Explorer" : "Explorer", null);
 
     public override void DpiChanged() => ApplyFont();
     public override void BoundsChanged() => Place();
@@ -432,13 +429,22 @@ internal sealed class LogView : Widget
         g.StrokeRound(Bounds, S(8), p.Border);
     }
 
+    private bool _placedVisible;
+
     private void Place()
     {
         if (_edit == IntPtr.Zero)
             return;
         var inner = Bounds.Inset(S(10), S(8));
-        Win32.SetWindowPos(_edit, IntPtr.Zero, inner.X, inner.Y, inner.W, inner.H,
-            Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | (Visible ? Win32.SWP_SHOWWINDOW : Win32.SWP_HIDEWINDOW));
+        // v21：显示/隐藏只在状态真正变化时切换。位置微调不该反复 SHOW/HIDE 原生 EDIT，
+        // 否则日志栏会在压缩过程中不停闪现。
+        uint flags = Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE;
+        if (Visible != _placedVisible)
+        {
+            flags |= Visible ? Win32.SWP_SHOWWINDOW : Win32.SWP_HIDEWINDOW;
+            _placedVisible = Visible;
+        }
+        Win32.SetWindowPos(_edit, IntPtr.Zero, inner.X, inner.Y, inner.W, inner.H, flags);
     }
 
     private void ApplyFont() => Win32.SendMessageW(_edit, Win32.WM_SETFONT, Gfx.FontHandle(Fonts.Small, Window.Dpi), 1);

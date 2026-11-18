@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace HacBrewPackLz;
 
@@ -13,6 +14,9 @@ internal static class Sender
 {
     public const int TcpPort = 25870;
     public const int BeaconPort = 25871;
+
+    /// <summary>What the Switch lists it as. A phone's own name, which Android doesn't give .NET.</summary>
+    public static string MachineName { get; set; } = Environment.MachineName;
     private const string BeaconMagic = "HBPZ1";
     private const int RequestHeader = 4 + 4 + 8 + 8 + 4;
     private const int LargestRead = 16 << 20;
@@ -34,16 +38,16 @@ internal static class Sender
             bool isFile = File.Exists(full);
             // It takes no options, and what follows one, like the keys after -k, is no game to share.
             if (input.StartsWith('-') && !isFile && !Directory.Exists(full))
-                throw new ToolException($"'{input}' 不是有效参数：send 只接受要发送到 Switch 的游戏文件或文件夹。");
+                throw new ToolException($"send doesn't take '{input}'. Give it only the game files or folders to send to the Switch.");
             if (!isFile && !Directory.Exists(full))
             {
-                Ui.Warn($"未找到 '{input}'");
+                Ui.Warn($"'{input}' not found");
                 continue;
             }
             // Folders are shared whole, as an extracted game's files can be anything. A file on its own has to be a game.
             if (isFile && !GameArchive.IsGameFile(full))
             {
-                Ui.Warn($"'{input}' 不是 NSP、NSZ、XCI 或 XCZ，已跳过不共享");
+                Ui.Warn($"'{input}' isn't an NSP, NSZ, XCI or XCZ, so it's not shared");
                 continue;
             }
             string name = Path.GetFileName(full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
@@ -75,24 +79,28 @@ internal static class Sender
         if (listener is null)
             throw new ToolException("无法启动网络共享：所需的端口已被占用。");
 
-        Ui.Info($"正以 {Environment.MachineName} 的身份向 Switch 共享 {roots.Count} 个项目：");
+        Ui.Info($"正在以 {MachineName} 的身份向 Switch 共享 {roots.Count} 个项目：");
         foreach (var root in roots)
             Ui.Info($"  {root.Value}");
         Ui.Info("");
         Ui.Info("在 Switch 上打开 hacBrewPackLZ，这些游戏会出现在「游戏文件」中。请保持此窗口运行直到完成。");
-        Ui.Info($"通过网络共享时，PC 与 Switch 必须处于同一局域网；Windows 可能提示是否允许通过防火墙。端口 {port}。");
+        Ui.Info($"走网络时两端必须在同一局域网，Windows 可能弹出防火墙提示。端口 {port}。");
         if (OperatingSystem.IsWindows())
-            Ui.Info("通过 USB 数据线连接时，Windows 需要为 Switch 安装 WinUSB 或 libusbK 驱动（可用 Zadig 安装，与 DBI 使用的是同一个驱动）。");
+            Ui.Info("走 USB 线时，Windows 需要为 Switch 安装 WinUSB 或 libusbK 驱动，可用 Zadig 安装（与 DBI 使用的一致）。");
+        else if (OperatingSystem.IsLinux())
+            Ui.Info("走 USB 线时，Linux 需要 libusb，并允许当前用户访问 Switch（帮助页有一次性设置说明）。");
+        else if (OperatingSystem.IsMacOS())
+            Ui.Info("走 USB 线时，Mac 需要 libusb，可用 Homebrew 安装：brew install libusb。");
 
         var sent = watch ?? new SendWatch();
-        sent.Started(Environment.MachineName, port);
+        sent.Started(MachineName, port);
         var answers = new SendAnswers(inside => Resolve(roots, inside), keys ?? (() => Keyset.Load(Keyset.Find(null))));
         // The tests connect straight to the port, and leave the cable and the Switch on the network to whatever else is sending.
         bool quiet = Environment.GetEnvironmentVariable("HBP_SEND_UNANNOUNCED") == "1";
         var threads = new List<Thread> { new(() => Accept(listener, roots, answers, sent, token)) { IsBackground = true, Name = "网络" } };
         if (!quiet)
-            threads.Add(new Thread(() => Announce(port, token)) { IsBackground = true, Name = "广播宣告" });
-        if (OperatingSystem.IsWindows() && !quiet)
+            threads.Add(new Thread(() => Announce(port, token)) { IsBackground = true, Name = "Announce" });
+        if (SwitchUsb.Possible && !quiet)
             threads.Add(new Thread(() => UsbLoop(roots, answers, sent, token)) { IsBackground = true, Name = "USB" });
         foreach (var thread in threads)
             thread.Start();
@@ -105,7 +113,7 @@ internal static class Sender
     /// <summary>Says it's there, every second, to every network it's on.</summary>
     private static void Announce(int port, CancellationToken token)
     {
-        byte[] message = Encoding.UTF8.GetBytes($"{BeaconMagic} {port} {Environment.MachineName}");
+        byte[] message = Encoding.UTF8.GetBytes($"{BeaconMagic} {port} {MachineName}");
         using var udp = new UdpClient { EnableBroadcast = true };
         while (!token.IsCancellationRequested)
         {
@@ -167,12 +175,12 @@ internal static class Sender
             {
                 string who = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "网络";
                 Ui.Info($"Switch 已从 {who} 连接。");
-                string how = $"通过网络（{who}）";
+                string how = $"网络（{who}）";
                 sent.Connected(how);
                 using (client)
                     Serve(client.GetStream(), roots, answers, sent, token);
                 sent.Disconnected(how);
-                Ui.Info($"{who} 的 Switch 已断开连接。");
+                Ui.Info($"Switch 已从 {who} 断开连接。");
             }) { IsBackground = true, Name = "正在提供服务" }.Start();
         }
     }
@@ -180,8 +188,24 @@ internal static class Sender
     /// <summary>Answers whatever the console asks, until it goes away.</summary>
     private static void Serve(Stream stream, Dictionary<string, string> roots, SendAnswers answers, SendWatch sent, CancellationToken token)
     {
-        FileStream? open = null;
+        SafeFileHandle? open = null;
         string? openPath = null;
+        long openLength = 0;
+        // The piece a Switch reading a file from front to back asks for next, read from the disk while this one goes across, so the disk and
+        // the cable or the network are never waiting for each other. The cable has one way through, so this is all the reading ahead it can have.
+        Task<byte[]?>? ahead = null;
+        long aheadAt = -1, aheadLength = 0;
+        void LetAheadFinish()
+        {
+            try
+            {
+                ahead?.Wait();
+            }
+            catch (AggregateException)
+            {
+            }
+            ahead = null;
+        }
         try
         {
             var header = new byte[RequestHeader];
@@ -209,7 +233,7 @@ internal static class Sender
                     switch (command)
                     {
                         case Command.Hello:
-                            answer = Encoding.UTF8.GetBytes($"{AppInfo.Name} {AppInfo.Version}\n{Environment.MachineName}");
+                            answer = Encoding.UTF8.GetBytes($"{AppInfo.Name} {AppInfo.Version}\n{MachineName}");
                             break;
                         case Command.List:
                             (status, answer) = List(roots, inside);
@@ -226,24 +250,33 @@ internal static class Sender
                             }
                             if (openPath != path)
                             {
+                                LetAheadFinish();
                                 open?.Dispose();
-                                open = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1 << 16, FileOptions.SequentialScan);
+                                open = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan);
                                 openPath = path;
+                                openLength = RandomAccess.GetLength(open);
                             }
-                            answer = new byte[b];
-                            open!.Seek(a, SeekOrigin.Begin);
-                            int got = 0;
-                            while (got < answer.Length)
+                            byte[]? read = null;
+                            if (ahead is not null && aheadAt == a && aheadLength == b)
+                                read = ahead.GetAwaiter().GetResult();
+                            LetAheadFinish();
+                            read ??= ReadRange(open!, a, b);
+                            if (read is null)
                             {
-                                int n = open.Read(answer, got, answer.Length - got);
-                                if (n <= 0)
-                                    break;
-                                got += n;
-                            }
-                            if (got != answer.Length)
                                 status = Status.Failed;
-                            else
-                                sent.Read(path, b, open.Length);
+                                break;
+                            }
+                            answer = read;
+                            sent.Read(path, b, openLength);
+                            long next = a + b;
+                            if (b > 0 && next < openLength)
+                            {
+                                var handle = open!;
+                                long length = Math.Min(b, openLength - next);
+                                ahead = Task.Run(() => ReadRange(handle, next, length));
+                                aheadAt = next;
+                                aheadLength = length;
+                            }
                             break;
                         case Command.Describe or Command.Estimate:
                             var known = command == Command.Describe ? answers.Describe(inside) : answers.Estimate(inside);
@@ -255,8 +288,9 @@ internal static class Sender
                             break;
                     }
                 }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                catch (Exception e) when (e is not OperationCanceledException)
                 {
+                    // One request that can't be answered is a failure for the Switch to hear about, not the end of the program.
                     status = Status.Failed;
                     answer = [];
                 }
@@ -276,7 +310,30 @@ internal static class Sender
         }
         finally
         {
+            LetAheadFinish();
             open?.Dispose();
+        }
+    }
+
+    /// <summary>Part of a file, or nothing if it's shorter than that by now or can't be read.</summary>
+    private static byte[]? ReadRange(SafeFileHandle handle, long offset, long count)
+    {
+        try
+        {
+            var buffer = new byte[count];
+            long got = 0;
+            while (got < count)
+            {
+                int n = RandomAccess.Read(handle, buffer.AsSpan((int)got), offset + got);
+                if (n <= 0)
+                    return null;
+                got += n;
+            }
+            return buffer;
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 
@@ -354,7 +411,8 @@ internal static class Sender
         return (Status.NotThere, []);
     }
 
-    /// <summary>The console can only be reached over USB once Windows has a driver for it that lets programs talk to it, as with DBI.</summary>
+    /// <summary>The console can only be reached over USB once Windows has a driver for it that lets programs talk to it, as with DBI, or on Linux and
+    /// macOS, once libusb is there to talk to it.</summary>
     private static void UsbLoop(Dictionary<string, string> roots, SendAnswers answers, SendWatch sent, CancellationToken token)
     {
         bool saidWaiting = false;
@@ -382,7 +440,7 @@ internal static class Sender
                 Serve(stream, roots, answers, sent, token);
             }
             sent.Disconnected("通过 USB 数据线");
-            Ui.Info("Switch 已断开 USB 数据线连接。");
+            Ui.Info("Switch 的 USB 数据线已断开。");
             token.WaitHandle.WaitOne(1000);
         }
     }
@@ -393,26 +451,19 @@ internal static class Sender
 internal sealed class SendWatch
 {
     private const double SpeedSeconds = 3;
-    /// The settle window lives on SendSnapshot: the window asks it about each title,
-    /// so one constant serves both the global snapshot and per-title checks.
 
     private readonly object _gate = new();
     private readonly List<string> _connected = [];
     private readonly Dictionary<string, (long read, long length)> _files = new(StringComparer.OrdinalIgnoreCase);
-    /// When each output file was last read. A title is done when all of its own files go
-    /// quiet, so starting another title can't drag an earlier one back to a stale percent.
-    private readonly Dictionary<string, DateTime> _lastReadAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<(DateTime at, long bytes)> _recent = new();
     private string _machine = "";
     private int _port;
     private string? _usbProblem;
     private string? _file;
-    private DateTime _fileAt = DateTime.MinValue;
     private DateTime _lastRead = DateTime.MinValue;
     private DateTime _lastSaid = DateTime.MinValue;
-    /// Announce each output file once per send; several can be read in turn while a
-    /// merged title is installed, and announcing every switch floods the details log.
-    private readonly HashSet<string> _announced = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>v16：每个文件最后一次被读取的时刻，用于按文件判定「已发送」。</summary>
+    private readonly Dictionary<string, DateTime> _lastReadAt = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Raised on whichever thread it happened on.</summary>
     public event Action? Changed;
@@ -461,42 +512,21 @@ internal sealed class SendWatch
             var (read, _) = _files.GetValueOrDefault(path);
             // What's read more than once still only counts the once, as far as how much is left goes.
             _files[path] = (Math.Min(read + count, length), length);
-            _lastReadAt[path] = now;
             _recent.Enqueue((now, count));
             while (_recent.Count > 0 && (now - _recent.Peek().at).TotalSeconds > SpeedSeconds)
                 _recent.Dequeue();
             _lastRead = now;
+            _lastReadAt[path] = now;
 
-            // Several output NSPs can be read in turn. Keep the status on the one still
-            // in progress instead of flapping between them on every single request.
             bool newFile = path != _file;
-            if (newFile)
-            {
-                var (currentRead, currentLength) = _files.GetValueOrDefault(_file ?? "");
-                bool currentDone = _file is null || currentRead >= currentLength;
-                bool currentQuiet = _file is null || (now - _fileAt).TotalSeconds >= 2;
-                if (!currentDone && !currentQuiet)
-                    newFile = false;
-            }
-            if (path == _file)
-                _fileAt = now;
-            if (newFile)
-            {
-                _file = path;
-                _fileAt = now;
-            }
-            bool announce = newFile && _announced.Add(path);
-            if (announce || (now - _lastSaid).TotalSeconds >= 5)
+            _file = path;
+            if (newFile || (now - _lastSaid).TotalSeconds >= 5)
             {
                 _lastSaid = now;
-                say = announce
-                    ? $"正在发送 {Path.GetFileName(path)}"
-                    : $"  已发送 {ProgressReporter.Format(_files[path].read)} / 共 {ProgressReporter.Format(length)}";
+                say = newFile ? $"正在发送 {Path.GetFileName(path)}" : $"  {ProgressReporter.Format(_files[path].read)} / {ProgressReporter.Format(length)}";
             }
         }
-        // Never call out to the UI while holding _gate. Session.Snapshot() takes Session's
-        // lock before asking this object for a snapshot; doing the reverse here used to
-        // deadlock the window thread part way through a long USB transfer.
+        // Said once the watch is let go: the list keeps the line under its own lock, which the window holds while it reads the watch.
         if (say is not null)
             Ui.Info(say);
         Changed?.Invoke();
@@ -508,62 +538,58 @@ internal sealed class SendWatch
         {
             var now = DateTime.UtcNow;
             bool active = (now - _lastRead).TotalSeconds < SpeedSeconds;
-            bool settled = (now - _lastRead).TotalSeconds >= SendSnapshot.SettleSeconds;
             long speed = active ? (long)(_recent.Where(r => (now - r.at).TotalSeconds <= SpeedSeconds).Sum(r => r.bytes) / SpeedSeconds) : 0;
             return new SendSnapshot(_machine, _port, _connected.ToArray(), _usbProblem, active ? _file : null, speed,
-                new Dictionary<string, (long, long)>(_files, StringComparer.OrdinalIgnoreCase), settled,
-                new Dictionary<string, DateTime>(_lastReadAt, StringComparer.OrdinalIgnoreCase), now);
+                new Dictionary<string, (long, long)>(_files, StringComparer.OrdinalIgnoreCase),
+                new Dictionary<string, DateTime>(_lastReadAt, StringComparer.OrdinalIgnoreCase));
         }
     }
 }
 
 /// <param name="Reading">The file the Switch is reading now, if it's reading anything.</param>
-/// <param name="Settled">True once the Switch has been quiet long enough that a part-read file counts as sent.</param>
-/// <param name="LastReadAt">When each output file was last read, for per-title settle checks.</param>
-/// <param name="At">When this snapshot was taken, so settle checks use one clock value.</param>
 internal sealed record SendSnapshot(string Machine, int Port, string[] Connected, string? UsbProblem, string? Reading, long BytesPerSecond,
-    IReadOnlyDictionary<string, (long read, long length)> Files, bool Settled,
-    IReadOnlyDictionary<string, DateTime> LastReadAt, DateTime At)
+    IReadOnlyDictionary<string, (long read, long length)> Files, IReadOnlyDictionary<string, DateTime> LastReadAt)
 {
-    /// <summary>How long a title's own files must be quiet before a part-read file counts as sent.</summary>
+    /// <summary>After this many quiet seconds a row's own files count as sent, even if the Switch stopped reading before the end.</summary>
     public const double SettleSeconds = 8;
 
-    /// <summary>True once every file this title is made of has been quiet long enough. Files never
-    /// read don't count, and reading another title later can't make an earlier one look unfinished.</summary>
-    public bool IsSettled(IEnumerable<string> paths)
-    {
-        bool any = false;
-        foreach (string file in Matching(paths))
-        {
-            any = true;
-            if (!LastReadAt.TryGetValue(file, out var at) || (At - at).TotalSeconds < SettleSeconds)
-                return false;
-        }
-        return any;
-    }
-
-    private IEnumerable<string> Matching(IEnumerable<string> paths)
+    /// <summary>Does a file the Switch read belong to one of these paths (a file, or a folder shared whole)?</summary>
+    public static bool Matching(IEnumerable<string> paths, string file)
     {
         foreach (string path in paths)
         {
             string full = Path.GetFullPath(path);
             string inside = full.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            foreach (string file in Files.Keys)
-                if (string.Equals(file, full, StringComparison.OrdinalIgnoreCase)
-                    || file.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
-                    yield return file;
+            if (string.Equals(file, full, StringComparison.OrdinalIgnoreCase) || file.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
+        return false;
     }
 
     /// <summary>How much of these files, or of the files in these folders, the Switch has read.</summary>
     public (long read, long length) Of(IEnumerable<string> paths)
     {
         long read = 0, length = 0;
-        foreach (string file in Matching(paths))
+        foreach (var file in Files)
         {
-            read += Files[file].read;
-            length += Files[file].length;
+            if (!Matching(paths, file.Key))
+                continue;
+            read += file.Value.read;
+            length += file.Value.length;
         }
         return (read, length);
+    }
+
+    /// <summary>Time alone makes this true; the GUI's 1 s tick keeps taking new snapshots so it can come true without another event.</summary>
+    public bool IsSettled(IEnumerable<string> paths)
+    {
+        var (read, _) = Of(paths);
+        if (read == 0)
+            return false;
+        DateTime last = DateTime.MinValue;
+        foreach (var entry in LastReadAt)
+            if (Matching(paths, entry.Key) && entry.Value > last)
+                last = entry.Value;
+        return last != DateTime.MinValue && (DateTime.UtcNow - last).TotalSeconds >= SettleSeconds;
     }
 }

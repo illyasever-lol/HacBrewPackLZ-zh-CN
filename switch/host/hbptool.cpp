@@ -1,5 +1,5 @@
 // The engine on a PC, with just enough of a command line to hold it against the C# tool:
-//   hbptool convert  -k keys [--nosignncasig2] [--nocompress] [--level N] [--blocksize N] --nspdir out inputs...
+//   hbptool convert  -k keys [--nosignncasig2] [--nocompress] [--level N] [--blocksize N] [--separatedlc] --nspdir out inputs...
 //   hbptool analyze  -k keys inputs...
 //   hbptool extract  -k keys --outdir out inputs...
 //   hbptool build    -k keys [--nosignncasig2] [--nocompress] [--level N] [--blocksize N] --nspdir out folders...
@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <map>
 #include <random>
+#include <set>
 
 #include "../core/crypto.h"
 #include "../core/title.h"
@@ -49,7 +50,7 @@ Args parse(int argc, char** argv) {
         std::string arg = argv[i];
         auto value = [&]() -> std::string {
             if (++i >= argc)
-                throw ToolError(arg + "需要指定一个值");
+                throw ToolError(arg + " needs a value");
             return argv[i];
         };
         if (arg == "-k")
@@ -76,6 +77,8 @@ Args parse(int argc, char** argv) {
             a.options.threads = atoi(value().c_str());
         else if (arg == "--minsaving")
             a.options.minSavingPercent = atoi(value().c_str());
+        else if (arg == "--separatedlc")
+            a.options.dlcInGameFile = false;
         else
             a.inputs.push_back(arg);
     }
@@ -85,6 +88,8 @@ Args parse(int argc, char** argv) {
 int runTitles(const char* mode, const Args& args) {
     Keyset keyset;
     keyset.load(args.keys);
+    // A solid NCZ needed out of order is kept in memory, as on the console, only when a test gives it some.
+    NczSource::setSpoolMemory(sys::spareMemory());
 
     std::vector<std::string> notes;
     std::vector<InputIssue> problems;
@@ -107,33 +112,84 @@ int runTitles(const char* mode, const Args& args) {
     printf("Found %d title(s)\n", (int)set.jobs.size());
 
     int failures = 0;
+    // As on the PC: once a game's new file is made, none of its DLC is left out. It's in that file, or with --separatedlc in one of its own.
+    std::set<const TitleJob*> inGameFile;
+    std::set<u64> gamesMade;
     for (auto& job : set.jobs) {
         printf("%s\n", job.describe().c_str());
         try {
-            if (!strcmp(mode, "analyze")) {
-                SizeEstimate e = estimateTitle(job, args.options);
+            if (!strcmp(mode, "analyze") || !strcmp(mode, "measure")) {
+                ConvertOptions options = args.options;
+                options.tempDir = args.temp.empty() ? args.nspDir : args.temp;
+                // As the PC's analyze --measure: a game under 1 GB is measured exactly.
+                if (job.inputBytes < MeasureExactlyBelow)
+                    options.measureEvery = 1;
+                SizeEstimate e = !strcmp(mode, "measure") ? measureTitle(job, options) : estimateTitle(job, options);
                 printf("  In bytes:   %lld +/- %lld\n", (long long)e.outputBytes, (long long)e.marginBytes);
                 printf("  Now:        %lld\n", (long long)e.inputBytes);
                 printf("  Game data:  %lld to %lld\n", (long long)e.romFsBytes, (long long)e.romFsStoredBytes);
+                // Whether its game data is compressed already, and by whom, as the app tells: a copy this tool made, of whichever version,
+                // isn't its makers', and says what compressing it freed.
+                if (hasCompressedGameData(job))
+                    printf("  Compressed: by this tool %d, freed %lld\n", isMadeByThisTool(job) ? 1 : 0, (long long)freedBy(job, options));
             } else if (!strcmp(mode, "extract")) {
                 ExtractResult result = extractTitle(job, set, args.outDir);
                 printf("  Extracted %lld files, %lld bytes, to %s\n", (long long)result.files, (long long)result.bytes, result.path.c_str());
             } else {
+                u64 application = job.isBaseGame() ? job.main->meta.titleId : job.main->meta.linkedId();
+                // A game's DLC go into its file, and DLC without their game into one file, named after the first of them.
+                bool alone = !job.isBaseGame() && std::none_of(set.jobs.begin(), set.jobs.end(),
+                    [&](const TitleJob& other) { return other.isBaseGame() && other.main->meta.titleId == application; });
+                // v23：有本体的 DLC 一律由本体那一次统一写出，与 PC 端 RunMerged 一致，
+                // 不再依赖 set.jobs 的枚举顺序（原先 DLC 排在本体前面时会先单独成文件）。
+                if (!job.isBaseGame() && !alone)
+                    continue;
+                if (inGameFile.count(&job)) {
+                    printf(alone ? "  In one file with the other DLC\n" : "  In the game's file\n");
+                    continue;
+                }
                 ConvertOptions options = args.options;
                 options.tempDir = args.temp.empty() ? args.nspDir : args.temp;
-                if (SavingRule::applies(options)) {
+                if (SavingRule::applies(options) && !gamesMade.count(application)) {
                     SizeEstimate e = estimateTitle(job, options);
                     if (!SavingRule::worthCompressing(e, options)) {
-                        printf("  Left out: %s\n", SavingRule::reason(e, options).c_str());
-                        continue;
+                        // As the command line on the PC: one a first look can't vouch for is measured, writing nothing.
+                        if (SavingRule::notSure(e, options)) {
+                            ConvertOptions measuring = options;
+                            if (job.inputBytes < MeasureExactlyBelow)
+                                measuring.measureEvery = 1;
+                            e = measureTitle(job, measuring);
+                            printf("  Measured in bytes: %lld +/- %lld\n", (long long)e.outputBytes, (long long)e.marginBytes);
+                        }
+                        if (!SavingRule::worthCompressing(e, options)) {
+                            printf("  Left out: %s\n", SavingRule::reason(e, options).c_str());
+                            continue;
+                        }
                     }
                 }
+                std::vector<const TitleJob*> titles{&job};
+                // v23：按 ApplicationId 全量筛 DLC，删掉依赖指针先后（枚举顺序）的旧条件。
+                if (options.dlcInGameFile && (job.isBaseGame() || alone)) {
+                    for (auto& other : set.jobs) {
+                        if (&other != &job && !other.isBaseGame() && other.main->meta.linkedId() == application)
+                            titles.push_back(&other);
+                    }
+                }
+                std::sort(titles.begin() + (job.isBaseGame() ? 1 : 0), titles.end(),
+                          [](const TitleJob* a, const TitleJob* b) { return a->main->meta.titleId < b->main->meta.titleId; });
+                int contents = 0;
+                for (const TitleJob* each : titles)
+                    contents += (int)each->contents.size();
                 sys::makeDirectories(args.nspDir);
                 TitleConverter converter(options, keyset);
-                std::string path = args.nspDir + "/" + outputFileName(job, set, options);
-                NspOutput output(path, (int)job.contents.size());
-                converter.run(job, output);
+                std::string path = args.nspDir + "/" + outputFileName(*titles[0], set, options);
+                NspOutput output(path, contents, 0, true, (int)titles.size());
+                for (const TitleJob* each : titles)
+                    converter.run(*each, output);
                 printf("  Created %s, %lld bytes\n", path.c_str(), (long long)output.outputBytes());
+                if (job.isBaseGame())
+                    gamesMade.insert(application);
+                inGameFile.insert(titles.begin(), titles.end());
             }
         } catch (const ToolError& e) {
             printf("  FAILED: %s\n", e.what());
@@ -161,7 +217,7 @@ int runBuilds(const char* mode, const Args& args) {
             options.tempDir = args.temp.empty() ? args.nspDir : args.temp;
             sys::makeDirectories(args.nspDir);
             std::string path = args.nspDir + "/" + game.outputFileName(options);
-            NspOutput output(path, game.contentCount());
+            NspOutput output(path, game.contentCount(), 0, true);
             TitleConverter(options, keyset).build(game, output);
             printf("  Created %s, %lld bytes\n", path.c_str(), (long long)output.outputBytes());
         } catch (const ToolError& e) {
@@ -188,7 +244,7 @@ bool decodeStream(const Bytes& packed, Bytes& out, i64 expected) {
     out.clear();
     stream.decoded = [&](i64 position, const u8* data, size_t size) {
         if ((i64)out.size() != position)
-            throw ToolError("流位置不连续");
+            throw ToolError("Stream positions don't follow on");
         out.insert(out.end(), data, data + size);
     };
     while (stream.advance()) {
@@ -252,12 +308,12 @@ int zstdCheck(const std::string& folder) {
             size_t size = decoder.decompress(packed.data(), packed.size(), whole.data(), expected.size());
             whole.resize(size);
             if (whole != expected)
-                throw ToolError("整体模式：结果错误");
+                throw ToolError("whole: wrong result");
 
             Bytes streamed;
             decodeStream(packed, streamed, (i64)expected.size());
             if (streamed != expected)
-                throw ToolError("流模式：结果错误");
+                throw ToolError("stream: wrong result");
             passed++;
         } catch (const ToolError& e) {
             printf("FAIL %s: %s\n", name.c_str(), e.what());
@@ -305,7 +361,7 @@ int zstdFuzz(const std::string& folder, int rounds) {
 Bytes hexArgument(const char* text, size_t size) {
     Bytes value;
     if (!fromHex(text, value))
-        throw ToolError("不是十六进制");
+        throw ToolError("Not hex");
     if (value.size() < size)
         value.insert(value.begin(), size - value.size(), 0);
     return value;
@@ -318,7 +374,7 @@ int rsaCheck(int argc, char** argv) {
     printf("%s\n", toHex(output, 0x100).c_str());
     if (argc > 5) {
         Bytes message;
-        printf("%s\n", oaepUnpad(output, message) ? toHex(message.data(), message.size()).c_str() : "已拒绝");
+        printf("%s\n", oaepUnpad(output, message) ? toHex(message.data(), message.size()).c_str() : "refused");
     }
     return 0;
 }
@@ -329,6 +385,54 @@ int signCheck(const char* hexData) {
     u8 signature[0x100];
     signPss(data.data(), data.size(), signature);
     printf("%s\n%s\n", toHex(signingModulus(), 0x100).c_str(), toHex(signature, 0x100).c_str());
+    return 0;
+}
+
+/// Where an offset of a game's data is: in which file, and whether its update takes those bytes from its base game or holds them itself.
+/// For a hash check that fails, it says which part is damaged or doesn't belong. usage: hbptool where -k keys <files> <hex offset>
+int whereIs(Args args) {
+    if (args.inputs.size() < 2)
+        return 2;
+    i64 offset = (i64)strtoull(args.inputs.back().c_str(), nullptr, 16);
+    args.inputs.pop_back();
+    Keyset keyset;
+    keyset.load(args.keys);
+    std::vector<std::string> notes;
+    std::vector<InputIssue> problems;
+    TitleSet set(keyset);
+    for (auto& path : TitleSet::expand(args.inputs, notes, problems))
+        set.add(std::make_shared<FileArchive>(path));
+    set.group();
+    for (auto& job : set.jobs) {
+        for (auto& content : job.contents) {
+            if (content.type != Cnmt::ContentTypeProgram)
+                continue;
+            for (int i : content.sectionsInFileOrder()) {
+                SectionSource source = {};
+                if (!content.sectionAt(i, source) || source.section->fsType() != NcaFsSection::FsRomFs)
+                    continue;
+                printf("%s section %d, game data at 0x%llx\n", source.owner->name().c_str(), i, (unsigned long long)offset);
+                if (source.original && source.section->hasIndirect()) {
+                    bool fromBase = false;
+                    for (auto& kept : source.owner->keptInImage(*source.section, source.original)) {
+                        if (offset >= kept.image && offset < kept.image + kept.length) {
+                            printf("  comes from the base game, %s, at 0x%llx of its section (kept range 0x%llx, 0x%llx long)\n", source.original->name().c_str(),
+                                   (unsigned long long)(kept.original + (offset - kept.image)), (unsigned long long)kept.image, (unsigned long long)kept.length);
+                            fromBase = true;
+                        }
+                    }
+                    if (!fromBase)
+                        printf("  is the update's own\n");
+                }
+                SourcePtr image = source.owner->openRomFsImage(*source.section, source.original, false);
+                RomFsArchive archive = RomFsArchive::open(image, "the game data");
+                for (auto& file : archive.files) {
+                    if (offset >= file.offset && offset < file.offset + file.size)
+                        printf("  in %s, %lld bytes, 0x%llx into it\n", file.path.c_str(), (long long)file.size, (unsigned long long)(offset - file.offset));
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -369,6 +473,8 @@ int main(int argc, char** argv) {
             return signCheck(argv[2]);
         if (mode == "build" || mode == "estimatebuild")
             return runBuilds(mode.c_str(), parse(argc, argv));
+        if (mode == "where")
+            return whereIs(parse(argc, argv));
         if (mode == "listing") {
             Args args = parse(argc, argv);
             bool whole = !args.inputs.empty() && args.inputs[0] == "whole";

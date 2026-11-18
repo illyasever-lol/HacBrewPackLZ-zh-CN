@@ -24,7 +24,8 @@ static class Check
     static int Main(string[] a)
     {
         string keys = a[0], nsp = a[1];
-        string? romfs = null, exefs = null, reference = null, dumpImage = null, baseNsp = null, updateNsp = null;
+        string? romfs = null, exefs = null, reference = null, dumpImage = null, baseNsp = null, updateNsp = null, patchNsp = null, readPatched = null, saveRange = null;
+        long from = 0, length = 0;
         int random = 20000;
         for (int i = 2; i < a.Length; i += 2)
         {
@@ -37,6 +38,11 @@ static class Check
                 case "--dump-image": dumpImage = a[i + 1]; break;
                 case "--base": baseNsp = a[i + 1]; break;
                 case "--update": updateNsp = a[i + 1]; break;
+                case "--patch": patchNsp = a[i + 1]; break;
+                case "--read-patched": readPatched = a[i + 1]; break;
+                case "--from": from = Convert.ToInt64(a[i + 1], 16); break;
+                case "--length": length = Convert.ToInt64(a[i + 1], 16); break;
+                case "--save-range": saveRange = a[i + 1]; break;
             }
         }
 
@@ -53,11 +59,133 @@ static class Check
 
         if (dumpImage is not null)
         {
-            var image = ncas.First(n => n.nca.Header.ContentType == NcaContentType.Program).nca
-                .OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
+            // With --patch, the game data as an official update makes it, laid over this NSP's as its base, the way the console does.
+            var programNca = ncas.First(n => n.nca.Header.ContentType == NcaContentType.Program).nca;
+            // A game with no game data (Animal Well keeps everything in its code) gives its code instead.
+            var section = programNca.SectionExists(NcaSectionType.Data) ? NcaSectionType.Data : NcaSectionType.Code;
+            IStorage image;
+            if (patchNsp is not null)
+            {
+                var (_, patchNcas) = OpenNsp(patchNsp);
+                var patch = patchNcas.First(n => n.nca.Header.ContentType == NcaContentType.Program).nca;
+                image = programNca.OpenStorageWithPatch(patch, section, IntegrityCheckLevel.ErrorOnInvalid);
+            }
+            else
+            {
+                image = programNca.OpenStorage(section, IntegrityCheckLevel.ErrorOnInvalid);
+            }
             using var output = File.Create(dumpImage);
             image.CopyToStream(output);
             Console.WriteLine($"dumped {output.Length} bytes");
+            return 0;
+        }
+
+        // The game data an official update makes, laid over this NSP's as its base, read the way the console does with every hash checked, from
+        // and for as far as asked (hex), and kept in a file if asked, to compare with what this tool reads there. Nothing else is written.
+        if (readPatched is not null)
+        {
+            var programNca = ncas.First(n => n.nca.Header.ContentType == NcaContentType.Program).nca;
+            var (_, patchNcas) = OpenNsp(readPatched);
+            var patch = patchNcas.First(n => n.nca.Header.ContentType == NcaContentType.Program).nca;
+            var image = programNca.OpenStorageWithPatch(patch, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
+            image.GetSize(out long size).ThrowIfFailure();
+            long end = length > 0 ? Math.Min(size, from + length) : size;
+            Console.WriteLine($"patched game data 0x{size:x} bytes, reading 0x{from:x} to 0x{end:x}");
+            var chunk = new byte[1 << 20];
+            using var save = saveRange is null ? null : File.Create(saveRange);
+            // With --scan, it goes on past what fails, and says each stretch of 16 KB blocks that does.
+            bool scan = a.Contains("--scan");
+            const int Block = 0x4000;
+            long bad = 0, badStart = -1, badEnd = -1;
+            void Note(long start, long stop)
+            {
+                if (badStart >= 0 && start == badEnd)
+                {
+                    badEnd = stop;
+                    return;
+                }
+                if (badStart >= 0)
+                    Console.WriteLine($"  fails: 0x{badStart:x} to 0x{badEnd:x}");
+                badStart = start;
+                badEnd = stop;
+            }
+            for (long at = from; at < end; at += chunk.Length)
+            {
+                int n = (int)Math.Min(chunk.Length, end - at);
+                try
+                {
+                    image.Read(at, chunk.AsSpan(0, n)).ThrowIfFailure();
+                }
+                catch (Exception e)
+                {
+                    if (!scan)
+                    {
+                        Console.WriteLine($"read failed at 0x{at:x}: {e.GetType().Name} {e.Message}");
+                        return 1;
+                    }
+                    for (long b = at; b < at + n; b += Block)
+                    {
+                        int m = (int)Math.Min(Block, at + n - b);
+                        try
+                        {
+                            image.Read(b, chunk.AsSpan(0, m)).ThrowIfFailure();
+                        }
+                        catch (Exception)
+                        {
+                            bad++;
+                            Note(b, b + m);
+                        }
+                    }
+                    continue;
+                }
+                save?.Write(chunk, 0, n);
+            }
+            if (badStart >= 0)
+                Console.WriteLine($"  fails: 0x{badStart:x} to 0x{badEnd:x}");
+            Console.WriteLine(bad == 0 ? "read ok, every hash checked" : $"{bad} blocks of 16 KB failed their hash check");
+            return bad == 0 ? 0 : 1;
+        }
+
+        // The content meta as it's stored, byte for byte, to compare what a game says it is and needs.
+        if (a.Contains("--cnmt"))
+        {
+            foreach (var (name, nca) in ncas.Where(n => n.nca.Header.ContentType == NcaContentType.Meta))
+            {
+                var fs = nca.OpenFileSystem(0, IntegrityCheckLevel.ErrorOnInvalid);
+                var e = fs.EnumerateEntries("/", "*.cnmt").Single();
+                using var file = new UniqueRef<IFile>();
+                fs.OpenFile(ref file.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                file.Get.GetSize(out long size).ThrowIfFailure();
+                var bytes = new byte[size];
+                file.Get.Read(out long _, 0, bytes).ThrowIfFailure();
+                Console.WriteLine($"{e.Name} ({size} bytes):");
+                for (int i = 0; i < bytes.Length; i += 16)
+                    Console.WriteLine($"  {i:x4}: {Convert.ToHexString(bytes, i, Math.Min(16, bytes.Length - i))}");
+            }
+            return 0;
+        }
+
+        // Only what each section is made of, without reading it through.
+        if (a.Contains("--headers"))
+        {
+            foreach (var (name, nca) in ncas)
+            {
+                Console.WriteLine($"{name}: {nca.Header.ContentType} keygen {nca.Header.KeyGeneration}");
+                for (int i = 0; i < 4; i++)
+                {
+                    if (!nca.SectionExists(i))
+                        continue;
+                    try
+                    {
+                        var h = nca.GetFsHeader(i);
+                        Console.WriteLine($"  section {i}: {h.FormatType} {h.EncryptionType} compression={h.ExistsCompressionLayer()} patch={h.IsPatchSection()} sparse={h.ExistsSparseLayer()}");
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine($"  section {i}: {e.GetType().Name} {e.Message}");
+                    }
+                }
+            }
             return 0;
         }
 
@@ -170,7 +298,9 @@ static class Check
         var have = actual.EnumerateEntries("/", "*", SearchOptions.RecurseSubdirectories).Where(e => e.Type == DirectoryEntryType.File).ToDictionary(e => e.FullPath);
         foreach (var missing in want.Keys.Except(have.Keys))
             Fail($"{label}: {missing} is missing from the rebuilt NSP");
-        foreach (var extra in have.Keys.Except(want.Keys))
+        // A game made with its update keeps a map of what the update kept of the original, in its control data, for a newer update, and every
+        // compressed copy says which version made it and what the game came to before.
+        foreach (var extra in have.Keys.Except(want.Keys).Where(k => k is not ("/hacbrewpacklz_update_map.txt" or "/hacbrewpacklz_copy.txt")))
             Fail($"{label}: {extra} is only in the rebuilt NSP");
 
         long bytes = 0;
@@ -314,14 +444,16 @@ static class Check
         using var visitor = new BucketTree.Visitor();
         tree.Find(ref visitor.Ref, 0).ThrowIfFailure();
 
-        long expectedVirtual = 0, previousPhysicalEnd = 0, count = 0, lz4 = 0, raw = 0;
+        // Data is stored in order. Where the same data is held again, an entry points back at what was stored before it instead: the very
+        // same LZ4 block, or bytes stored as they are, which can run on into what's stored next.
+        long expectedVirtual = 0, storedEnd = 0, count = 0, lz4 = 0, raw = 0;
+        var lz4Stored = new Dictionary<long, long>();
+        var rawStored = new List<(long Start, long End)>();
         while (true)
         {
             var e = visitor.Get<RawEntry>();
             if (e.VirtualOffset != expectedVirtual && count == 0)
                 Fail("first entry does not start at 0");
-            if (e.PhysicalOffset < previousPhysicalEnd)
-                Fail($"entry at 0x{e.VirtualOffset:x} overlaps the previous physical range");
             if (e.Type == 0 && e.PhysicalSize != -1)
                 Fail($"raw entry at 0x{e.VirtualOffset:x} doesn't have the retail physical size of -1");
             if (e.Type == 3)
@@ -348,14 +480,40 @@ static class Check
                 visitor.MoveNext().ThrowIfFailure();
                 nextVirtual = visitor.Get<RawEntry>().VirtualOffset;
             }
-            previousPhysicalEnd = e.PhysicalOffset + (e.Type == 0 ? nextVirtual - e.VirtualOffset : e.PhysicalSize);
+            long start = e.PhysicalOffset, end = start + (e.Type == 0 ? nextVirtual - e.VirtualOffset : e.PhysicalSize);
+            if (e.Type == 3)
+            {
+                if (start < storedEnd && !(lz4Stored.TryGetValue(start, out long known) && known == e.PhysicalSize))
+                    Fail($"entry at 0x{e.VirtualOffset:x} overlaps the previous physical range");
+                else if (start >= storedEnd)
+                {
+                    lz4Stored[start] = e.PhysicalSize;
+                    storedEnd = end;
+                }
+            }
+            else if (e.Type == 0)
+            {
+                int at = rawStored.BinarySearch((start, long.MaxValue));
+                at = at < 0 ? ~at - 1 : at;
+                if (start < storedEnd && !(at >= 0 && rawStored[at].Start <= start && Math.Min(end, storedEnd) <= rawStored[at].End))
+                    Fail($"entry at 0x{e.VirtualOffset:x} overlaps the previous physical range");
+                else if (end > storedEnd)
+                {
+                    long fresh = Math.Max(start, storedEnd);
+                    if (rawStored.Count > 0 && rawStored[^1].End == fresh)
+                        rawStored[^1] = (rawStored[^1].Start, end);
+                    else
+                        rawStored.Add((fresh, end));
+                    storedEnd = end;
+                }
+            }
             if (!more)
                 break;
             expectedVirtual = nextVirtual;
         }
         if (count != treeHeader.EntryCount)
             Fail($"visited {count} entries, header says {treeHeader.EntryCount}");
-        if (previousPhysicalEnd > info.TableOffset)
+        if (storedEnd > info.TableOffset)
             Fail("physical data overlaps the table");
 
         // Random lookups walk L1, L2 and entry sets from the top each time.

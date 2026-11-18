@@ -11,21 +11,24 @@ internal sealed class GameFolder
     public required long Bytes { get; init; }
     public byte[]? Icon { get; init; }
 
-    /// <summary>The control folder is "control", as extracting writes it and as the Switch app and other tools expect.
-    /// Builds before v7 wrote "控制"; accept those too so a folder someone already extracted can still be packed.</summary>
-    private static string ControlName(string folder) =>
-        Directory.Exists(System.IO.Path.Combine(folder, "control")) ? "control" :
-        Directory.Exists(System.IO.Path.Combine(folder, "控制")) ? "控制" : "control";
-
     public static bool IsOne(string folder) =>
-        File.Exists(System.IO.Path.Combine(folder, "exefs", "main.npdm")) &&
-        File.Exists(System.IO.Path.Combine(folder, ControlName(folder), "control.nacp"));
+        File.Exists(System.IO.Path.Combine(folder, "exefs", "main.npdm")) && File.Exists(System.IO.Path.Combine(folder, "control", "control.nacp")) &&
+        !File.Exists(System.IO.Path.Combine(folder, NotFinished));
+
+    /// <summary>
+    /// What extracting puts in a game's folder first and takes away once all of it is out, the same on every version. While it's there, the
+    /// folder's only part of a game, even with the exefs and control folders out already, which make it look like one: it's never listed, and
+    /// extracting the game again clears it away first. A power cut or a crash part of the way through leaves it there.
+    /// </summary>
+    public const string NotFinished = "Not finished extracting.txt";
+
+    public const string NotFinishedText = "hacBrewPackLZ was extracting a game into this folder and didn't finish. It isn't listed as a game. Extracting the game again starts afresh, or delete this folder.";
 
     public static GameFolder Open(string folder)
     {
         folder = System.IO.Path.GetFullPath(folder);
         Npdm.Load(System.IO.Path.Combine(folder, "exefs", "main.npdm"), 0, null, out ulong titleId);
-        string control = System.IO.Path.Combine(folder, ControlName(folder));
+        string control = System.IO.Path.Combine(folder, "control");
         var nacp = File.ReadAllBytes(System.IO.Path.Combine(control, "control.nacp"));
         if (nacp.Length < Nacp.Size)
             throw new ToolException($"'{System.IO.Path.Combine(control, "control.nacp")}' is too small to be a NACP");
@@ -42,15 +45,14 @@ internal sealed class GameFolder
                 version = found;
         }
 
-        var everywhere = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 };
-        long bytes = Parts(folder).Sum(part => new DirectoryInfo(part).EnumerateFiles("*", everywhere).Sum(f => f.Length));
+        // Counted as building it goes through it, links to folders and all, a link back to a folder it's in said as building it says it.
+        long bytes = Parts(folder).Sum(RomFsBuilder.FolderBytes);
         return new GameFolder { Path = folder, Name = name, TitleId = titleId, Version = version, Bytes = bytes, Icon = IconIn(control) };
     }
 
     /// <summary>The folders that go into the NSP.</summary>
     private static IEnumerable<string> Parts(string folder) =>
-        new[] { "exefs", "romfs", "logo", ControlName(folder), "htmldoc", "legalinfo" }
-            .Select(p => System.IO.Path.Combine(folder, p)).Where(Directory.Exists);
+        new[] { "exefs", "romfs", "logo", "control", "htmldoc", "legalinfo" }.Select(p => System.IO.Path.Combine(folder, p)).Where(Directory.Exists);
 
     /// <summary>The icon in a control folder, or what the control NCA's RomFS holds: the English one if there is one, which most games have.</summary>
     public static byte[]? IconIn(string control)
@@ -75,7 +77,7 @@ internal sealed class GameFolder
         chosen.ExefsDir = Part("exefs");
         chosen.RomfsDir = Part("romfs");
         chosen.LogoDir = Part("logo");
-        chosen.ControlDir = Part(ControlName(Path));
+        chosen.ControlDir = Part("control");
         chosen.HtmlDocDir = Optional("htmldoc");
         chosen.LegalInfoDir = Optional("legalinfo");
         chosen.NoRomfs = !Directory.Exists(chosen.RomfsDir);
@@ -86,18 +88,21 @@ internal sealed class GameFolder
         chosen.NoPatchNacpLogo = false;
         chosen.TitleVersion = Version;
         string directory = chosen.NspDirSet ? chosen.NspDir : System.IO.Path.GetDirectoryName(Path)!;
-        chosen.OutputPath = System.IO.Path.Combine(directory, $"{LocalNames.ForOutputName(Name)} [{TitleId:X16}][v{Version}]{(chosen.Compress ? "[LZ4]" : "")}.nsp");
+        // Beside the folder, where the game it was extracted from may well be, under this very name.
+        chosen.OutputPath = LocalNames.FreePath(System.IO.Path.Combine(directory, $"{LocalNames.ForOutputName(Name)} [{TitleId:X16}][v{Version}]{(chosen.Compress ? "[LZ4]" : "")}.nsp"));
         return chosen;
     }
 
     /// <summary>Game folders in a folder and the folders in it, though not inside a game folder, which can hold anything.</summary>
-    public static List<string> FindIn(string root)
+    public static List<string> FindIn(string root, CancellationToken token = default)
     {
         var found = new List<string>();
         var pending = new Stack<string>();
         pending.Push(root);
         while (pending.Count > 0)
         {
+            // A whole drive can take a while, and being asked to stop shouldn't have to wait for the end of it.
+            token.ThrowIfCancellationRequested();
             string folder = pending.Pop();
             if (IsOne(folder))
             {
@@ -108,8 +113,9 @@ internal sealed class GameFolder
             {
                 foreach (var child in new DirectoryInfo(folder).EnumerateDirectories())
                 {
-                    // A link back up would go round forever.
-                    if (!child.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    // A link back up would go round forever. What's been saved from inside games is a few of their parts, never a game, and
+                    // could pass for one or end up mixed into an extraction of one.
+                    if (!child.Attributes.HasFlag(FileAttributes.ReparsePoint) && !string.Equals(child.Name, GameInside.FilesFromGames, StringComparison.OrdinalIgnoreCase))
                         pending.Push(child.FullName);
                 }
             }

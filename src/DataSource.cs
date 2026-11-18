@@ -2,7 +2,37 @@ using Microsoft.Win32.SafeHandles;
 
 namespace HacBrewPackLz;
 
-internal sealed class ToolException(string message) : Exception(message);
+internal class ToolException(string message) : Exception(message);
+
+/// <summary>
+/// What was read isn't what it should be: it doesn't match its hashes, a compressed block in it doesn't decode, or an update reading it needs
+/// a part of the original game that isn't there. Read through a compressed copy, that's an update that doesn't fit the copy, rather than a
+/// file that can't be read.
+/// </summary>
+internal sealed class MismatchException(string message) : ToolException(message);
+
+/// <summary>Where a damaged file's numbers can't be trusted.</summary>
+internal static class Ranges
+{
+    /// <summary>Whether size bytes from offset lie within length, without the sum overflowing, as it can with what a damaged file says.</summary>
+    public static bool Fits(long offset, long size, long length) => offset >= 0 && size >= 0 && offset <= length && size <= length - offset;
+
+    /// <summary>The most a table of names or entries is read whole for. Real ones are a few KB; a damaged one could ask for gigabytes.</summary>
+    public const long MostTable = 16 << 20;
+}
+
+/// <summary>What went wrong with one game, whatever it was, as against having been asked to stop.</summary>
+internal static class Failures
+{
+    public static bool IsStop(Exception e) =>
+        e is OperationCanceledException || e is AggregateException all && all.Flatten().InnerExceptions.All(i => i is OperationCanceledException);
+
+    /// <summary>The usual failures say what they are. Anything else is a fault in this program, and says so.</summary>
+    public static string Describe(Exception e) => Help.WithNextStep(
+        e is ToolException or IOException or UnauthorizedAccessException or System.Security.Cryptography.CryptographicException or AggregateException
+            ? e.Message
+            : $"Something unexpected went wrong ({e.GetType().Name}): {e.Message}");
+}
 
 /// <summary>
 /// Read-only random access bytes. Everything that ends up in an NCA is described as a chain of these, so

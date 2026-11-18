@@ -25,7 +25,8 @@ internal static class LocalNames
     /// <summary>Makes one name usable as a file name here. Returns the same string when it needs no change.</summary>
     public static string ForFileSystem(string name)
     {
-        if (!OperatingSystem.IsWindows())
+        // Android's shared storage and memory cards take no more than Windows does.
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsAndroid())
             return name;
 
         var clean = new StringBuilder(name.Length);
@@ -46,6 +47,37 @@ internal static class LocalNames
         foreach (char c in text)
             clean.Append(c < 32 || c is '<' or '>' or ':' or '"' or '|' or '?' or '*' or '/' or '\\' ? '_' : c);
         return clean.ToString().Trim().TrimEnd('.');
+    }
+
+    /// <summary>
+    /// Where a file this saves goes: the path given if nothing's there, or else the same name with " (2)", " (3)" and on before its
+    /// extension. What's there already is somebody's, and may well be what's being read, such as an original game named the way this
+    /// names what it makes. Only a path given exactly (-o) is written over.
+    /// </summary>
+    public static string FreePath(string path)
+    {
+        string folder = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        string stem = Path.GetFileNameWithoutExtension(path), extension = Path.GetExtension(path);
+        for (int copy = 1; copy <= MostCopies; copy++)
+        {
+            string candidate = copy == 1 ? path : Path.Combine(folder, $"{stem} ({copy}){extension}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate))
+                return candidate;
+        }
+        throw new ToolException($"'{folder}' has {MostCopies} files called '{stem}' already, with a number after it. Delete some, or choose another NSP folder");
+    }
+
+    private const int MostCopies = 999;
+
+    /// <summary>
+    /// The name a file was saved under, as <see cref="FreePath"/> may have made it: without a " (…)" just before its extension, as in
+    /// "Game [LZ4] (2).nsp". Versions before 1.5 put " (converted)" there.
+    /// </summary>
+    public static string WithoutCopyNumber(string fileName)
+    {
+        string extension = Path.GetExtension(fileName), stem = Path.GetFileNameWithoutExtension(fileName);
+        int open = stem.LastIndexOf(" (", StringComparison.Ordinal);
+        return open > 0 && stem.EndsWith(')') ? stem[..open] + extension : fileName;
     }
 
     public static string Combine(string root, string relative)

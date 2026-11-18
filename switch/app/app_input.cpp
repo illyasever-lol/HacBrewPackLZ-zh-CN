@@ -11,7 +11,19 @@ using namespace app;
 
 void App::update(const InputState& input, double dt) {
     _time += dt;
+    _aliveAt = sys::now();
     u32 pressed = input.held & ~_lastHeld;
+    if (pressed || input.touching)
+        _lastPressAt = _time;
+
+    // A compressed game that stopped with an error since last time is asked about once the installed games are known.
+    if (!_askedAboutGames && _scanned[TabInstalled] && _screen == Screen::Main && !_dialog && !_menu && _time >= _nextStoppedCheck) {
+        _nextStoppedCheck = _time + 1;
+        askAboutStoppedGames();
+    }
+
+    if (_sayStoppedLooking.exchange(false))
+        showToast("已停止查找。在 + 菜单中刷新列表可重新查找");
 
     if (_resultsReady.exchange(false)) {
         _screen = Screen::Results;
@@ -27,7 +39,7 @@ void App::update(const InputState& input, double dt) {
             sys::Lock lock(_mutex);
             why = _unexpected;
         }
-        showMessage("操作未成功", (why.empty() ? std::string("发生了意外错误。") : why + ".") + (!_logProblem.empty() ? "且日志无法写入：" + _logProblem : _log ? "更多内容见" + _logPath : std::string()));
+        showMessage("操作未成功", (why.empty() ? std::string("发生了意外错误。") : why + ".") + (!_logProblem.empty() ? " 且日志无法写入： " + _logProblem : _log ? " 更多内容见 " + _logPath : std::string()));
     }
 
     catchUpWithDrives();
@@ -39,6 +51,15 @@ void App::update(const InputState& input, double dt) {
         _dirty = true;
     }
     showWhatsWaiting();
+
+    // What analysis has found since puts the lists in their new order once nobody has pressed anything for a moment, so nothing moves under the
+    // pointer, which stays on the game it was on. Measuring every game takes hours, and the order would otherwise wait for all of it.
+    if (_resortWanted && _time - _lastPressAt >= 2 && !_dialog && !_menu) {
+        _resortWanted = false;
+        sys::Lock lock(_mutex);
+        sortRowsLocked();
+        _dirty = true;
+    }
 
     // Set from here, so that it all happens on one thread.
     JobKind kind = _jobKind;
@@ -60,8 +81,8 @@ void App::update(const InputState& input, double dt) {
                 updateMain(pressed, input, dt);
                 break;
             case Screen::Job:
-                // Half a game removed is of no use to anyone, and it doesn't take long.
-                if ((pressed & ButtonB) && !stopAsked() && _jobKind != JobKind::Removing)
+                // Half a game removed is of no use to anyone, and it doesn't take long. Fixing takes a moment a game.
+                if ((pressed & ButtonB) && !stopAsked() && _jobKind != JobKind::Removing && _jobKind != JobKind::Fixing)
                     askToStop();
                 break;
             case Screen::Results:
@@ -76,14 +97,47 @@ void App::update(const InputState& input, double dt) {
             case Screen::Browse:
                 updateBrowse(pressed, input, dt);
                 break;
+            case Screen::Details:
+                updateDetails(pressed, input, dt);
+                break;
+            case Screen::Inside:
+                updateInside(pressed, input, dt);
+                break;
             case Screen::Welcome:
                 updateWelcome(pressed, input, dt);
+                break;
+            case Screen::Settings:
+                updateSettings(pressed, input, dt);
                 break;
         }
     }
 
     if (!_savedTicks.empty() && _screen == Screen::Main && !_dialog && !_menu && !_afterWork && !busy())
         restoreTicks();
+    // What came on the screen since, to move it in.
+    if (_screen != _screenSeen) {
+        _screenSeen = _screen;
+        _screenSince = _time;
+        _dirty = true;
+    }
+    if (_menu.get() != _menuSeen) {
+        if (_menu && !_menuSeen)
+            _menuSince = _time;
+        _menuSeen = _menu.get();
+    }
+    if (_dialog.get() != _dialogSeen) {
+        if (_dialog && !_dialogSeen)
+            _dialogSince = _time;
+        _dialogSeen = _dialog.get();
+    }
+    {
+        // A message can come from Look inside's reader, which sets it with the lock held.
+        sys::Lock lock(_mutex);
+        if (_toast != _toastSeen) {
+            _toastSeen = _toast;
+            _toastSince = _time;
+        }
+    }
     startWhatsDue();
     animate(dt);
     _lastHeld = input.held;
@@ -93,7 +147,8 @@ void App::update(const InputState& input, double dt) {
 void App::showWhatsWaiting() {
     if (_dialog || _menu)
         return;
-    if (_screen == Screen::Main) {
+    // The settings say so too, as a setting that couldn't be saved and checking for updates are both done there.
+    if (_screen == Screen::Main || _screen == Screen::Settings) {
         std::string problem;
         {
             sys::Lock lock(_logMutex);
@@ -101,7 +156,7 @@ void App::showWhatsWaiting() {
             _saveProblemShown = _saveProblemShown || !problem.empty();
         }
         if (!problem.empty()) {
-            showMessage("保存失败", problem);
+            showMessage("无法保存", problem);
             return;
         }
 
@@ -122,7 +177,7 @@ void App::showWhatsWaiting() {
                     else
                         showMessage("无法从此处重启", "请关闭并重新打开以使用新版本。");
                 }});
-                _dialog->choices.push_back({"稍后", nullptr});
+                _dialog->choices.push_back({"Later", nullptr});
                 _dialog->cancelChoice = 1;
             }
             return;
@@ -137,14 +192,22 @@ void App::showWhatsWaiting() {
         _notes.clear();
     }
     if (!notes.empty()) {
-        showMessage("上次运行时", notes);
+        showMessage("上次", notes);
         return;
+    }
+
+    // Asked once, when it first matters: whether to delete files kept once they're installed.
+    if (_screen == Screen::Results) {
+        offerToDeleteInstalled();
+        if (_dialog)
+            return;
     }
 
     // Once each time it's opened as an applet, as that's what has it short of memory, and the way round it isn't anything anyone would guess.
     if (_memoryLimited && !_appletSaid && _screen == Screen::Main) {
         _appletSaid = true;
-        showMessage("以小程序模式启动", format("从相册打开时，本程序只能使用 %s 内存，大型游戏可能无法处理，压缩也会更慢，因为每份新副本都要从存储卡读回。想使用全部内存，请在启动任意游戏时按住 R 键：此时会打开自制程序菜单，从这里启动本程序可获得约 3 GB 内存。",
+        showMessage("从相册启动", format("从相册启动时，本程序只能使用 %s 内存，大型游戏可能无法处理。"
+                                                  "启动任意游戏时按住 R 可打开自制程序菜单，从那里启动本程序可获得约 3 GB 内存。",
                                                   formatSize(sys::workMemory()).c_str()));
     }
 }
@@ -153,7 +216,7 @@ void App::showWhatsWaiting() {
 void App::catchUpWithDrives() {
     _drivesChanged = _platform.drivesChanged() || _drivesChanged;
     JobKind running = _jobKind;
-    bool jobRunning = running == JobKind::Compressing || running == JobKind::Extracting || running == JobKind::Checking || running == JobKind::Removing;
+    bool jobRunning = running == JobKind::Compressing || running == JobKind::Extracting || running == JobKind::Checking || running == JobKind::Removing || running == JobKind::Fixing;
     if (!_drivesChanged || jobRunning)
         return;
     _drivesChanged = false;
@@ -169,14 +232,13 @@ void App::catchUpWithDrives() {
         }
     }
     if (_drives.size() != before)
-        showToast(_drives.size() > before ? "检测到 USB 可移动设备" : "USB 可移动设备已拔出");
+        showToast(_drives.size() > before ? "已检测到 USB 盘" : "USB 盘已拔出");
     if (_browser && _browser->path.empty())
         browseTo("");
 }
 
 /// So can a PC sharing its games: it's heard from a second or so after this opens, which is after the list has first been looked
-/// through, and its sending service can stop or start at any time with the cable left in. The cable watcher probes it every few
-/// seconds, so one fresh look is enough to clear or bring back its games without unplugging anything.
+/// through, and it can be closed or plugged in at any time.
 void App::catchUpWithPcs() {
     bool fromPcs = (_settings.fromPcNetwork || _settings.fromPcCable) && _settings.filesFolder.empty();
     // While choosing a folder, the PCs are among what there is to choose from.
@@ -186,7 +248,7 @@ void App::catchUpWithPcs() {
         _pcsChanged = remote::peersChanged() || _pcsChanged;
     }
     JobKind running = _jobKind;
-    bool jobRunning = running == JobKind::Compressing || running == JobKind::Extracting || running == JobKind::Checking || running == JobKind::Removing;
+    bool jobRunning = running == JobKind::Compressing || running == JobKind::Extracting || running == JobKind::Checking || running == JobKind::Removing || running == JobKind::Fixing;
     if (!_pcsChanged || jobRunning)
         return;
     _pcsChanged = false;
@@ -198,15 +260,10 @@ void App::catchUpWithPcs() {
         sys::Lock lock(_pcsMutex);
         before = _pcsLookedIn;
     }
-    // A service can stop and start again with the cable still plugged in, and the files it shares
-    // can change while its folder name (pc:USB/) stays the same. Any change the watcher reports
-    // therefore gets one fresh look through the list, not just a change of folder names.
-    if (fromPcs) {
+    if (fromPcs && now != before) {
         quietenWorker();
         forgetFileScan();
-        showToast(now.size() > before.size() ? "发现正在共享游戏的 PC"
-                  : now.size() < before.size() ? "一台 PC 已停止共享游戏"
-                  : "PC 共享内容已更新，正在刷新列表");
+        showToast(now.size() >= before.size() ? "发现正在共享游戏的 PC" : "一台 PC 已停止共享游戏");
     }
 }
 
@@ -237,14 +294,22 @@ bool App::repeated(u32 held, u32 button, double dt) {
 }
 
 void App::updateMain(u32 pressed, const InputState& input, double dt) {
+    constexpr int Positions = TabCount + 1;
     if (pressed & ButtonL)
-        setTab((_tab + TabCount - 1) % TabCount);
+        goToPosition((position() + Positions - 1) % Positions);
     if (pressed & ButtonR)
-        setTab((_tab + 1) % TabCount);
-    if (pressed & ButtonB)
-        pressQuit();
-    if (_tab == TabSettings) {
-        updateOptions(pressed, input, dt);
+        goToPosition((position() + 1) % Positions);
+    if (pressed & ButtonB) {
+        // While this list is being looked through, B stops that rather than the app.
+        if (!_overview && lookingThroughThisList())
+            stopLooking();
+        else
+            pressQuit();
+    }
+    if (pressed & ButtonPlus)
+        openMenu();
+    if (_overview) {
+        updateOverview(pressed, input, dt);
         return;
     }
 
@@ -281,11 +346,48 @@ void App::updateMain(u32 pressed, const InputState& input, double dt) {
         cycleTicks();
     if (pressed & ButtonX)
         pressCompress();
-    if (pressed & ButtonPlus)
-        openMenu();
+    // Left and right go through the views. On the way to up or down, as a stick often is going down a long list, they don't.
+    if (!(input.held & (ButtonUp | ButtonDown))) {
+        if (pressed & ButtonLeft)
+            stepView(-1);
+        else if (pressed & ButtonRight)
+            stepView(1);
+    }
 }
 
-/// Left and right change a setting, and A changes it too, or does what it's for.
+void App::updateOverview(u32 pressed, const InputState& input, double dt) {
+    int move = (repeated(input.held, ButtonUp, dt) ? -1 : 0) + (repeated(input.held, ButtonDown, dt) ? 1 : 0);
+    // On the way up or down, as a stick often is, left and right do nothing, as on the lists.
+    int across = (input.held & (ButtonUp | ButtonDown)) ? 0 : (pressed & ButtonLeft) ? -1 : (pressed & ButtonRight) ? 1 : 0;
+    if (move == 0 && across == 0 && !(pressed & (ButtonA | ButtonX)))
+        return;
+    Overview overview;
+    {
+        sys::Lock lock(_mutex);
+        overview = overviewLocked();
+    }
+    OverviewLayout layout = overviewLayout(overview);
+    if (layout.stops.empty())
+        return;
+    int focus = nextOverviewStop(layout, overviewStopIndex(overview, layout), move, across);
+    const OverviewStop& stop = layout.stops[(size_t)focus];
+    const OverviewLine& line = overview.cards[stop.tab].lines[(size_t)stop.line];
+    if (stop.tab != _overviewAt.tab || stop.kind != _overviewAt.stop || line.kind != _overviewAt.kind || stop.key != _overviewAt.game) {
+        pointOverviewAt(stop, line);
+        _dirty = true;
+    }
+    if (pressed & ButtonA) {
+        pressOverviewStop(stop, line);
+    } else if (pressed & ButtonX) {
+        // X does the card's button, wherever on the card the pointer is, as the button shows.
+        const OverviewCard& card = overview.cards[stop.tab];
+        int primary = primaryLine(card);
+        if (primary >= 0)
+            actOnOverviewLine(card.lines[(size_t)primary]);
+    }
+}
+
+// Left and right change a setting, and A changes it too, or does what it's for.
 void App::updateOptionItem(OptionItem& item, u32 pressed, const InputState& input, double dt) {
     bool left = item.repeats ? repeated(input.held, ButtonLeft, dt) : (pressed & ButtonLeft) != 0;
     bool right = item.repeats ? repeated(input.held, ButtonRight, dt) : (pressed & ButtonRight) != 0;
@@ -317,7 +419,7 @@ void App::updateOptions(u32 pressed, const InputState& input, double dt) {
                 found = i;
         }
         for (int i = 0; i < (int)_options.size() && found < 0; i++) {
-            if (_options[(size_t)i].label == "更多设置" || _options[(size_t)i].label == "收起设置")
+            if (_options[(size_t)i].label == "更多设置" || _options[(size_t)i].label == "收起高级设置")
                 found = i;
         }
         if (found >= 0)
@@ -329,6 +431,14 @@ void App::updateOptions(u32 pressed, const InputState& input, double dt) {
         _dirty = true;
     }
     updateOptionItem(_options[(size_t)_optionFocus], pressed, input, dt);
+}
+
+void App::updateSettings(u32 pressed, const InputState& input, double dt) {
+    if (pressed & ButtonB) {
+        closeSettings();
+        return;
+    }
+    updateOptions(pressed, input, dt);
 }
 
 void App::updateWelcome(u32 pressed, const InputState& input, double dt) {
@@ -381,7 +491,7 @@ void App::updateResults(u32 pressed, const InputState& input, double dt) {
         sys::Lock lock(_mutex);
         count = (int)_results.size();
     }
-    int most = std::max(count - VisibleRows, 0);
+    int most = std::max(count - _resultsShown, 0);
     if (repeated(input.held, ButtonUp, dt) && _resultTop > 0) {
         _resultTop--;
         _dirty = true;
@@ -390,10 +500,12 @@ void App::updateResults(u32 pressed, const InputState& input, double dt) {
         _resultTop++;
         _dirty = true;
     }
-    if (pressed & (ButtonA | ButtonB)) {
+    if (pressed & ButtonB) {
         _screen = Screen::Main;
         _dirty = true;
     }
+    if (pressed & ButtonPlus)
+        openMenu(MenuResults);
 }
 
 void App::updateDialog(u32 pressed) {
@@ -442,8 +554,8 @@ void App::updateMenu(u32 pressed, const InputState& input, double dt) {
         _dirty = true;
         if (action)
             action();
-    } else if (pressed & ButtonB && menu.page != MenuMain) {
-        openMenu();
+    } else if (pressed & ButtonB && menu.page != menu.root) {
+        openMenu(menu.root);
     } else if (pressed & (ButtonB | ButtonPlus)) {
         _menu.reset();
         _dirty = true;
@@ -466,10 +578,10 @@ void App::handleTouch(const InputState& input) {
         if (_touchDragged && _screen == Screen::Browse && _browser && !_dialog) {
             _browser->scroll = std::max(0.0, _browser->scroll - (input.touchY - _touchLastY));
             _dirty = true;
-        } else if (_touchDragged && _screen == Screen::Main && _tab == TabSettings && !_dialog) {
+        } else if (_touchDragged && _screen == Screen::Settings && !_dialog) {
             _optionScroll = std::max(0.0, _optionScroll - (input.touchY - _touchLastY));
             _dirty = true;
-        } else if (_touchDragged && _screen == Screen::Main && !_dialog && !_menu) {
+        } else if (_touchDragged && _screen == Screen::Main && !_overview && !_dialog && !_menu) {
             int count;
             {
                 sys::Lock lock(_mutex);
@@ -536,7 +648,7 @@ void App::animate(double dt) {
             value = target;
         _dirty = true;
     };
-    approach(_tabShown, _tab, 0.004);
+    approach(_tabShown, position(), 0.004);
     approach(_focusShown, _focus[_tab], 0.004);
     approach(_scrollShown, _scroll[_tab], 0.5);
 }
@@ -545,6 +657,10 @@ bool App::needsDrawing() {
     // A spinner wants to keep turning, while a job wants the processor for itself.
     double now = sys::now();
     bool busy = this->busy();
+    if (!busy && _inside) {
+        sys::Lock lock(_mutex);
+        busy = insideLoadingLocked();
+    }
     double interval = _screen == Screen::Job || _analystRunning ? 0.25 : 0.1;
     if (_dirty.exchange(false) || (busy && now - _lastWorkDraw >= interval)) {
         _lastWorkDraw = now;
@@ -557,11 +673,13 @@ bool App::needsDrawing() {
 // For the tests
 
 App::Snapshot App::snapshot() {
-    static const char* const screens[] = {"Main", "Job", "Results", "NoKeys", "Browse", "Welcome"};
+    static const char* const screens[] = {"主界面", "任务", "结果", "NoKeys", "浏览", "欢迎", "选项", "详细信息", "Inside"};
     Snapshot s;
-    s.screen = _screen == Screen::Main && _tab == TabSettings ? "Options" : screens[(int)_screen];
-    s.tab = _tab;
+    s.screen = screens[(int)_screen];
+    s.tab = _overview ? -1 : _tab;
     s.analyzing = _analystRunning;
+    s.measuring = _analystRunning && _analystMeasuring;
+    s.thorough = _settings.thorough && _settings.compress;
     s.scanning = _jobKind == JobKind::Scanning || _jobKind == JobKind::Starting;
     s.dialog = _dialog ? _dialog->title : "";
     if (_dialog) {
@@ -569,7 +687,7 @@ App::Snapshot App::snapshot() {
             s.dialogText += paragraph + "\n";
     }
     s.toast = _toast;
-    s.actionWord = verb();
+    s.actionWord = actionWord();
     if (_browser) {
         s.browsing = _browser->path;
         for (auto& entry : _browser->entries)
@@ -578,6 +696,12 @@ App::Snapshot App::snapshot() {
     for (auto& item : _welcome)
         s.welcome.push_back(item.label + ": " + item.value());
     s.welcomeFocus = _welcomeFocus;
+    // What was cut short on the last frame drawn, and games drawn with their letters though they have an icon.
+    s.cut = _cut;
+    s.fitCut = _fitCut;
+    s.crowded = _crowded;
+    s.headings = _headings;
+    s.lettersForIcons = _lettersForIcons;
     for (auto& item : _options)
         s.options.push_back(item.label + ": " + item.value());
     s.optionFocus = _optionFocus;
@@ -587,13 +711,56 @@ App::Snapshot App::snapshot() {
         s.menuFocus = _menu->focus;
     }
     sys::Lock lock(_mutex);
+    if (_analystRunning) {
+        AnalysisShown a = analysisShownLocked();
+        s.analysisLine = format("%s%s, %d of %d", a.measuring ? "测量中 " : "正在分析 ", a.title.c_str(), a.index, a.count);
+    }
     s.updateState = _updateState;
+    if (_inside) {
+        const Inside& in = *_inside;
+        s.insideReady = in.ready;
+        s.insideProblem = in.problem;
+        s.detailsState = in.stateLabel + ": " + in.stateBig;
+        for (auto& section : in.sections) {
+            for (auto& line : section.lines)
+                s.details.push_back(section.title + ": " + line.label + ": " + line.value + (line.note.empty() ? "" : " (" + line.note + ")"));
+        }
+        s.detailsNotes = in.notes;
+        if (in.ready && !in.nodes.empty()) {
+            for (int i = in.folder; i > 0; i = in.nodes[(size_t)i].parent)
+                s.insidePath = in.nodes[(size_t)i].name + (s.insidePath.empty() ? "" : "/" + s.insidePath);
+            if (in.foundFrom >= 0)
+                s.insidePath = "found: " + in.finding;
+            for (int index : insideShownLocked()) {
+                const InsideNode& node = in.nodes[(size_t)index];
+                s.insideEntries.push_back(node.name + " | " + (node.folder ? std::string("Folder") : node.kind) + " | " + formatSize(node.size));
+            }
+        }
+        s.insideFocus = in.focus;
+        // Ready for what's under the pointer, rather than what was before it.
+        if (in.ready && !in.nodes.empty()) {
+            const std::vector<int>& shown = insideShownLocked();
+            s.insidePreviewReady = in.previewReady && !shown.empty() && in.previewOf == shown[(size_t)std::min(in.focus, (int)shown.size() - 1)];
+        }
+        s.previewKind = in.previewKind;
+        s.previewChips = in.chips;
+        for (size_t i = 0; i < in.lines.size() && i < 8; i++)
+            s.previewLines.push_back(in.lines[i]);
+        if (in.picture) {
+            s.pictureW = in.picture->w;
+            s.pictureH = in.picture->h;
+        }
+        s.insideFull = in.full;
+        s.insideSaving = in.saving;
+        s.insideSavedTo = in.savedTo;
+    }
     s.sortedBy = sortDescription();
     s.tickHint = tickActionLabel(nextTickActionLocked());
     s.label = _jobLabel;
     s.overall = overallLocked(nullptr);
     s.resultsTitle = _resultsTitle;
     s.resultsDetail = _resultsDetail;
+    s.resultsAdvice = _resultsAdvice;
     for (auto& result : _results)
         s.results.push_back(result.name + ": " + result.outcome + (result.message.empty() ? "" : " (" + result.message + ")"));
     for (auto* row : visibleRowsLocked(_tab)) {
@@ -605,9 +772,91 @@ App::Snapshot App::snapshot() {
         view.note = !row->blocked.empty() ? row->blocked : !row->message.empty() ? row->message : row->belowMinimum;
         view.detail = row->detail;
         view.notes = (int)row->notes.size();
+        view.now = row->now;
+        view.after = row->hasEstimate ? row->estimate.outputBytes : 0;
+        ShownRow inView = shownInViewLocked(*row);
+        view.second = inView.second;
+        view.saved = inView.saved;
         s.rows.push_back(view);
     }
+    static const char* const states[] = {"Ready", "Working", "已完成", "失败"};
+    for (int tab = 0; tab < TabCount; tab++) {
+        s.actionWords[tab] = actionWordOn(tab);
+        s.scanned[tab] = _scanned[tab];
+        for (auto& row : _rows) {
+            if (row.tab != tab)
+                continue;
+            FullRow full;
+            full.tab = tab;
+            full.key = row.key;
+            full.name = row.name;
+            full.visible = !leftOffListLocked(row);
+            full.inToDo = inViewLocked(row, View::ToDo);
+            full.inDone = inViewLocked(row, View::Done);
+            full.ticked = row.ticked;
+            full.byHand = row.byHand;
+            full.blocked = !row.blocked.empty();
+            full.state = states[(int)row.state];
+            ShownRow shown = shownLocked(row);
+            full.second = shown.second;
+            full.now = shown.now;
+            full.after = shown.after;
+            full.saved = shown.saved;
+            full.share = shown.share;
+            full.status = shown.status;
+            full.hasEstimate = row.hasEstimate;
+            full.alreadyCompressed = row.hasEstimate && row.estimate.alreadyCompressed;
+            full.nowBytes = row.now;
+            full.afterBytes = row.hasEstimate ? row.estimate.outputBytes : 0;
+            full.marginBytes = row.hasEstimate ? row.estimate.marginBytes : 0;
+            full.savedBytes = row.sureSaved();
+            full.notSure = row.notSure;
+            full.unmeasured = unmeasuredLocked(row);
+            full.measured = row.hasEstimate && row.estimate.measured;
+            full.olderCopy = row.hasEstimate && row.estimate.olderCopy;
+            full.freedBytes = row.hasEstimate ? row.estimate.freedBytes : 0;
+            full.mainFile = row.mainFile;
+            full.updateFile = row.updateFile;
+            full.extracted = row.extracted;
+            full.dlcFiles = row.dlcFiles;
+            full.overInstalled = row.overInstalled;
+            full.hasUpdate = row.hasUpdate;
+            s.all.push_back(full);
+        }
+    }
     s.compressedHidden = doneHiddenLocked(_tab < TabCount ? _tab : TabInstalled);
+    for (int tab = 0; tab < TabCount; tab++)
+        s.views[tab] = viewName(_view[tab]);
+    s.overview = _overview;
+    static const char* const kinds[] = {"Looking", "ToDo", "ToInstall", "已完成", "Nothing", "NotSure", "WontStart", "Developer"};
+    const Overview& overview = overviewLocked();
+    s.headline = overview.headline;
+    for (auto& card : overview.cards) {
+        for (auto& line : card.lines)
+            s.overviewLines.push_back({line.tab, kinds[(int)line.kind], line.text, line.sub, line.saved, line.kind == OverviewLine::ToDo ? (int)card.biggest.size() : 0,
+                                       line.count, line.notSure});
+    }
+    for (auto& meter : overview.meters)
+        s.meters.push_back({meter.label, meter.free, meter.frees});
+    OverviewLayout layout = overviewLayout(overview);
+    int firstLine[TabCount] = {0, (int)overview.cards[0].lines.size()};
+    for (auto& stop : layout.stops) {
+        Snapshot::Stop seen;
+        seen.tab = stop.tab;
+        seen.line = firstLine[stop.tab] + stop.line;
+        seen.game = stop.game >= 0 ? overview.cards[stop.tab].biggest[(size_t)stop.game].name : "";
+        seen.x = stop.rect.x;
+        seen.y = stop.rect.y;
+        seen.w = stop.rect.w;
+        seen.h = stop.rect.h;
+        static const char* const stopKinds[] = {"Line", "Game", "Act", "选择", "Sources"};
+        seen.kind = stopKinds[(int)stop.kind];
+        const OverviewLine& line = overview.cards[stop.tab].lines[(size_t)stop.line];
+        seen.label = stop.kind == OverviewStop::Act ? actLabel(line) : stop.kind == OverviewStop::Choose ? "选择游戏" : stop.kind == OverviewStop::Sources ? "搜索位置" : "";
+        s.overviewStops.push_back(seen);
+    }
+    s.overviewFocus = layout.stops.empty() ? 0 : overviewStopIndex(overview, layout);
+    s.focus = _overview ? -1 : _focus[_tab];
     return s;
 }
 

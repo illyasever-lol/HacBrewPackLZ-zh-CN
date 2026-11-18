@@ -33,9 +33,9 @@ internal static class Npdm
 
         titleId = titleIdOverride != 0 ? titleIdOverride : BinaryPrimitives.ReadUInt64LittleEndian(npdm.AsSpan(aci0 + 0x10));
         if (titleId < MinTitleId || titleId > MaxTitleId)
-            throw new ToolException($"Invalid title id {titleId:x16}, the valid range is {MinTitleId:x16} - {MaxTitleId:x16}");
+            throw new ToolException($"标题 ID {titleId:x16} 无效，有效范围 {MinTitleId:x16} - {MaxTitleId:x16}");
         if (titleId > 0x01FFFFFFFFFFFFFF)
-            Ui.Warn($"Title id {titleId:x16} is outside the usual application range");
+            Ui.Warn($"标题 ID {titleId:x16} 超出常规应用范围");
 
         if (titleIdOverride != 0)
             BinaryPrimitives.WriteUInt64LittleEndian(npdm.AsSpan(aci0 + 0x10), titleIdOverride);
@@ -269,6 +269,9 @@ internal sealed class ContentMeta
         BinaryPrimitives.WriteUInt32LittleEndian(c[8..], version);
         BinaryPrimitives.WriteUInt16LittleEndian(c[0x10..], (ushort)records.Count);
         BinaryPrimitives.WriteUInt16LittleEndian(c[0x12..], 0);
+        // A base game cut down to go with its update is marked as needing it. What's made here always has all of the game, so the mark
+        // goes: one that kept it had DBI warn that it needed its update, and didn't start.
+        c[0x14] &= unchecked((byte)~Cnmt.AttributeCompacted);
         if (requiredSystemVersion is { } required && Type is Cnmt.MetaApplication or Cnmt.MetaPatch && ExtendedHeaderSize >= 0xC)
             BinaryPrimitives.WriteUInt32LittleEndian(c[(HeaderSize + 8)..], required);
         // A game asking for a newer version of itself than the one that's in here would only have the console say to update it before it starts.
@@ -292,6 +295,9 @@ internal static class Cnmt
     public const byte MetaApplication = 0x80;
     public const byte MetaPatch = 0x81;
     public const byte MetaAddOnContent = 0x82;
+
+    /// <summary>In a content meta's attributes: a base game cut down to what its update reads from it, which only works with that update.</summary>
+    public const byte AttributeCompacted = 0x04;
 
     public static string FileName(ulong titleId) => $"Application_{titleId:x16}.cnmt";
 

@@ -39,21 +39,23 @@ internal static partial class Explorer
 #endif
     }
 
-    /// <summary>Opens a web address in the default browser.</summary>
-    public static void OpenUrl(string url)
+    /// <summary>Opens a web page in the system's browser.</summary>
+    public static void OpenWebPage(string url)
     {
         if (OperatingSystem.IsWindows())
         {
             ShellExecuteW(IntPtr.Zero, "open", url, null, null, ShowNormal);
             return;
         }
+
 #if !WINDOWS
         try
         {
-            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
+            Process.Start(OperatingSystem.IsMacOS() ? "open" : "xdg-open", [url])?.Dispose();
         }
         catch (Win32Exception)
         {
+            // Nothing there to open it with.
         }
 #endif
     }

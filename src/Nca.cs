@@ -223,9 +223,10 @@ internal sealed class NcaWriter(byte[] headerKey, byte[] keyAreaEncryptionKey, b
         var h = header.AsSpan();
         "NCA3"u8.CopyTo(h[0x200..]);
         h[0x205] = (byte)contentType;
-        int generation = Math.Clamp(keyGeneration, 0, 0xFF);
-        h[0x206] = (byte)Math.Min(generation, 2);
-        h[0x220] = (byte)generation;
+        if (keyGeneration >= 2)
+            h[0x206] = 2;
+        if (keyGeneration >= 3)
+            h[0x220] = (byte)keyGeneration;
         BinaryPrimitives.WriteUInt64LittleEndian(h[0x210..], titleId);
         BinaryPrimitives.WriteInt32LittleEndian(h[0x218..], contentIndex);
         BinaryPrimitives.WriteUInt32LittleEndian(h[0x21C..], sdkOverride ?? sdkVersion);
@@ -258,7 +259,7 @@ internal sealed class NcaWriter(byte[] headerKey, byte[] keyAreaEncryptionKey, b
     }
 
     /// <summary>
-    /// Encrypts and streams one NCA to <paramref name="输出"/> and returns its SHA-256 and size. Everything has to be
+    /// Encrypts and streams one NCA to <paramref name="output"/> and returns its SHA-256 and size. Everything has to be
     /// known by now, as the header goes first.
     /// </summary>
     public NcaInfo Write(Stream output, NcaContentType contentType, ulong titleId, NcaSection?[] sections, RSA? signer, ProgressReporter? progress,
@@ -357,10 +358,11 @@ internal sealed class NcaBuilder : IByteSink
         EndSection(index, section.FsHeader);
     }
 
-    public CompressedData AddCompressed(int index, DataSource image, int blockSize, int level, int threads, bool encrypted, ProgressReporter progress)
+    public CompressedData AddCompressed(int index, DataSource image, int blockSize, int level, int threads, bool encrypted, ProgressReporter progress,
+        IReadOnlyList<UpdateMap.Range>? kept = null)
     {
         StartSection(encrypted, 0);
-        var data = RomFsCompressor.Run(image, this, blockSize, level, threads, progress);
+        var data = RomFsCompressor.Run(image, this, blockSize, level, threads, progress, kept);
         Write(data.Ivfc.HashLevels, 0, data.Ivfc.HashLevels.Length);
         EndSection(index, NcaSections.CompressedRomFsHeader(data, encrypted));
         return data;

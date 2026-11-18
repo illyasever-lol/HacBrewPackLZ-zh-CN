@@ -8,19 +8,34 @@ internal sealed class PopupList : AppWindow
     private readonly int _width;
     private int _hover = -1;
     private bool _closing;
+    /// <summary>Where it goes on the screen, how far from there it starts, and when it came out, while it's on its way.</summary>
+    private readonly POINT _place;
+    private readonly int _startsOff;
+    private double _since = -1;
 
     public PopupList(AppWindow owner, Rect below, (string text, char icon, Action action)[] items, int chosen = -1)
     {
         _items = items;
         _chosen = chosen;
-        CreatePopup(owner);
+        bool moves = Motion.On;
+        CreatePopup(owner, moves ? Win32.WS_EX_LAYERED : 0);
         int iconRoom = items.Any(i => i.icon != '\0') ? S(26) : 0;
         _width = Math.Max(below.W, items.Max(i => TextWidth(i.text, Fonts.Body)) + iconRoom + S(40));
 
-        var corner = new POINT { X = below.X, Y = below.Bottom + S(4) };
-        Win32.ClientToScreen(owner.Handle, ref corner);
+        // Below what it's for, or above it when there isn't room below in the window, as for a button along the bottom.
         int height = items.Length * S(ItemHeight) + S(8);
-        Win32.SetWindowPos(Handle, IntPtr.Zero, corner.X, corner.Y, _width, height, Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
+        bool above = below.Bottom + S(4) + height > owner.ClientHeight && below.Y - S(4) - height >= 0;
+        var corner = new POINT { X = below.X, Y = above ? below.Y - S(4) - height : below.Bottom + S(4) };
+        Win32.ClientToScreen(owner.Handle, ref corner);
+        _place = corner;
+        if (moves)
+        {
+            // It starts a little way back towards what opened it, unseen, and the first picture of it starts it moving.
+            _startsOff = above ? S(10) : -S(10);
+            _since = Motion.Now;
+            Win32.SetLayeredWindowAttributes(Handle, 0, 0, Win32.LWA_ALPHA);
+        }
+        Win32.SetWindowPos(Handle, IntPtr.Zero, corner.X, corner.Y + _startsOff, _width, height, Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
         Win32.ShowWindow(Handle, Win32.SW_SHOW);
         Win32.SetForegroundWindow(Handle);
         Win32.SetFocus(Handle);
@@ -30,9 +45,28 @@ internal sealed class PopupList : AppWindow
 
     protected override void Layout(int width, int height) { }
 
+    /// <summary>On its way out: as far along as it's got, and as clear, until it's in its place, where it's an ordinary window again.</summary>
+    protected override void OnFrame()
+    {
+        if (_since < 0)
+            return;
+        double along = Motion.Along(_since, Motion.RiseTime);
+        Win32.SetWindowPos(Handle, IntPtr.Zero, _place.X, _place.Y + (int)Math.Round(_startsOff * (1 - along)), 0, 0,
+            Win32.SWP_NOSIZE | Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
+        if (along < 1)
+        {
+            Win32.SetLayeredWindowAttributes(Handle, 0, (byte)Math.Round(255 * along), Win32.LWA_ALPHA);
+            return;
+        }
+        _since = -1;
+        Win32.SetWindowLongPtrW(Handle, Win32.GWL_EXSTYLE, (IntPtr)((long)Win32.GetWindowLongPtrW(Handle, Win32.GWL_EXSTYLE) & ~(long)Win32.WS_EX_LAYERED));
+    }
+
     protected override void PaintWindow(Gfx g)
     {
         var p = Theme.P;
+        if (_since >= 0)
+            StillMoving();
         g.Fill(new Rect(0, 0, ClientWidth, ClientHeight), p.StrongBorder);
         g.Fill(new Rect(1, 1, ClientWidth - 2, ClientHeight - 2), p.Surface);
         for (int i = 0; i < _items.Length; i++)
@@ -117,99 +151,5 @@ internal sealed class PopupList : AppWindow
             return;
         _closing = true;
         Win32.DestroyWindow(Handle);
-    }
-}
-
-/// <summary>Some notes below a button, each wrapped to fit, and kept inside the window that opened it. It closes when anything else is clicked.</summary>
-internal sealed class NotePopup : AppWindow
-{
-    private const int Padding = 14;
-    private const int LineHeight = 20;
-    private const int Gap = 10;
-    private const int Widest = 520;
-    private readonly List<List<string>> _notes = [];
-    private bool _closing;
-
-    public NotePopup(AppWindow owner, Rect below, string[] notes)
-    {
-        CreatePopup(owner);
-        int room = Math.Min(S(Widest), owner.ClientWidth - S(40)) - S(Padding) * 2 - S(26);
-        int widest = 0;
-        foreach (string note in notes)
-        {
-            var lines = Wrap(note, room);
-            widest = Math.Max(widest, lines.Max(l => TextWidth(l, Fonts.Body)));
-            _notes.Add(lines);
-        }
-        int width = widest + S(Padding) * 2 + S(26);
-        int height = S(Padding) * 2 + _notes.Sum(n => n.Count) * S(LineHeight) + (_notes.Count - 1) * S(Gap);
-
-        // Right-aligned with the button, but never past either side of the window.
-        int x = Math.Clamp(below.Right - width, S(20), Math.Max(S(20), owner.ClientWidth - S(20) - width));
-        var corner = new POINT { X = x, Y = below.Bottom + S(4) };
-        Win32.ClientToScreen(owner.Handle, ref corner);
-        Win32.SetWindowPos(Handle, IntPtr.Zero, corner.X, corner.Y, width, height, Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
-        Win32.ShowWindow(Handle, Win32.SW_SHOW);
-        Win32.SetForegroundWindow(Handle);
-        Win32.SetFocus(Handle);
-    }
-
-    /// <summary>Word by word, and a word too long for a line on its own, like a long file name, gets a line of its own anyway.</summary>
-    private List<string> Wrap(string text, int width)
-    {
-        var lines = new List<string>();
-        string line = "";
-        foreach (string word in text.Split(' '))
-        {
-            string longer = line.Length == 0 ? word : line + " " + word;
-            if (line.Length > 0 && TextWidth(longer, Fonts.Body) > width)
-            {
-                lines.Add(line);
-                line = word;
-            }
-            else
-            {
-                line = longer;
-            }
-        }
-        lines.Add(line);
-        return lines;
-    }
-
-    protected override void Layout(int width, int height) { }
-
-    protected override void PaintWindow(Gfx g)
-    {
-        var p = Theme.P;
-        g.Fill(new Rect(0, 0, ClientWidth, ClientHeight), p.StrongBorder);
-        g.Fill(new Rect(1, 1, ClientWidth - 2, ClientHeight - 2), p.Surface);
-        int y = S(Padding);
-        foreach (var lines in _notes)
-        {
-            g.Icon(Glyph.Info, new Rect(S(Padding), y, S(16), S(LineHeight)), 13, p.Faint);
-            foreach (string line in lines)
-            {
-                g.Text(line, new Rect(S(Padding) + S(26), y, ClientWidth - S(Padding) * 2 - S(26), S(LineHeight)), Fonts.Body, p.Text);
-                y += S(LineHeight);
-            }
-            y += S(Gap);
-        }
-    }
-
-    protected override IntPtr OnMessage(uint message, IntPtr wParam, IntPtr lParam)
-    {
-        switch (message)
-        {
-            case Win32.WM_LBUTTONUP:
-            case Win32.WM_KEYDOWN:
-            case Win32.WM_ACTIVATE when Win32.Low(wParam) == 0:
-                if (!_closing)
-                {
-                    _closing = true;
-                    Win32.DestroyWindow(Handle);
-                }
-                return 0;
-        }
-        return base.OnMessage(message, wParam, lParam);
     }
 }

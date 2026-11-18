@@ -9,14 +9,35 @@ internal static class Sgr
 {
     private static readonly bool Off = Environment.GetEnvironmentVariable("NO_COLOR") is { Length: > 0 };
 
+    /// <summary>No colours, so what they'd say has to be said some other way, such as brackets round the view shown.</summary>
+    public static bool Plain => Off;
+
     public static readonly string Reset = Make("0");
     public static readonly string Title = Make("1;38;5;80");
     public static readonly string Accent = Make("38;5;80");
+    public static readonly string AccentStrong = Make("1;38;5;80");
     public static readonly string Strong = Make("1");
     public static readonly string Dim = Make("38;5;245");
+    /// <summary>Quieter than dim, for what's there to be found rather than read: column headings, rules, games waiting their turn.</summary>
+    public static readonly string Faint = Make("38;5;240");
     public static readonly string Good = Make("38;5;114");
+    public static readonly string GoodStrong = Make("1;38;5;114");
     public static readonly string Warn = Make("38;5;179");
+    public static readonly string WarnStrong = Make("1;38;5;179");
     public static readonly string Bad = Make("38;5;203");
+    public static readonly string BadStrong = Make("1;38;5;203");
+    /// <summary>Filled in with the accent colour: the view shown, and the key that does the next thing.</summary>
+    public static readonly string Chosen = Make("1;38;5;16;48;5;80");
+    /// <summary>The row the pointer's on, all the way across.</summary>
+    public static readonly string Band = Make("48;5;236");
+    /// <summary>What's left of a bar.</summary>
+    public static readonly string Track = Make("38;5;238");
+
+    /// <summary>What a game saves, on its bar: one green, stronger the more it saves, as on the Switch. A saving of 10% or less is the
+    /// quietest, one of 60% or more the strongest, in the four shades of it a terminal has.</summary>
+    public static string Saving(double saved) => SavingShades[(int)Math.Round(Math.Clamp((saved - 0.10) / 0.50, 0, 1) * 3)];
+
+    private static readonly string[] SavingShades = [Make("38;5;29"), Make("38;5;35"), Make("38;5;42"), Make("38;5;78")];
 
     public static string For(UiLevel level) => level switch
     {
@@ -184,19 +205,12 @@ internal static class Terminal
         return Sgr.Accent + new string(BarFull, full) + Sgr.Dim + new string(BarEmpty, width - full) + Sgr.Reset;
     }
 
-    /// <summary>Roughly how long the rest of a job will take, or empty before there's anything to go on.</summary>
+    /// <summary>Roughly how long the rest of a step will take, or empty before there's anything to go on.</summary>
     public static string TimeLeft(ProgressSnapshot s)
     {
         if (s.BytesPerSecond <= 0 || s.Done <= 0 || s.Done >= s.Total)
             return "";
-        double seconds = (s.Total - s.Done) / s.BytesPerSecond;
-        return seconds switch
-        {
-            < 60 => "剩余不到一分钟",
-            < 90 => "约剩一分钟",
-            < 3600 => $"约剩 {Math.Round(seconds / 60)} 分钟",
-            _ => $"约剩 {Math.Floor(seconds / 3600)} 小时 {Math.Round(seconds % 3600 / 60)} 分钟",
-        };
+        return ProgressReporter.TimeLeft((s.Total - s.Done) / s.BytesPerSecond);
     }
 
     [DllImport("kernel32.dll")]
@@ -215,8 +229,9 @@ internal static class Terminal
     private static extern bool SetConsoleMode(IntPtr handle, uint mode);
 }
 
-/// <summary>One row of the screen, kept to the width it was made for no matter what is added to it.</summary>
-internal sealed class Line(int width)
+/// <summary>One row of the screen, kept to the width it was made for no matter what is added to it. A row with a band has it behind
+/// everything on it, gaps included, as far as it goes.</summary>
+internal sealed class Line(int width, string band = "")
 {
     private readonly StringBuilder _text = new();
 
@@ -227,11 +242,31 @@ internal sealed class Line(int width)
         string fitted = Terminal.Fit(text, width - Used);
         if (fitted.Length == 0)
             return this;
-        _text.Append(style).Append(fitted);
-        if (style.Length > 0)
+        _text.Append(band).Append(style).Append(fitted);
+        if (style.Length > 0 || band.Length > 0)
             _text.Append(Sgr.Reset);
         Used += Terminal.DisplayWidth(fitted);
         return this;
+    }
+
+    /// <summary>A thin bar, in half cells, so bars on rows one above the other don't run into each other as blocks do. Without colours,
+    /// what's left of it is a thinner line.</summary>
+    /// <summary>What a game comes to, as a share of what it is now: what stays, then what goes in <paramref name="goes"/>. Without colours, what
+    /// stays is the heavy line and what goes the light one.</summary>
+    public Line AddSizeBar(int cells, double after, string goes)
+    {
+        int halves = (int)Math.Round(Math.Clamp(after, 0, 1) * cells * 2);
+        string stays = new string('\u2501', halves / 2) + (halves % 2 == 1 ? "\u2578" : "");
+        Add(stays, Sgr.Dim);
+        return Add(new string(Sgr.Plain ? '\u2500' : '\u2501', cells - stays.Length), goes);
+    }
+
+    public Line AddBar(int cells, double fraction, string style)
+    {
+        int halves = (int)Math.Round(Math.Clamp(fraction, 0, 1) * cells * 2);
+        string filled = new string('\u2501', halves / 2) + (halves % 2 == 1 ? "\u2578" : "");
+        Add(filled, style);
+        return Add(new string(Sgr.Plain ? '\u2500' : '\u2501', cells - filled.Length), Sgr.Track);
     }
 
     /// <summary>Adds text that already holds its own styles and whose width is known.</summary>
@@ -249,7 +284,10 @@ internal sealed class Line(int width)
         int gap = Math.Min(column, width) - Used;
         if (gap > 0)
         {
-            _text.Append(' ', gap);
+            if (band.Length > 0)
+                _text.Append(band).Append(' ', gap).Append(Sgr.Reset);
+            else
+                _text.Append(' ', gap);
             Used += gap;
         }
         return this;
@@ -307,7 +345,7 @@ internal sealed class ConsoleSink : IUiSink
         {
             ClearProgress();
             if (elapsed.TotalSeconds >= 1)
-                Console.Out.WriteLine($"{Sgr.Dim}{label}: 完成时间 {elapsed.TotalSeconds:0.0}s{Sgr.Reset}");
+                Console.Out.WriteLine($"{Sgr.Dim}{label}: done in {elapsed.TotalSeconds:0.0}s{Sgr.Reset}");
         }
     }
 
@@ -345,7 +383,7 @@ internal sealed class ConsoleSink : IUiSink
         if (Terminal.TimeLeft(s) is { Length: > 0 } left)
             extras.Add(left);
         if (s.ShowOutput && s.Done > 0)
-            extras.Add($"输出 {s.Output * 100.0 / s.Done:0}%");
+            extras.Add($"output {s.Output * 100.0 / s.Done:0}%");
 
         int Fixed() => Terminal.DisplayWidth(label) + 1 + percent.Length + extras.Sum(e => e.Length + 2);
         while (extras.Count > 0 && Fixed() + BarMin + 1 > width)

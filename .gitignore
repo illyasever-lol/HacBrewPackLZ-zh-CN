@@ -25,18 +25,9 @@ keys.ini
 *.zst
 switch/third_party/libusbhsfs/release/
 switch/third_party/libusbhsfs/lib/
+*.pem
+*.keystore
+*.keystore.pass
 
-# Binaries go to Releases, not into git
-*.exe
-*.dll
-*.pdb
-*.nupkg
-*.o
-*.a
-*.cache
-*.nro
-prod.keys
-title.keys
-dev.keys
-.vs/
-.idea/
+# This PC's paths for tools/check.py and tools/build_release.py (tools/local.example.json names each one)
+tools/local.json

@@ -3,9 +3,42 @@ using System.Text;
 
 namespace HacBrewPackLz;
 
-/// <summary>A Switch running hacBrewPackLZ, plugged in with a USB cable, through whichever of the WinUSB or libusbK drivers Windows has for it. Zadig
-/// installs either, and DBI uses the same one, as the console shows up with the same IDs. Both drivers take the same calls.</summary>
-internal sealed unsafe class SwitchUsb : IDisposable
+/// <summary>A Switch running hacBrewPackLZ, plugged in with a USB cable: on Windows through its own USB drivers, and on Linux and macOS through libusb.
+/// Each read is one transfer's worth, which can be less than the buffer holds.</summary>
+internal abstract class SwitchUsb : IDisposable
+{
+    /// <summary>The console's IDs, the same as DBI's, so the same driver works for both.</summary>
+    public const ushort Vendor = 0x057E, Product = 0x3000;
+
+    /// <summary>Null if there's no console there, with why not in problem when that's something to do anything about. HBP_USB=libusb takes the libusb
+    /// way on Windows too, which is how it's tried with a console here.</summary>
+    public static SwitchUsb? Open(out string? problem)
+    {
+        problem = null;
+        try
+        {
+            if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("HBP_USB") != "libusb")
+                return WindowsUsb.Find(out problem);
+            return Possible ? LibUsb.Find(out problem) : null;
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or InvalidOperationException)
+        {
+            problem = "无法打开 Switch 的 USB 连接：" + e.Message;
+            return null;
+        }
+    }
+
+    /// <summary>Whether this system can send over a cable at all.</summary>
+    public static bool Possible => OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS();
+
+    public abstract int Read(byte[] buffer, int offset, int count);
+    public abstract void Write(byte[] buffer, int offset, int count);
+    public abstract void Dispose();
+}
+
+/// <summary>Windows, through whichever of the WinUSB or libusbK drivers it has for the console. Zadig installs either, and DBI uses the same one, as
+/// the console shows up with the same IDs. Both drivers take the same calls.</summary>
+internal sealed unsafe class WindowsUsb : SwitchUsb
 {
     private const string HardwareId = "VID_057E&PID_3000";
     private const uint DigcfPresent = 0x2, DigcfAllClasses = 0x4, DigcfDeviceInterface = 0x10;
@@ -75,7 +108,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
     private readonly delegate* unmanaged[Stdcall]<nint, int> _free;
     private int _disposed;
 
-    private SwitchUsb(nint file, nint usb, byte inPipe, byte outPipe, nint library, string prefix)
+    private WindowsUsb(nint file, nint usb, byte inPipe, byte outPipe, nint library, string prefix)
     {
         _file = file;
         _usb = usb;
@@ -87,25 +120,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
     }
 
     /// <summary>Null if there's no console there, with why not in problem when that's something to do anything about.</summary>
-    public static SwitchUsb? Open(out string? problem)
-    {
-        problem = null;
-        if (!OperatingSystem.IsWindows())
-            return null;
-        try
-        {
-            return Find(out problem);
-        }
-        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or InvalidOperationException)
-        {
-            problem = e is EntryPointNotFoundException
-                ? "无法打开 Switch 的 USB 连接：驱动缺少所需的函数，请用 Zadig 重新安装 WinUSB 或 libusbK 驱动。"
-                : "无法打开 Switch 的 USB 连接：" + e.Message;
-            return null;
-        }
-    }
-
-    private static SwitchUsb? Find(out string? problem)
+    internal static SwitchUsb? Find(out string? problem)
     {
         problem = null;
         nint set;
@@ -126,7 +141,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
                 {
                     problem = service.Length == 0
                         ? "检测到 Switch 已插入，但 Windows 未安装其驱动，请用 Zadig 安装 WinUSB 驱动。"
-                        : $"检测到 Switch 已插入，但当前使用的是 {service} 驱动，请用 Zadig 改装 WinUSB 或 libusbK 驱动。";
+                        : $"A Switch is plugged in, but with the {service} driver. Install the WinUSB or libusbK driver for it with Zadig instead.";
                     return null;
                 }
                 Guid? guid = InterfaceGuid(set, &info);
@@ -223,7 +238,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
         problem = null;
         if (!NativeLibrary.TryLoad(library, out nint lib))
         {
-            problem = $"Switch 驱动所需的 {library} 不存在，请用 Zadig 重新安装驱动。";
+            problem = $"The Switch's driver needs {library}, which isn't there.";
             return null;
         }
         const uint GenericReadWrite = 0xC0000000, ShareReadWrite = 3, OpenExisting = 3, Overlapped = 0x40000000, Normal = 0x80;
@@ -232,14 +247,6 @@ internal sealed unsafe class SwitchUsb : IDisposable
             file = CreateFileW(p, GenericReadWrite, ShareReadWrite, 0, OpenExisting, Normal | Overlapped, 0);
         if (file == -1)
             return null;
-        // A driver with a missing export used to surface as a bare "Entry point was not found."
-        foreach (string suffix in new[] { "Initialize", "QueryInterfaceSettings", "QueryPipe", "Free", "ReadPipe", "WritePipe" })
-            if (!NativeLibrary.TryGetExport(lib, prefix + suffix, out _))
-            {
-                CloseHandle(file);
-                problem = $"Switch 的 USB 驱动缺少 {prefix + suffix} 函数，请用 Zadig 重新安装 WinUSB 或 libusbK 驱动。";
-                return null;
-            }
         var initialize = (delegate* unmanaged[Stdcall]<nint, nint*, int>)NativeLibrary.GetExport(lib, prefix + "Initialize");
         var querySettings = (delegate* unmanaged[Stdcall]<nint, byte, InterfaceDescriptor*, int>)NativeLibrary.GetExport(lib, prefix + "QueryInterfaceSettings");
         var queryPipe = (delegate* unmanaged[Stdcall]<nint, byte, byte, PipeInformation*, int>)NativeLibrary.GetExport(lib, prefix + "QueryPipe");
@@ -274,11 +281,11 @@ internal sealed unsafe class SwitchUsb : IDisposable
             return null;
         }
         // Nothing to end what's sent with an empty packet: each side reads exactly as much as the other sends, which is what ends each read.
-        return new SwitchUsb(file, usb, inPipe, outPipe, lib, prefix);
+        return new WindowsUsb(file, usb, inPipe, outPipe, lib, prefix);
     }
 
     /// <summary>One transfer's worth, which can be less than the buffer holds.</summary>
-    public int Read(byte[] buffer, int offset, int count)
+    public override int Read(byte[] buffer, int offset, int count)
     {
         uint got = 0;
         fixed (byte* b = buffer)
@@ -289,7 +296,7 @@ internal sealed unsafe class SwitchUsb : IDisposable
         return (int)got;
     }
 
-    public void Write(byte[] buffer, int offset, int count)
+    public override void Write(byte[] buffer, int offset, int count)
     {
         while (count > 0)
         {
@@ -304,12 +311,319 @@ internal sealed unsafe class SwitchUsb : IDisposable
         }
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
         _free(_usb);
         CloseHandle(_file);
+    }
+}
+
+/// <summary>Linux and macOS, through libusb, which needs no driver installed: on Linux, only that this user is allowed to use the console, which a
+/// udev rule gives once (Help says how). A transfer can't be called off from another thread, so each one waits a little at a time, and closing waits
+/// for the one in progress to see that it's closing.</summary>
+internal sealed unsafe class LibUsb : SwitchUsb
+{
+    private const int ErrorAccess = -3, ErrorBusy = -6, ErrorTimeout = -7;
+    private const uint Patience = 1000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DeviceDescriptor
+    {
+        public byte Length, DescriptorType;
+        public ushort Usb;
+        public byte DeviceClass, DeviceSubClass, DeviceProtocol, MaxPacketSize0;
+        public ushort Vendor, Product, Release;
+        public byte Manufacturer, ProductName, SerialNumber, Configurations;
+    }
+
+    /// <summary>libusb's calls, loaded once for as long as the program runs.</summary>
+    private sealed class Api
+    {
+        public readonly nint Context;
+        public readonly delegate* unmanaged<nint, nint**, nint> GetDeviceList;
+        public readonly delegate* unmanaged<nint*, int, void> FreeDeviceList;
+        public readonly delegate* unmanaged<nint, DeviceDescriptor*, int> GetDeviceDescriptor;
+        public readonly delegate* unmanaged<nint, nint*, int> OpenDevice;
+        public readonly delegate* unmanaged<nint, void> Close;
+        public readonly delegate* unmanaged<nint, int, int> SetAutoDetachKernelDriver;
+        public readonly delegate* unmanaged<nint, int, int> ClaimInterface;
+        public readonly delegate* unmanaged<nint, int, int> ReleaseInterface;
+        public readonly delegate* unmanaged<nint, byte, byte, ushort, ushort, byte*, ushort, uint, int> ControlTransfer;
+        public readonly delegate* unmanaged<nint, byte, byte*, int, int*, uint, int> BulkTransfer;
+        private readonly delegate* unmanaged<int, byte*> _errorName;
+
+        public Api(nint library, nint context)
+        {
+            Context = context;
+            GetDeviceList = (delegate* unmanaged<nint, nint**, nint>)NativeLibrary.GetExport(library, "libusb_get_device_list");
+            FreeDeviceList = (delegate* unmanaged<nint*, int, void>)NativeLibrary.GetExport(library, "libusb_free_device_list");
+            GetDeviceDescriptor = (delegate* unmanaged<nint, DeviceDescriptor*, int>)NativeLibrary.GetExport(library, "libusb_get_device_descriptor");
+            OpenDevice = (delegate* unmanaged<nint, nint*, int>)NativeLibrary.GetExport(library, "libusb_open");
+            Close = (delegate* unmanaged<nint, void>)NativeLibrary.GetExport(library, "libusb_close");
+            SetAutoDetachKernelDriver = (delegate* unmanaged<nint, int, int>)NativeLibrary.GetExport(library, "libusb_set_auto_detach_kernel_driver");
+            ClaimInterface = (delegate* unmanaged<nint, int, int>)NativeLibrary.GetExport(library, "libusb_claim_interface");
+            ReleaseInterface = (delegate* unmanaged<nint, int, int>)NativeLibrary.GetExport(library, "libusb_release_interface");
+            ControlTransfer = (delegate* unmanaged<nint, byte, byte, ushort, ushort, byte*, ushort, uint, int>)NativeLibrary.GetExport(library, "libusb_control_transfer");
+            BulkTransfer = (delegate* unmanaged<nint, byte, byte*, int, int*, uint, int>)NativeLibrary.GetExport(library, "libusb_bulk_transfer");
+            _errorName = (delegate* unmanaged<int, byte*>)NativeLibrary.GetExport(library, "libusb_error_name");
+        }
+
+        public string ErrorName(int code) => Marshal.PtrToStringAnsi((nint)_errorName(code)) ?? code.ToString();
+    }
+
+    private static readonly object Loading = new();
+    private static Api? _api;
+    private static string? _missing;
+
+    private readonly Api _lib;
+    private readonly nint _handle;
+    private readonly int _interface;
+    private readonly byte _in, _out;
+    private readonly object _gate = new();
+    private int _transfers;
+    private volatile bool _closing;
+    private bool _closed;
+
+    private LibUsb(Api lib, nint handle, int interfaceNumber, byte inPoint, byte outPoint)
+    {
+        _lib = lib;
+        _handle = handle;
+        _interface = interfaceNumber;
+        _in = inPoint;
+        _out = outPoint;
+    }
+
+    /// <summary>libusb is part of nearly every Linux. On a Mac it comes beside the program, or from Homebrew.</summary>
+    private static Api? Load(out string? problem)
+    {
+        lock (Loading)
+        {
+            if (_api is null && _missing is null)
+            {
+                string[] names = OperatingSystem.IsMacOS()
+                    ? ["libusb-1.0.0.dylib", "/opt/homebrew/lib/libusb-1.0.0.dylib", "/usr/local/lib/libusb-1.0.0.dylib", "libusb-1.0.dylib"]
+                    : OperatingSystem.IsWindows() ? ["libusb-1.0.dll"] : ["libusb-1.0.so.0", "libusb-1.0.so"];
+                nint library = 0;
+                foreach (var name in names)
+                {
+                    bool loaded = Path.IsPathRooted(name)
+                        ? NativeLibrary.TryLoad(name, out library)
+                        : NativeLibrary.TryLoad(name, typeof(LibUsb).Assembly, null, out library);
+                    if (loaded)
+                        break;
+                }
+                if (library == 0)
+                    _missing = OperatingSystem.IsMacOS() ? "Sending by USB cable needs libusb, which Homebrew installs: brew install libusb"
+                        : OperatingSystem.IsWindows() ? "Sending by USB cable this way needs libusb-1.0.dll beside the program"
+                        : "Sending by USB cable needs libusb, which isn't installed: install the libusb-1.0 package";
+                else
+                {
+                    var init = (delegate* unmanaged<nint*, int>)NativeLibrary.GetExport(library, "libusb_init");
+                    nint context = 0;
+                    int rc = init(&context);
+                    if (rc != 0)
+                        _missing = $"libusb couldn't start ({rc})";
+                    else
+                        _api = new Api(library, context);
+                }
+            }
+            problem = _missing;
+            return _api;
+        }
+    }
+
+    internal static SwitchUsb? Find(out string? problem)
+    {
+        var lib = Load(out problem);
+        if (lib is null)
+            return null;
+        nint* list;
+        nint count = lib.GetDeviceList(lib.Context, &list);
+        if (count < 0)
+            return null;
+        try
+        {
+            for (nint i = 0; i < count; i++)
+            {
+                DeviceDescriptor device;
+                if (lib.GetDeviceDescriptor(list[i], &device) != 0 || device.Vendor != Vendor || device.Product != Product)
+                    continue;
+                nint handle;
+                int rc = lib.OpenDevice(list[i], &handle);
+                if (rc == ErrorAccess)
+                {
+                    problem = OperatingSystem.IsLinux()
+                        ? "A Switch is plugged in, but this user isn't allowed to use it. Help says how to allow it, once"
+                        : "A Switch is plugged in, but this user isn't allowed to use it";
+                    return null;
+                }
+                if (rc != 0)
+                {
+                    problem = $"A Switch is plugged in, but its USB connection couldn't be opened ({lib.ErrorName(rc)})";
+                    return null;
+                }
+                return Connect(lib, handle, out problem);
+            }
+            return null;
+        }
+        finally
+        {
+            lib.FreeDeviceList(list, 1);
+        }
+    }
+
+    private static SwitchUsb? Connect(Api lib, nint handle, out string? problem)
+    {
+        problem = null;
+        // The configuration's descriptors as the console sends them, read straight, so nothing depends on how libusb lays them out.
+        var descriptors = new byte[256];
+        int got;
+        fixed (byte* d = descriptors)
+            got = lib.ControlTransfer(handle, 0x80, 6, 0x0200, 0, d, (ushort)descriptors.Length, Patience);
+        if (got <= 0 || !Endpoints(descriptors.AsSpan(0, got), out int interfaceNumber, out byte inPoint, out byte outPoint))
+        {
+            lib.Close(handle);
+            problem = "The Switch is plugged in, but not with hacBrewPackLZ open on it";
+            return null;
+        }
+        // Only Linux can take the console from a driver that has it; elsewhere this says it can't, which is fine.
+        lib.SetAutoDetachKernelDriver(handle, 1);
+        int rc = lib.ClaimInterface(handle, interfaceNumber);
+        if (rc != 0)
+        {
+            lib.Close(handle);
+            problem = rc == ErrorBusy ? "A Switch is plugged in, but another program is using its USB connection"
+                : $"A Switch is plugged in, but its USB connection couldn't be opened ({lib.ErrorName(rc)})";
+            return null;
+        }
+        return new LibUsb(lib, handle, interfaceNumber, inPoint, outPoint);
+    }
+
+    /// <summary>The first interface in a configuration's descriptors, and its bulk endpoint each way. A USB 3 companion after each endpoint is
+    /// passed over, as is anything else.</summary>
+    internal static bool Endpoints(ReadOnlySpan<byte> descriptors, out int interfaceNumber, out byte inPoint, out byte outPoint)
+    {
+        interfaceNumber = -1;
+        inPoint = outPoint = 0;
+        bool inFirst = false;
+        for (int at = 0; at + 2 <= descriptors.Length;)
+        {
+            int length = descriptors[at], type = descriptors[at + 1];
+            if (length < 2 || at + length > descriptors.Length)
+                break;
+            if (type == 4 && length >= 9)
+            {
+                if (interfaceNumber >= 0)
+                    break;
+                inFirst = descriptors[at + 3] == 0;
+                if (inFirst)
+                    interfaceNumber = descriptors[at + 2];
+            }
+            else if (type == 5 && length >= 7 && inFirst && (descriptors[at + 3] & 3) == 2)
+            {
+                byte address = descriptors[at + 2];
+                if ((address & 0x80) != 0)
+                {
+                    if (inPoint == 0)
+                        inPoint = address;
+                }
+                else if (outPoint == 0)
+                    outPoint = address;
+            }
+            at += length;
+        }
+        return interfaceNumber >= 0 && inPoint != 0 && outPoint != 0;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        Begin();
+        try
+        {
+            fixed (byte* b = buffer)
+            {
+                while (true)
+                {
+                    int got = 0;
+                    int rc = _lib.BulkTransfer(_handle, _in, b + offset, count, &got, Patience);
+                    // What came before the wait ran out still counts: the reader asks again for the rest.
+                    if (rc == 0 || got > 0)
+                        return got;
+                    if (rc != ErrorTimeout || _closing)
+                        throw new IOException("Switch 的 USB 数据线已断开");
+                }
+            }
+        }
+        finally
+        {
+            End();
+        }
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        Begin();
+        try
+        {
+            fixed (byte* b = buffer)
+            {
+                while (count > 0)
+                {
+                    int sent = 0;
+                    int rc = _lib.BulkTransfer(_handle, _out, b + offset, count, &sent, Patience);
+                    if (rc != 0 && (rc != ErrorTimeout || _closing))
+                        throw new IOException("Switch 的 USB 数据线已断开");
+                    offset += sent;
+                    count -= sent;
+                }
+            }
+        }
+        finally
+        {
+            End();
+        }
+    }
+
+    private void Begin()
+    {
+        lock (_gate)
+        {
+            if (_closing)
+                throw new IOException("Switch 的 USB 数据线已断开");
+            _transfers++;
+        }
+    }
+
+    private void End()
+    {
+        lock (_gate)
+        {
+            _transfers--;
+            if (!_closing || _transfers > 0 || _closed)
+                return;
+            _closed = true;
+        }
+        Shut();
+    }
+
+    public override void Dispose()
+    {
+        lock (_gate)
+        {
+            _closing = true;
+            if (_transfers > 0 || _closed)
+                return;
+            _closed = true;
+        }
+        Shut();
+    }
+
+    private void Shut()
+    {
+        _lib.ReleaseInterface(_handle, _interface);
+        _lib.Close(_handle);
     }
 }
 

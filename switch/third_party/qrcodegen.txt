@@ -1,0 +1,2 @@
+qrcodegen from https://github.com/nayuki/QR-Code-generator (the C version, master on 2026-11-04), as it is, under the MIT licence in its files.
+It draws the QR codes that take help and problem reports to a phone.

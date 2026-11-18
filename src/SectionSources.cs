@@ -148,6 +148,16 @@ internal sealed class IndirectSource : DataSource
     public override long Length => _end;
     public override bool ReadsAtOnce => _patch.ReadsAtOnce && _original?.ReadsAtOnce != false;
 
+    /// <summary>Where each part read from the base game starts.</summary>
+    public IEnumerable<long> FromOriginal()
+    {
+        for (int i = 0; i < _virtual.Length; i++)
+        {
+            if (!_fromPatch[i])
+                yield return _virtual[i];
+        }
+    }
+
     public override void Read(long offset, byte[] buffer, int bufferOffset, int count)
     {
         while (count > 0)
@@ -319,7 +329,7 @@ internal sealed class VerifiedSource(DataSource data, byte[] hashes, int blockSi
         int blocks = (length + blockSize - 1) / blockSize;
         long firstBlock = position / blockSize;
         if ((firstBlock + blocks) * HashSize > hashes.Length)
-            throw new ToolException($"{what}: the hash table is too short for its data, the file is damaged{hint}");
+            throw new MismatchException($"{what}: the hash table is too short for its data, the file is damaged{hint}");
 
         if (length % blockSize != 0)
         {
@@ -345,7 +355,7 @@ internal sealed class VerifiedSource(DataSource data, byte[] hashes, int blockSi
 
         long bad = Volatile.Read(ref failed);
         if (bad >= 0)
-            throw new ToolException($"{what}: hash check failed at offset 0x{bad * blockSize:x}. The file is damaged{hint}");
+            throw new MismatchException($"{what}: hash check failed at offset 0x{bad * blockSize:x}. The file is damaged{hint}");
     }
 }
 
@@ -397,9 +407,11 @@ internal sealed class CompressedImageSource : DataSource
     {
         while (count > 0)
         {
-            _cursor = SortedLookup.Find(_virtual, _end, offset, _cursor);
-            if (_cursor < 0)
+            // Kept only when it's found, as the other readers do: kept as -1, the next read of it failed with an index out of range.
+            int found = SortedLookup.Find(_virtual, _end, offset, _cursor);
+            if (found < 0)
                 throw new ToolException($"{_name}: offset 0x{offset:x} isn't covered by the compression table");
+            _cursor = found;
 
             long entryEnd = _cursor + 1 < _virtual.Length ? _virtual[_cursor + 1] : _end;
             long inEntry = offset - _virtual[_cursor];
@@ -440,7 +452,7 @@ internal sealed class CompressedImageSource : DataSource
         _blockEntry = -1;
         _data.Read(_physical[entry], _compressed, 0, physicalSize);
         if (Lz4Decoder.Decode(_compressed, 0, physicalSize, _block, 0, virtualSize) != virtualSize)
-            throw new ToolException($"{_name}: compressed block at 0x{_virtual[entry]:x} failed to decode");
+            throw new MismatchException($"{_name}: compressed block at 0x{_virtual[entry]:x} failed to decode");
         _blockEntry = entry;
     }
 }

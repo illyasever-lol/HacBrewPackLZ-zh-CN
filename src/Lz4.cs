@@ -243,7 +243,7 @@ internal sealed unsafe class Lz4Encoder
 
     private static int FindLongest(byte* s, ushort* head, ushort* prev, ref int nextInsert, int ip, int matchEnd, int attempts, out int match)
     {
-        // Positions are stored +1 so that 0 can mean "空". The last 12 bytes are never inserted, so they fit in 16 bits.
+        // Positions are stored +1 so that 0 can mean "empty". The last 12 bytes are never inserted, so they fit in 16 bits.
         for (int i = nextInsert; i < ip; i++)
         {
             uint h = Hash(*(uint*)(s + i));

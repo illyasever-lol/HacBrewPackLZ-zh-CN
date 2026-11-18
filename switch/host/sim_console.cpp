@@ -33,7 +33,13 @@ std::string keyName(const MetaKey& key) { return format("%016llx_%u_%d", (unsign
 
 class SimWriter : public ContentWriter {
 public:
-    SimWriter(SimConsole& console, Storage storage, std::string token, i64 size) : _console(console), _storage(storage), _token(std::move(token)), _size(size), _file(new sys::File(console.placeholderPath(storage, _token), sys::File::Mode::Create)) {}
+    SimWriter(SimConsole& console, Storage storage, std::string token, i64 size) : _console(console), _storage(storage), _token(std::move(token)), _size(size) {}
+
+    /// A step of its own, as on a console, so the power can go between the journal knowing of it and its being made.
+    void create() override {
+        _console.tick();
+        _file.reset(new sys::File(_console.placeholderPath(_storage, _token), sys::File::Mode::Create));
+    }
 
     ~SimWriter() override {
         if (_file) {
@@ -52,9 +58,10 @@ public:
         if (free >= 0 && end > free)
             throw ToolError("There isn't enough room to write the new copy");
         if (_size >= 0 && end > _size)
-            throw ToolError("内部错误：实际写入量大于占位预留量");
+            throw ToolError("Internal error: more was written than the placeholder was made for");
         _file->write(offset, data, size);
         _end = std::max(_end, end);
+        _writes.emplace_back(offset, end);
     }
 
     void setSize(i64 size) override {
@@ -77,11 +84,18 @@ public:
             _console.tick();
             sys::renameFile(_console.contentPath(_storage, _held), _console.placeholderPath(_storage, _token));
         } else if (_size >= 0 && _end != _size) {
-            throw ToolError("内部错误：实际写入量小于占位预留量");
+            throw ToolError("Internal error: less was written than the placeholder was made for");
         }
         _console.tick();
         _file.reset();
         sys::renameFile(_console.placeholderPath(_storage, _token), _console.contentPath(_storage, id));
+        // How it was written, now that where it ends is known.
+        constexpr i64 Block = 0x4000;
+        for (auto& write : _writes) {
+            _console.contentWrites++;
+            if (write.first % Block != 0 || (write.second % Block != 0 && write.second != _end))
+                _console.blockSplittingWrites++;
+        }
     }
 
 private:
@@ -91,6 +105,7 @@ private:
     i64 _size;
     std::unique_ptr<sys::File> _file;
     i64 _end = 0;
+    std::vector<std::pair<i64, i64>> _writes;
     ContentId _held;
     bool _isHeld = false;
 };
@@ -117,7 +132,8 @@ private:
 }  // namespace
 
 SimConsole::SimConsole(std::string folder, const Keyset& keyset) : _folder(std::move(folder)), _keyset(keyset) {
-    for (Storage storage : {Storage::Sd, Storage::Nand}) {
+    // A game card's games are installed there by the tests, as the system has them while a card is in.
+    for (Storage storage : {Storage::Sd, Storage::Nand, Storage::GameCard}) {
         sys::makeDirectories(storageFolder(storage) + "/contents");
         sys::makeDirectories(storageFolder(storage) + "/placeholders");
         sys::makeDirectories(storageFolder(storage) + "/metas");
@@ -141,7 +157,7 @@ void SimConsole::tick() {
     }
 }
 
-std::string SimConsole::storageFolder(Storage storage) const { return _folder + (storage == Storage::Sd ? "/sd" : "/nand"); }
+std::string SimConsole::storageFolder(Storage storage) const { return _folder + (storage == Storage::Sd ? "/sd" : storage == Storage::GameCard ? "/gamecard" : "/nand"); }
 std::string SimConsole::contentPath(Storage storage, const ContentId& id) const { return storageFolder(storage) + "/contents/" + id.hex() + ".nca"; }
 std::string SimConsole::placeholderPath(Storage storage, const std::string& token) const { return storageFolder(storage) + "/placeholders/" + token; }
 std::string SimConsole::metaPath(Storage storage, const MetaKey& key) const { return storageFolder(storage) + "/metas/" + keyName(key); }
@@ -225,6 +241,17 @@ void SimConsole::install(const std::vector<std::string>& nspPaths, Storage stora
     }
 }
 
+std::vector<u64> SimConsole::cardApplications() {
+    tick();
+    std::vector<u64> list;
+    for (u64 application : listApplications()) {
+        auto found = records(application);
+        if (std::any_of(found.begin(), found.end(), [](const std::pair<MetaKey, Storage>& record) { return record.second == Storage::GameCard && record.first.type == Cnmt::MetaApplication; }))
+            list.push_back(application);
+    }
+    return list;
+}
+
 std::vector<u64> SimConsole::listApplications() {
     tick();
     std::vector<u64> list;
@@ -238,6 +265,8 @@ InstalledGame SimConsole::describe(u64 applicationId) {
     tick();
     InstalledGame game;
     game.applicationId = applicationId;
+    if (applicationId == runsThrough)
+        game.blocked = "hacBrewPackLZ is open through this game: open it from another one";
     for (auto& record : records(applicationId)) {
         Bytes blob = readAll(metaPath(record.second, record.first));
         InstalledMeta meta;
@@ -245,6 +274,8 @@ InstalledGame SimConsole::describe(u64 applicationId) {
         meta.storage = record.second;
         int extended = rd16(blob.data());
         int count = rd16(blob.data() + 2);
+        if (meta.key.type == Cnmt::MetaApplication)
+            meta.attributes = blob[6];
         for (int i = 0; i < count; i++) {
             const u8* info = blob.data() + 8 + extended + i * 0x18;
             InstalledContent content;
@@ -315,6 +346,14 @@ void SimConsole::deleteContent(Storage storage, const ContentId& id) {
 void SimConsole::setMeta(Storage storage, const MetaKey& key, const Bytes& installMeta) {
     tick();
     writeAll(metaPath(storage, key), installMeta.data(), installMeta.size());
+}
+
+Bytes SimConsole::getMeta(Storage storage, const MetaKey& key) {
+    tick();
+    std::string path = metaPath(storage, key);
+    if (!sys::exists(path))
+        throw ToolError("(2005-0008) That record isn't there");
+    return readAll(path);
 }
 
 bool SimConsole::hasMeta(Storage storage, const MetaKey& key) {

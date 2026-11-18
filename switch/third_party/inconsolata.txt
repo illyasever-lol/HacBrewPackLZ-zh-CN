@@ -1,0 +1,4 @@
+Inconsolata Regular, version 2.000, by The Inconsolata Project Authors (https://github.com/googlefonts/Inconsolata), as Google Fonts
+has it, under the SIL Open Font License 1.1 in inconsolata/OFL.txt (from https://github.com/google/fonts, ofl/inconsolata).
+It shows the bytes and text inside games, in Look inside, where every character has to be as wide as the others.
+app/app_mono_font.cpp holds its bytes, as they are, written out from inconsolata/Inconsolata-Regular.ttf.

@@ -31,6 +31,10 @@ internal abstract class Widget
         get => _bounds;
         set
         {
+            // v21：位置没变就不要惊动控件。压缩时状态文字变化会让主窗口每秒重排数十次，
+            // 每次都触发 BoundsChanged 会让原生子窗口被反复 SetWindowPos，右侧出现闪烁。
+            if (_bounds == value)
+                return;
             _bounds = value;
             BoundsChanged();
         }
@@ -52,6 +56,8 @@ internal abstract class Widget
     public virtual void MouseMove(int x, int y) { }
     public virtual void MouseLeave() { }
     public virtual void DoubleClick(int x, int y) { }
+    /// <summary>The right button let go over it, as a menu of what can be done to what's there opens on.</summary>
+    public virtual void RightClick(int x, int y) { }
     public virtual bool Wheel(int delta) => false;
     public virtual bool KeyDown(int key) => false;
     public virtual void Focus() { }
@@ -73,6 +79,16 @@ internal abstract class AppWindow : NativeWindow
     private int _bufferHeight;
     private bool _trackingLeave;
     private AppWindow? _modalOwner;
+    /// <summary>Something in it is moving, so a timer has it drawn again about as often as the screen shows a new picture.</summary>
+    private bool _moving, _stillMoving;
+    private static readonly IntPtr MotionTimer = 1;
+    /// <summary>When what's shown came on, as it fades in from the background, and the picture of it that's faded in, drawn once as it came
+    /// on, as drawing all of it again every moment would take longer than a moment.</summary>
+    private double _fadeSince = -1;
+    private IntPtr _keptDc, _keptBitmap, _keptOld;
+    private int _keptWidth, _keptHeight;
+    /// <summary>For tests: how long each picture took to draw while something moved, added to this file.</summary>
+    private static readonly string? FrameLog = Environment.GetEnvironmentVariable("HACBREWPACKLZ_GUI_FRAMES");
 
     public int Dpi { get; private set; } = 96;
     public int ClientWidth { get; private set; }
@@ -93,6 +109,19 @@ internal abstract class AppWindow : NativeWindow
     protected virtual bool OnKey(int key) => false;
     protected virtual void OnMessageFromWorker() { }
     protected virtual void OnThemeChanged() { }
+    /// <summary>Each moment while something moves, before it's drawn again.</summary>
+    protected virtual void OnFrame() { }
+
+    /// <summary>Said while drawing: something drawn is on its way somewhere, so it's drawn again in a moment.</summary>
+    public void StillMoving() => _stillMoving = true;
+
+    /// <summary>What's shown now fades in from the background for a moment, as a new screen does on the Switch, once the window is on the screen.</summary>
+    protected void FadeIn()
+    {
+        _fadeSince = Win32.IsWindowVisible(Handle) && Motion.On ? Motion.Now : -1;
+        // A picture of what was shown before isn't what's coming on.
+        ReleaseKept();
+    }
 
     public T Add<T>(T widget) where T : Widget
     {
@@ -131,9 +160,9 @@ internal abstract class AppWindow : NativeWindow
         CenterOn(owner, S(width), S(height));
     }
 
-    protected void CreatePopup(AppWindow owner)
+    protected void CreatePopup(AppWindow owner, uint exStyle = 0)
     {
-        CreateNative("", Win32.WS_POPUP | Win32.WS_CLIPCHILDREN, Win32.WS_EX_TOOLWINDOW, owner.Handle, popup: true);
+        CreateNative("", Win32.WS_POPUP | Win32.WS_CLIPCHILDREN, Win32.WS_EX_TOOLWINDOW | exStyle, owner.Handle, popup: true);
         Dpi = owner.Dpi;
         int corners = Win32.CornerRoundSmall;
         Win32.DwmSetWindowAttribute(Handle, Win32.DWMWA_WINDOW_CORNER_PREFERENCE, ref corners, sizeof(int));
@@ -232,6 +261,13 @@ internal abstract class AppWindow : NativeWindow
             case Win32.WM_LBUTTONUP:
                 HandleMouseUp(Win32.Low(lParam), Win32.High(lParam));
                 return 0;
+            case Win32.WM_RBUTTONUP:
+                if (WidgetAt(Win32.Low(lParam), Win32.High(lParam)) is { } clicked)
+                {
+                    clicked.RightClick(Win32.Low(lParam), Win32.High(lParam));
+                    Invalidate();
+                }
+                return 0;
             case Win32.WM_MOUSEMOVE:
                 HandleMouseMove(Win32.Low(lParam), Win32.High(lParam));
                 return 0;
@@ -251,6 +287,7 @@ internal abstract class AppWindow : NativeWindow
                 return 0;
             case Win32.WM_SETTINGCHANGE:
                 Theme.Refresh();
+                Motion.Refresh();
                 ApplyTitleBarTheme();
                 OnThemeChanged();
                 Invalidate();
@@ -264,6 +301,10 @@ internal abstract class AppWindow : NativeWindow
                 return 0;
             case Win32.WM_APP + 1:
                 OnMessageFromWorker();
+                return 0;
+            case Win32.WM_TIMER when wParam == MotionTimer:
+                OnFrame();
+                Invalidate();
                 return 0;
             case Win32.WM_CLOSE:
                 // Whatever is open over this window goes first.
@@ -339,10 +380,15 @@ internal abstract class AppWindow : NativeWindow
 
     private void Paint()
     {
+        long started = FrameLog is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
         Win32.BeginPaint(Handle, out var paint);
         EnsureBuffer();
-        using (var g = new Gfx(_bufferDc, Dpi))
+        _stillMoving = false;
+        double fading = Motion.Along(_fadeSince, Motion.FadeTime);
+        bool fromKept = fading < 1 && _keptDc != IntPtr.Zero && _keptWidth == ClientWidth && _keptHeight == ClientHeight;
+        if (!fromKept)
         {
+            using var g = new Gfx(_bufferDc, Dpi);
             g.Fill(new Rect(0, 0, ClientWidth, ClientHeight), Theme.P.Background);
             PaintWindow(g);
             foreach (var widget in _widgets)
@@ -357,8 +403,34 @@ internal abstract class AppWindow : NativeWindow
             }
             PaintOver(g);
         }
+        if (fading < 1)
+        {
+            // What came on, drawn once and kept, shows through the background as far as it's faded in.
+            if (!fromKept)
+                Keep();
+            using (var g = new Gfx(_bufferDc, Dpi))
+                g.Fill(new Rect(0, 0, ClientWidth, ClientHeight), Theme.P.Background);
+            Win32.GdiAlphaBlend(_bufferDc, 0, 0, ClientWidth, ClientHeight, _keptDc, 0, 0, ClientWidth, ClientHeight, (uint)Math.Round(255 * fading) << 16);
+            StillMoving();
+        }
+        else if (_fadeSince >= 0)
+        {
+            _fadeSince = -1;
+            ReleaseKept();
+        }
         Win32.BitBlt(paint.Dc, 0, 0, ClientWidth, ClientHeight, _bufferDc, 0, 0, Win32.SRCCOPY);
         Win32.EndPaint(Handle, ref paint);
+        if (FrameLog is not null && (_moving || _stillMoving))
+            File.AppendAllText(FrameLog, $"{GetType().Name} at {Motion.Now:0.000} s took {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:0.0} ms{(fading < 1 ? fromKept ? " fading" : " fading, drawn" : "")}\n");
+        // Windows asks for a new picture only when something has changed, so while anything moves, a timer asks every moment.
+        if (_stillMoving != _moving)
+        {
+            _moving = _stillMoving;
+            if (_moving)
+                Win32.SetTimer(Handle, MotionTimer, 10, IntPtr.Zero);
+            else
+                Win32.KillTimer(Handle, MotionTimer);
+        }
     }
 
     protected virtual void PaintOver(Gfx g) { }
@@ -377,8 +449,33 @@ internal abstract class AppWindow : NativeWindow
         Win32.ReleaseDC(Handle, screen);
     }
 
+    /// <summary>A copy of what's just been drawn, to fade in.</summary>
+    private void Keep()
+    {
+        ReleaseKept();
+        var screen = Win32.GetDC(Handle);
+        _keptDc = Win32.CreateCompatibleDC(screen);
+        _keptWidth = ClientWidth;
+        _keptHeight = ClientHeight;
+        _keptBitmap = Win32.CreateCompatibleBitmap(screen, Math.Max(_keptWidth, 1), Math.Max(_keptHeight, 1));
+        _keptOld = Win32.SelectObject(_keptDc, _keptBitmap);
+        Win32.ReleaseDC(Handle, screen);
+        Win32.BitBlt(_keptDc, 0, 0, _keptWidth, _keptHeight, _bufferDc, 0, 0, Win32.SRCCOPY);
+    }
+
+    private void ReleaseKept()
+    {
+        if (_keptDc == IntPtr.Zero)
+            return;
+        Win32.SelectObject(_keptDc, _keptOld);
+        Win32.DeleteObject(_keptBitmap);
+        Win32.DeleteDC(_keptDc);
+        _keptDc = IntPtr.Zero;
+    }
+
     private void ReleaseBuffer()
     {
+        ReleaseKept();
         if (_bufferDc == IntPtr.Zero)
             return;
         Win32.SelectObject(_bufferDc, _bufferOld);

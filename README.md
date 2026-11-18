@@ -1,15 +1,15 @@
 # HacBrewPackLZ 汉化版
 
-> 简体中文界面 · 功能增强 · 免安装 .NET 8 的 Windows 单文件版 · Switch NRO 全量汉化
+> 简体中文界面 · 功能增强 · 免安装 .NET 10 的 Windows 单文件版 · Switch NRO 全量汉化
 >
-> 上游项目：[hacBrewPackLZ 1.4.3](https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz)（GNU GPL-2.0）
+> 上游项目：[hacBrewPackLZ 1.5.1](https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz)（GNU GPL-2.0）
 > 汉化与增强：[illyasever](https://space.bilibili.com/36010)
-> 当前版本：**v16**（2026-11-09）
+> 当前版本：**v26**（2026-11-18）
 
 把 Nintendo Switch 游戏**变小**的工具：把 NSP / NSZ / XCI / XCZ 重建为数据经过 LZ4 压缩的 NSP。
 LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无需解包，也绝不改动原始文件。
 
-本仓库是上游 1.4.3 的**简体中文汉化与功能增强版**，包含完整可编译的修改后源码、
+本仓库是上游 1.5.1 的**简体中文汉化与功能增强版**，包含完整可编译的修改后源码、
 原始上游源码快照（ZIP）、界面截图与逐版更新日志。上游仓库保持零改动，
 所有修改均以精确字节补丁方式应用在本仓库源码上，编译产物与密钥一律不入库。
 
@@ -22,7 +22,7 @@ LZ4 是主机固件原生支持的 NCA 压缩层，压缩后照常运行、无�
 | 文件 | 说明 |
 | --- | --- |
 | `hacBrewPackLZ_zh.nro` | Switch 端程序（放到 SD 卡 `/switch/` 下用 Homebrew Menu 启动） |
-| `hacbrewpacklz-gui_zh.exe` | Windows 图形界面，免安装 .NET 8 |
+| `hacbrewpacklz-gui_zh.exe` | Windows 图形界面，免安装 .NET 10 |
 | `SHA256SUMS.txt` | 上述文件的校验和 |
 
 图形界面版双击即用；`prod.keys` 请自行准备，放在 exe 同目录或用 `-k` 指定。
@@ -127,7 +127,7 @@ hacbrewpacklz_zh.exe --help
 
 ### 交付形态
 
-- **免安装 .NET 8 的自包含单文件 EXE**（Windows x64，每个约 35 MB），无需安装任何运行时；
+- **免安装 .NET 10 的自包含单文件 EXE**（Windows x64，每个约 35 MB），无需安装任何运行时；
 - **完整中文的 Switch NRO**，与 PC 端同一版本迭代；
 - 每版附 ZIP、SHA256 校验和、逐项对照表与验证报告。
 
@@ -135,12 +135,12 @@ hacbrewpacklz_zh.exe --help
 
 ## 相对原始版本的优化
 
-上游基线为 GitLab 1.4.3。下表列出本汉化版相对原版的实际改动与验证依据：
+上游基线为 GitLab 1.5.1。下表列出本汉化版相对原版的实际改动与验证依据：
 
-| 维度 | 上游 1.4.3 原版 | 本汉化版 v11 | 依据 |
+| 维度 | 上游 1.5.1 原版 | 本汉化版 v26 | 依据 |
 | --- | --- | --- | --- |
 | 界面语言 | 全英文（GUI / CLI / TUI / NRO） | 简体中文全端覆盖，约 1200 条词条 | v1、v2、v8、v11 |
-| 运行依赖 | 需自行安装 .NET 8 运行时 | 自包含单文件 exe，免安装运行时（win-x64，约 35 MB/个） | v6 |
+| 运行依赖 | 需自行安装 .NET 10 运行时 | 自包含单文件 exe，免安装运行时（win-x64，约 38 MB/个） | v6 |
 | Switch NRO | 英文界面，中文长文本会横向溢出 | 全量汉化 + 按 UTF-8 码点断行（697px 单行 → 595px 两行） | v8 |
 | SDK / 密钥世代 | 下拉选 `0xD` 实际写入 `0xC`，密钥错代 | 写入 `revision + 1`，A/B 探针验证头部与外部显示一致 | v6 |
 | 合并本体 / 更新 / DLC | 分别处理 | 可合并为单一 NSP，内含多份 CNMT | v3 |
@@ -176,6 +176,21 @@ hacbrewpacklz_zh.exe --help
 | v14 | 修复 EXE 发送死锁（锁序反转）、NRO 输出目录误判、4 处漏译 | 77/77；EXE + NRO 双端重编 |
 | v15 | 实机反馈 7 项：journal 改名失败中断安装、装完仍留进度、插线等 30 s、多 NSP 播报错乱、详细信息拖窗卡顿、SDK 文案、默认 1024×768 | 105/105；双端重编，行为模拟 5/5 |
 | v16 | 装完后进度残留与状态栏冻结（时间函数缺时间推进） | 51/51；仅 EXE 重编，行为模拟 5/5 |
+| v17 | **跟随上游 GitLab v1.5.0 rebase**：重建全部既有汉化与自定义功能，NRO 帮助页与字体链同步 | 全量重编 + 逐条译文资产重建 |
+| v18～v19 | PC GUI 补译与功能重建、发送会话进度与列表残留修复、发送按钮显示状态修复 | 双端重编 + 行为级模拟 |
+| v20 | **跟随上游 v1.5.1 rebase**；整行配对译文语义错位扫描 | 五层断言（译文/功能/语义/模拟/二进制） |
+| v21 | **整合打包方案锁定**：弃用上游原生实现，恢复 1.4.3 起自建的每标题一份 CNMT 方案；GUI 布局幂等、日志栏不闪烁 | 双端行为模拟 120 帧零闪烁 |
+| v22 | NRO 50 张截图逐条补译、7 个中文帮助主题、简中共享字体回退链与按码点折行 | 31/31 三层取证 |
+| v23 | NRO 16 张截图补译、3 处帮助页换行；**NRO 整合打包对齐 EXE 自建方案**（按 ApplicationId 全量收集 DLC） | 58 项补丁 / 50/50 验证 |
+| v24 | 双端 9 张截图补译、空间提示措辞、`min→分钟` / `was→压缩前`、`over the network` 补译 | 24 项补丁 / 48/48 验证 |
+| v25 | NRO「游戏是否启动」确认框与同链路问题报告页补译（12 处可见 UI） | 10 项补丁 / 41/41 验证 |
+| v26 | **两端「关于」页撤销 NSC_BUILDER 致谢**（链接只留 GitHub 页），双端全量重编 | 7 项回退补丁 / 38/38 三层取证 |
+
+**v17～v26 累计要点**：跟随上游 1.5.0 → 1.5.1 两次 rebase 并重建全部汉化；
+整合打包固定为自建方案（按 ApplicationId 全量收集 DLC、每标题一份 CNMT，PC 与 Switch 一致）；
+USB 事务级互斥、发送服务心跳与自动刷新、按文件判定发送完成、journal 重试与直写兜底；
+简中系统共享字体回退链与中文按 UTF-8 码点折行；累计处理 50 + 16 + 9 + 1 张实机截图反馈；
+v26 起「关于」页只保留汉化作者与 B 站链接，NSC_BUILDER 致谢见下方「## 致谢」。
 
 完整明细见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -197,10 +212,10 @@ hacbrewpacklz_zh.exe --help
 
 ## 从源码编译
 
-环境：.NET 8 SDK（见 `global.json`），Windows x64。
+环境：.NET 10 SDK（见 `global.json`），Windows x64。
 
 ```bat
-:: 需 .NET 8 运行时的常规构建
+:: 需 .NET 10 运行时的常规构建
 dotnet build hacbrewpacklz.csproj -c Release
 dotnet build gui/hacbrewpacklz-gui.csproj -c Release
 
@@ -223,20 +238,20 @@ Switch 端 NRO 需要 devkitPro / libnx，编译方式见 `switch/README.md`。
 | 路径 | 内容 |
 | --- | --- |
 | `src/` | C# 核心：NCA / NSP / CNMT / LZ4 / 选项 / 会话 / 校验等（已汉化并增强） |
-| `gui/` | Win32 自绘图形界面（含新增 `AboutWindow.cs`） |
+| `gui/` | Win32 自绘图形界面（1.5.1 起分页重构，关于页在 `Pages.cs`） |
 | `switch/` | Switch 端 NRO 源码（C++，全量汉化 + 路径 ASCII 化 + USB 服务心跳） |
 | `docs/`、`tests/`、`selftest/`、`tools/`、`assets/` | 上游文档、测试、工具与资源 |
 | `screenshots/` | 本汉化版界面截图 |
 | `upstream/hacbrewpacklz-upstream-source.zip` | **原始上游源码快照**（打包为 ZIP，已排除 `.git` 与二进制） |
 | `upstream/README-upstream.md` | 上游英文 README 原文 |
-| `CHANGELOG.md` | v1 → v16 逐版改动记录 |
+| `CHANGELOG.md` | v1 → v26 逐版改动记录 |
 | `LICENSE` | GNU GPL-2.0 原文 |
 
 ---
 
 ## 与上游的关系
 
-- **上游仓库**：<https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz>，版本 1.4.3，许可证 GPL-2.0。
+- **上游仓库**：<https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz>，版本 1.5.1，许可证 GPL-2.0。
 - 本仓库只做**本地化与功能增强**，不改动上游任何文件；`upstream/` 内的 ZIP 是原版源码原样快照，便于逐行对照。
 - 汉化采用「基线副本 + 精确字节补丁」流程：每版一份独立补丁脚本，编译前逐字节重放校验，
   编译后做 `#US` / `#Strings` 堆二进制核验、A-B 行为级反射验证、状态机行为模拟与无运行时实测。
@@ -262,4 +277,5 @@ Switch 端 NRO 需要 devkitPro / libnx，编译方式见 `switch/README.md`。
 ## 致谢
 
 - 上游作者与 [hacBrewPackLZ](https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz) 项目，GPL-2.0。
+- [NSC_BUILDER](https://github.com/whatobiplays/NSC_BUILDER) · 整合打包实现参考
 - 汉化作者：**illyasever** · <https://space.bilibili.com/36010>

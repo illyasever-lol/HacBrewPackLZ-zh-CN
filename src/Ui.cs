@@ -3,7 +3,7 @@ namespace HacBrewPackLz;
 internal static class AppInfo
 {
     public const string Name = "hacBrewPackLZ";
-    public const string Version = "1.4.3";
+    public const string Version = "1.5.1";
 }
 
 internal enum UiLevel
@@ -70,5 +70,5 @@ internal sealed class PlainSink : IUiSink
     }
 
     public void ProgressDone(string label, TimeSpan elapsed) =>
-        Console.WriteLine($"{label}: 完成时间 {elapsed.TotalSeconds:0.0}s");
+        Console.WriteLine($"{label}：完成，用时 {elapsed.TotalSeconds:0.0} 秒");
 }

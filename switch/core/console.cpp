@@ -1,7 +1,9 @@
 #include "console.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
+#include <set>
 
 namespace hbp {
 
@@ -217,44 +219,35 @@ struct Journal {
 std::string journalPath(const std::string& folder) { return folder + "/journal.txt"; }
 std::string journalTempPath(const std::string& folder) { return folder + "/journal.new"; }
 
-/// The new one is written beside the old, so there's always a whole one to find, whenever the power goes.
+/// The new one is written beside the old, so there's always a whole one to find, whenever the power goes. The file system won't rename over a
+/// file, so the old one has to be gone first, and if it can't be deleted, that's what's said, rather than that renaming failed.
 void saveJournal(const std::string& folder, const Journal& journal) {
     sys::makeDirectories(folder);
     std::string text = journal.text();
     std::string temp = journalTempPath(folder);
-    std::string target = journalPath(folder);
-    auto writeTo = [&](const std::string& path) {
+    {
+        sys::File file(temp, sys::File::Mode::Create);
+        file.write(0, text.data(), text.size());
+        file.flush();
+    }
+    sys::commit(temp);
+    std::string path = journalPath(folder);
+    // v15: 共享 FS 会话可能被扫描 / USB 线程占用，单次 removeFile 会失败并返回
+    // 2001-0106 (Svc InvalidCurrentMemory)，中断整个安装流程。重试后再直接覆写兜底。
+    bool removed = sys::removeFile(path);
+    for (int attempt = 0; !removed && attempt < 3; attempt++) {
+        sys::sleepMs(50);
+        removed = sys::removeFile(path);
+    }
+    if (!removed && sys::exists(path)) {
         sys::File file(path, sys::File::Mode::Create);
         file.write(0, text.data(), text.size());
         file.flush();
-    };
-    writeTo(temp);
-    sys::commit(temp);
-    // The SD-card FS session is shared with the file scan and the USB worker, so a
-    // single IPC can fail transiently; and libnx's rename never overwrites an
-    // existing target, unlike POSIX rename(). Retry the swap, then fall back to
-    // writing the fresh journal straight over the old one. A journal that can't be
-    // replaced only costs resume-after-power-cut; it must never abort an install
-    // whose content has already been placed. Same fallback as writeWholeFile().
-    bool swapped = false;
-    for (int attempt = 0; attempt < 3 && !swapped; attempt++) {
-        sys::removeFile(target);
-        try {
-            sys::renameFile(temp, target);
-            swapped = true;
-        } catch (const ToolError&) {
-            sys::sleepMs(10 * (attempt + 1));
-        }
+        sys::commit(path);
+        return;
     }
-    if (!swapped) {
-        try {
-            writeTo(target);
-        } catch (const ToolError&) {
-            // Leave the old journal in place rather than failing the install.
-        }
-        sys::removeFile(temp);
-    }
-    sys::commit(target);
+    sys::renameFile(temp, path);
+    sys::commit(path);
 }
 
 void clearJournal(const std::string& folder) {
@@ -264,7 +257,11 @@ void clearJournal(const std::string& folder) {
 }
 
 bool loadJournalFile(const std::string& path, Journal& journal) {
-    if (!sys::exists(path))
+    sys::Presence there = sys::presence(path);
+    // Not being able to tell isn't the same as there being none: taken that way, the only record of a game left half replaced was cleared away.
+    if (there == sys::Presence::CantTell)
+        throw ToolError(format("Couldn't check for an unfinished replacement in '%s', as the system turned the question down or gave an error", path.c_str()));
+    if (there == sys::Presence::Missing)
         return false;
     sys::File file(path, sys::File::Mode::Read);
     std::string text((size_t)file.size(), '\0');
@@ -317,7 +314,7 @@ public:
                 _image = _nca.openRomFsImage(*_nca.section(i), nullptr);
         }
         if (!_image)
-            throw ToolError(name + "没有游戏数据");
+            throw ToolError(name + " 没有游戏数据");
         RomFsArchive archive = RomFsArchive::open(_image, name);
         for (auto& file : archive.files)
             _files["/" + file.path] = file;
@@ -326,7 +323,7 @@ public:
     void read(const std::string& path, i64 offset, void* buffer, size_t size) override {
         auto found = _files.find(path);
         if (found == _files.end())
-            throw ToolError("游戏数据中没有此文件：" + path);
+            throw ToolError("游戏数据中没有此文件： " + path);
         if (offset + (i64)size > found->second.size)
             throw ToolError("读取超出游戏数据中的文件末尾");
         _image->read(found->second.offset + offset, buffer, size);
@@ -345,7 +342,7 @@ public:
     OwnLogo(SourcePtr raw, const std::string& name, const Keyset& keyset) : _tickets(keyset), _nca(std::move(raw), name, keyset, _tickets) {
         constexpr int LogoSection = 2;
         if (!_nca.section(LogoSection) || _nca.section(LogoSection)->fsType() != NcaFsSection::FsPartition)
-            throw ToolError(name + "没有启动画面");
+            throw ToolError(name + " 没有启动画面");
         _archive = _nca.openPfs0(*_nca.section(LogoSection), nullptr);
     }
 
@@ -354,11 +351,11 @@ public:
             if ("/" + file.name != path)
                 continue;
             if (offset + (i64)size > file.size)
-                throw ToolError("读取超出" + path);
+                throw ToolError("读取超出 " + path);
             _archive->open(file)->read(offset, buffer, size);
             return;
         }
-        throw ToolError("启动画面中没有此文件：" + path);
+        throw ToolError("启动画面中没有此文件： " + path);
     }
 
 private:
@@ -368,6 +365,104 @@ private:
 };
 
 /// Puts each NCA into the console's storage as it comes, keeping the journal up to date.
+/// Hands the console only whole blocks, at offsets that are a multiple of them. The console keeps an installed game on the SD card
+/// encrypted in 16 KB blocks, and a write that starts or ends inside one has that block read, decrypted, joined and written again. With the
+/// NCA's header region in front of the builder's 4 MB pieces, every seam between two of them fell inside a block, so each of those blocks
+/// was written twice. Here whole 4 MB blocks, a multiple of 16 KB and the size SD cards are made to be written in, are passed on as they
+/// fill. The first is kept until the end, as the header goes over it last of all, so it's written once too. What's written over a block
+/// that's been passed on already, or leaves a gap in one, is passed on as it is.
+class AlignedWriter : public ContentWriter {
+public:
+    explicit AlignedWriter(std::unique_ptr<ContentWriter> inner) : _inner(std::move(inner)) {}
+
+    std::string token() const override { return _inner->token(); }
+    void create() override { _inner->create(); }
+
+    void write(i64 offset, const void* data, size_t size) override {
+        const u8* in = (const u8*)data;
+        while (size > 0) {
+            i64 block = offset / Block;
+            size_t n = (size_t)std::min<i64>((i64)size, (block + 1) * Block - offset);
+            put(block, offset - block * Block, in, n);
+            offset += (i64)n;
+            in += n;
+            size -= n;
+        }
+    }
+
+    void setSize(i64 size) override {
+        passOnAll();
+        _inner->setSize(size);
+    }
+
+    void holdAs(const ContentId& temporary) override {
+        passOnAll();
+        _inner->holdAs(temporary);
+    }
+
+    void finishAs(const ContentId& id) override {
+        passOnAll();
+        _inner->finishAs(id);
+    }
+
+private:
+    static constexpr i64 Block = 4 << 20;
+
+    /// What's been written of a block not passed on yet: one run with no gaps in it.
+    struct Pending {
+        Bytes data;
+        i64 start = 0, end = 0;
+    };
+
+    void put(i64 block, i64 at, const u8* data, size_t n) {
+        i64 end = at + (i64)n;
+        if (_passed.count(block)) {
+            _inner->write(block * Block + at, data, n);
+            return;
+        }
+        auto found = _pending.find(block);
+        if (found == _pending.end()) {
+            Pending fresh;
+            fresh.data.resize((size_t)Block);
+            fresh.start = fresh.end = at;
+            found = _pending.emplace(block, std::move(fresh)).first;
+        }
+        Pending& pending = found->second;
+        if (at > pending.end || end < pending.start) {
+            // A gap: what's there goes as it is, and so does this.
+            passOn(block);
+            _inner->write(block * Block + at, data, n);
+            return;
+        }
+        memcpy(pending.data.data() + at, data, n);
+        pending.start = std::min(pending.start, at);
+        pending.end = std::max(pending.end, end);
+        if (block != 0 && pending.start == 0 && pending.end == Block)
+            passOn(block);
+    }
+
+    void passOn(i64 block) {
+        auto found = _pending.find(block);
+        if (found == _pending.end())
+            return;
+        Pending& pending = found->second;
+        if (pending.end > pending.start)
+            _inner->write(block * Block + pending.start, pending.data.data() + pending.start, (size_t)(pending.end - pending.start));
+        _pending.erase(found);
+        _passed.insert(block);
+    }
+
+    /// In order, so the console's writer sees the file grow as it would have.
+    void passOnAll() {
+        while (!_pending.empty())
+            passOn(_pending.begin()->first);
+    }
+
+    std::unique_ptr<ContentWriter> _inner;
+    std::map<i64, Pending> _pending;
+    std::set<i64> _passed;
+};
+
 class InstallOutput : public TitleOutput, private NcaStream {
 public:
     InstallOutput(ConsoleApi& console, Journal& journal, std::string journalFolder, const char* readBackAs = "正在逐字节校验新副本") : _console(console), _journal(journal), _journalFolder(std::move(journalFolder)), _readBackAs(readBackAs) {}
@@ -375,10 +470,13 @@ public:
     NcaStream& beginNca(const char*, i64 size, const char*) override {
         i64 free = _console.freeBytes(_journal.storage);
         if (free < size)
-            throw ToolError(format("%s 空间不足：还需 %s，目前仅剩 %s", storageName(_journal.storage), formatSize(size).c_str(), formatSize(free).c_str()));
-        _writer = _console.createContent(_journal.storage, size);
+            throw ToolError(format("There isn't enough room on %s: this needs %s more, and %s is free", storageName(_journal.storage), formatSize(size).c_str(), formatSize(free).c_str()));
+        _writer = std::make_unique<AlignedWriter>(_console.createContent(_journal.storage, size));
+        // Written down before it's made, so that a power cut in between leaves nothing on the card the journal doesn't know of. Clearing up
+        // passes over one that was never made.
         _journal.placeholders.push_back(_writer->token());
         saveJournal(_journalFolder, _journal);
+        _writer->create();
         _position = 0;
         _growing = size < 0;
         _held = nullptr;
@@ -495,7 +593,7 @@ void checkWritten(ConsoleApi& console, Storage storage, const std::vector<Instal
         hash.finish(result);
         auto expected = std::find_if(hashes.begin(), hashes.end(), [&](auto& h) { return h.first == content.id; });
         if (expected == hashes.end() || memcmp(result, expected->second.data(), 32) != 0)
-            throw ToolError(format("写入 %s 的内容回读不一致（%s），存储卡可能出现故障", storageName(storage), content.id.hex().c_str()));
+            throw ToolError(format("What was written to %s doesn't read back the same (%s). The card may be failing", storageName(storage), content.id.hex().c_str()));
     }
     progress.done();
 }
@@ -526,12 +624,12 @@ void compareGameData(FirmwareView& view, const SourcePtr& image, const std::stri
             image->read(file.offset + at, mine.data(), n);
             view.read("/" + file.path, at, theirs.data(), n);
             if (memcmp(mine.data(), theirs.data(), n) != 0)
-                throw ToolError(format("新副本回读的 %s 与原文件不一致，因此保留原文件", file.path.c_str()));
+                throw ToolError(format("The new copy reads %s differently from the original, so the original stays", file.path.c_str()));
         }
         progress.report(++checked);
     }
     progress.done();
-    sink().message(format("已回读 %d 个文件（%s），内容一致", checked, what.c_str()));
+    sink().message(format("Read %d files of %s back, and they're the same", checked, what.c_str()));
 }
 
 bool romFsSectionOf(const ContentPair& content, SectionSource& source) {
@@ -542,7 +640,11 @@ bool romFsSectionOf(const ContentPair& content, SectionSource& source) {
     return false;
 }
 
-constexpr const char* FirmwareRefusal = "本主机固件无法读取压缩游戏，因此未作任何改动。需要 12.0.0 或更高版本固件及 sigpatches。";
+constexpr const char* FirmwareRefusal = "This console can't start compressed games yet, so nothing was changed. It needs sigpatches, and system version 12.0.0 or newer. ";
+
+/// Whether the firmware may be why a copy couldn't be mounted or read through it. The card turning a request down, or not answering, is no fault
+/// of the firmware's, goes through later on, and is said as it is: said as the firmware, the job stopped for good on what was only passing.
+static bool firmwareMayBeWhy(const std::string& message) { return !refusedBySystem(message) && message.find("(2001-0123)") == std::string::npos; }
 
 /// The ID the test copy goes by. It has nothing to do with any game, so that no game can get in the way of it.
 constexpr u64 TestCopyId = 0x01FFFFFFFFFFF000ull;
@@ -566,7 +668,7 @@ void checkLogo(ConsoleApi& console, Storage storage, const ContentId& id, const 
         mine = readLogoOf(raw, id.hex(), keyset);
         theirs = console.mountLogo(storage, id, programId);
     } catch (const ToolError& e) {
-        sink().message(std::string("未向固件查询新副本的启动画面：") + e.what());
+        sink().message(std::string("未向固件查询新副本的启动画面： ") + e.what());
         return;
     }
     static const char* const files[] = {"/NintendoLogo.png", "/StartupMovie.gif"};
@@ -576,11 +678,11 @@ void checkLogo(ConsoleApi& console, Storage storage, const ContentId& id, const 
             mine->read(file, 0, a.data(), 0x400);
             theirs->read(file, 0, b.data(), 0x400);
         } catch (const ToolError& e) {
-            sink().message(format("未能向固件查询 %s：%s", file, e.what()));
+            sink().message(format("The firmware wasn't asked about %s: %s", file, e.what()));
             continue;
         }
         if (memcmp(a.data(), b.data(), 0x400) != 0)
-            throw ToolError(format("固件读取的 %s 与写入内容不一致，因此保留原文件", file));
+            throw ToolError(format("The firmware reads %s differently from what was written, so the original stays", file));
     }
     sink().message("固件已接受新副本");
 }
@@ -600,7 +702,9 @@ void checkNewCopy(ConsoleApi& console, const TitleJob& job, const Journal& journ
             SourcePtr raw = console.openContent(journal.storage, candidate.id, candidate.size);
             TicketStore none(keyset);
             NcaFile rebuilt(raw, candidate.id.hex() + ".nca", keyset, none);
-            if (rebuilt.contentType() != original.contentType() || rebuilt.contentIndex() != original.contentIndex())
+            // A game with several programs has a Program for each, all with content index 0, so the program ID tells them apart.
+            if (rebuilt.contentType() != original.contentType() || rebuilt.contentIndex() != original.contentIndex() ||
+                rebuilt.programId() != original.programId())
                 continue;
             found = true;
 
@@ -609,14 +713,18 @@ void checkNewCopy(ConsoleApi& console, const TitleJob& job, const Journal& journ
                 std::unique_ptr<FirmwareView> view;
                 try {
                     view = console.mountGameData(journal.storage, candidate.id, rebuilt.programId());
+                } catch (const DamagedFileSystem&) {
+                    throw;
                 } catch (const ToolError& e) {
+                    if (!firmwareMayBeWhy(e.what()))
+                        throw;
                     throw ToolError(FirmwareRefusal + std::string(e.what()));
                 }
-                compareGameData(*view, image, candidate.id.hex(), "让固件回读");
+                compareGameData(*view, image, candidate.id.hex(), "Having the console read it back");
             } else {
                 checkLogo(console, journal.storage, candidate.id, raw, rebuilt.programId(), keyset);
                 auto view = readGameDataOf(raw, candidate.id.hex(), keyset);
-                compareGameData(*view, image, candidate.id.hex(), "正在回读校验新副本");
+                compareGameData(*view, image, candidate.id.hex(), "正在回读新副本");
             }
         }
         if (!found && !journal.kept.empty())
@@ -637,7 +745,7 @@ void checkBuiltCopy(ConsoleApi& console, const ExtractedGame& game, const Journa
             continue;
         checkLogo(console, journal.storage, candidate.id, raw, rebuilt.programId(), keyset);
         auto view = readGameDataOf(raw, candidate.id.hex(), keyset);
-        compareGameData(*view, image, candidate.id.hex(), "正在回读校验新副本");
+        compareGameData(*view, image, candidate.id.hex(), "正在回读新副本");
     }
 }
 
@@ -650,6 +758,10 @@ ReplaceResult replaceTitle(ConsoleApi& console, const std::string& journalFolder
     journal.applicationId = game.applicationId;
     journal.storage = Storage::None;
     for (auto& meta : game.metas) {
+        // A game card's copy can't go anywhere, and isn't installed: the new copy is installed beside it, and its records stay, which is how
+        // the system has a game on a card that's installed as well.
+        if (meta.storage == Storage::GameCard)
+            continue;
         // Whatever version of the title is there goes, along with a base game's update: the new copy takes over from both.
         bool isMain = meta.key.id == titleId && meta.key.type == type;
         bool isUpdate = ownUpdate != 0 && meta.key.id == ownUpdate && meta.key.type == Cnmt::MetaPatch;
@@ -667,7 +779,7 @@ ReplaceResult replaceTitle(ConsoleApi& console, const std::string& journalFolder
     if (journal.storage == Storage::None)
         journal.storage = installTo;
     if (journal.storage != Storage::Sd && journal.storage != Storage::Nand)
-        throw ToolError(format("该游戏位于 %s，无法替换", storageName(journal.storage)));
+        throw ToolError(format("This title is on %s, so it can't be replaced", storageName(journal.storage)));
     saveJournal(journalFolder, journal);
 
     InstallOutput output(console, journal, journalFolder);
@@ -740,22 +852,27 @@ void Replacer::checkConsole(Storage storage, const ConvertOptions& options, cons
             try {
                 auto view = _console.mountGameData(storage, id, TestCopyId);
                 compareGameData(*view, image, "测试副本", Label);
+            } catch (const DamagedFileSystem&) {
+                throw;
             } catch (const ToolError& e) {
+                if (!firmwareMayBeWhy(e.what()))
+                    throw;
                 throw ToolError(FirmwareRefusal + std::string(e.what()));
             }
             undoWriting(_console, journal);
             clearJournal(_journalFolder);
             return;
         } catch (const ToolError& e) {
-            // The test copy goes either way, and something that's only passing is worth one more try.
-            sink().message(std::string("主机检查未通过：") + e.what());
+            // The test copy goes either way, and something that's only passing is worth one more try. A damaged file system isn't, and
+            // trying again would only write more to it.
+            sink().message(std::string("主机检查未通过： ") + e.what());
             try {
                 undoWriting(_console, journal);
                 clearJournal(_journalFolder);
             } catch (const ToolError&) {
                 // It'll be finished next time the program starts.
             }
-            if (attempt >= Attempts)
+            if (attempt >= Attempts || saysFileSystemDamaged(e))
                 throw;
         } catch (const Cancelled&) {
             try {
@@ -778,13 +895,48 @@ static void letItStart(ConsoleApi& console, u64 applicationId) {
         }
         console.setLaunchVersion(applicationId, newest);
     } catch (const ToolError& e) {
-        sink().warning(std::string("无法告知主机要启动的版本：") + e.what());
+        sink().warning(std::string("无法告知主机要启动的版本： ") + e.what());
     }
 }
 
+/// The most the copy made in place of an installed game may ask of the system: what the console's record of the newest part being replaced
+/// says, as that's what it goes by before starting the game, and an installer such as DBI can have lowered it so this console starts it.
+/// An update coming from a file, rather than installed, still asks for what it says. Nothing known, it's what the game's files say.
+static u32 recordedRequiredSystem(ConsoleApi& console, const InstalledGame& game, const TitleJob& job) {
+    u64 titleId = job.main->meta.titleId, ownUpdate = job.isBaseGame() ? job.main->meta.linkedId() : 0;
+    const InstalledMeta* newest = nullptr;
+    for (auto& meta : game.metas) {
+        bool isMain = meta.key.id == titleId && meta.key.type == job.main->meta.type;
+        bool isUpdate = ownUpdate != 0 && meta.key.id == ownUpdate && meta.key.type == Cnmt::MetaPatch;
+        if (!(isMain || isUpdate) || (meta.key.type != Cnmt::MetaApplication && meta.key.type != Cnmt::MetaPatch))
+            continue;
+        if (!newest || meta.key.version > newest->key.version || (meta.key.version == newest->key.version && isUpdate))
+            newest = &meta;
+    }
+    if (!newest)
+        return UINT32_MAX;
+    u32 recorded = UINT32_MAX;
+    try {
+        Bytes record = console.getMeta(newest->storage, newest->key);
+        if (record.size() >= 8 + 0xC && rd16(record.data()) >= 0xC)
+            recorded = rd32(record.data() + 8 + 8);
+    } catch (const ToolError& e) {
+        sink().message(std::string("The console's record of what the game needs of the system couldn't be read: ") + e.what());
+        return UINT32_MAX;
+    }
+    bool updateInstalled = job.update && std::any_of(game.metas.begin(), game.metas.end(), [&](const InstalledMeta& m) {
+        return m.key.type == Cnmt::MetaPatch && m.key.id == job.update->meta.titleId && m.key.version == job.update->meta.version;
+    });
+    if (job.update && !updateInstalled)
+        recorded = std::max(recorded, job.update->meta.requiredSystemVersion());
+    return recorded;
+}
+
 ReplaceResult Replacer::run(const InstalledGame& game, const TitleJob& job, const ConvertOptions& options, const Keyset& keyset, Storage installTo) {
+    ConvertOptions inPlace = options;
+    inPlace.consoleRequiredSystem = recordedRequiredSystem(_console, game, job);
     ReplaceResult result = replaceTitle(
-        _console, _journalFolder, game, job.main->meta.titleId, job.main->meta.type, job.isBaseGame() ? job.main->meta.linkedId() : 0, options, installTo,
+        _console, _journalFolder, game, job.main->meta.titleId, job.main->meta.type, job.isBaseGame() ? job.main->meta.linkedId() : 0, inPlace, installTo,
         [&](const ConvertOptions& own, TitleOutput& output) { TitleConverter(own, keyset).run(job, output); },
         [&](const Journal& journal) { checkNewCopy(_console, job, journal, keyset); },
         [&] { job.releaseMemory(); });

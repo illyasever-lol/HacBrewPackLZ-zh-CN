@@ -116,6 +116,16 @@ internal sealed class NcaFsSection
     public long CompressionSize => BinaryPrimitives.ReadInt64LittleEndian(Header.AsSpan(0x180));
     public ReadOnlySpan<byte> CompressionHeader => Header.AsSpan(0x188, 0x10);
     public bool HasCompression => CompressionOffset != 0 && CompressionSize != 0;
+
+    /// <summary>Where the data level of its IVFC hash tree starts, past the hash levels, and how long it is.</summary>
+    public long DataLevelOffset => DataLevelField(0);
+    public long DataLevelSize => DataLevelField(8);
+
+    private long DataLevelField(int at)
+    {
+        int levels = BinaryPrimitives.ReadInt32LittleEndian(Header.AsSpan(0x14));
+        return levels >= 2 && levels <= 7 ? BinaryPrimitives.ReadInt64LittleEndian(Header.AsSpan(0x18 + (levels - 2) * 0x18 + at)) : 0;
+    }
 }
 
 /// <summary>
@@ -148,6 +158,9 @@ internal sealed class NcaFile
 
     /// <summary>Data that can only be read efficiently from front to back, which is the case for a solid NCZ.</summary>
     public bool ReadsInOrder => _ncz is { IsSolid: true };
+
+    /// <summary>Packed with Zstandard, as in an NSZ or XCZ, which the console can't read, so every installer unpacks it.</summary>
+    public bool Packed => _ncz is not null;
 
     public NcaFile(DataSource raw, string name, Keyset keyset, TicketStore tickets)
     {
@@ -214,19 +227,21 @@ internal sealed class NcaFile
 
     private DataSource OpenSparse(NcaFsSection section)
     {
-        if (_ncz is not null)
-            throw new ToolException($"{Name} section {section.Index} is only there in part, which can't be read from an NCZ");
         // With nothing listed, none of it is here at all, and the update has all of it.
         if (BinaryPrimitives.ReadInt32LittleEndian(section.SparseTableHeader[8..]) == 0)
             return new ZeroSource(section.Size);
 
-        long start = section.SparseDataOffset + section.SparseTableOffset, size = section.SparseTableSize;
-        if (section.SparseDataOffset < 0 || section.SparseTableOffset < 0 || size <= 0 || start + size > _raw.Length || size > int.MaxValue)
+        long size = section.SparseTableSize;
+        if (!Ranges.Fits(section.SparseDataOffset, section.SparseTableOffset, _raw.Length) || size <= 0 || size > int.MaxValue ||
+            !Ranges.Fits(section.SparseDataOffset + section.SparseTableOffset, size, _raw.Length))
             throw new ToolException($"{Name} section {section.Index} has a sparse table outside the file");
+        long start = section.SparseDataOffset + section.SparseTableOffset;
 
-        // Its table is encrypted where it now is, with a counter that says which time this section was cut down.
+        // Its table is encrypted where it now is, with a counter that says which time this section was cut down. The console decrypts it
+        // whatever the section's own data is, so a copy that keeps its data unencrypted still has it encrypted, and it's read the same way.
+        // An NCZ, as NXPress writes one of a game cut down (NCZSECT2), holds the table decrypted, as it does each piece.
         DataSource raw = new SubSource(_raw, start, size);
-        if (section.Encryption != NcaFsSection.EncryptNone)
+        if (_ncz is null)
             raw = new AesCtrSource(raw, ContentKey, start, ((ulong)section.SecureValue << 32) | ((uint)section.SparseGeneration << 16));
         var table = new byte[size];
         raw.Read(0, table, 0, table.Length);
@@ -242,9 +257,161 @@ internal sealed class NcaFile
         if (!section.HasIndirect)
             return physical;
 
-        DataSource? original = baseNca?.Sections[section.Index] is { } baseSection ? baseNca.OpenPhysical(baseSection) : null;
         var table = ReadMetaTable(section, section.IndirectOffset, section.IndirectSize);
+        DataSource? original = null;
+        if (baseNca?.Sections[section.Index] is { } baseSection)
+        {
+            original = baseNca.OpenAsOriginal(baseSection);
+            // A copy this compressed is read as the original was, which is what an update made for the original reads. An update made
+            // for the copy itself, as stored, reads it as it is: whichever its own hashes say it is, worked out once.
+            if (baseNca.IsRebuiltCompressed(baseSection) && baseNca.KeptOriginal.Count == 0)
+            {
+                if (!_readsStored.TryGetValue(section.Index, out bool stored))
+                {
+                    // An update this app made isn't encrypted, as an official one always is, and it was made for a copy as it's stored, which is
+                    // quick to see. Seeing whether an update reads a copy as its original was can take working out what the original had before
+                    // its data, over all of it, so that's only looked at first for an official update, which always reads the original.
+                    var asStored = new IndirectSource(baseNca.OpenPhysical(baseSection), physical, table, section.IndirectHeader, Name);
+                    stored = section.Encryption == NcaFsSection.EncryptNone
+                        ? Fits(section, asStored)
+                        : !Fits(section, new IndirectSource(original, physical, table, section.IndirectHeader, Name)) && Fits(section, asStored);
+                    _readsStored[section.Index] = stored;
+                }
+                if (stored)
+                    original = baseNca.OpenPhysical(baseSection);
+            }
+        }
         return new IndirectSource(original, physical, table, section.IndirectHeader, Name);
+    }
+
+    /// <summary>
+    /// What an update reads from this as its base game. An update is made against the original's stored bytes, which compressing
+    /// changes, but a compressed copy this tool made holds the very same game data. So the section is given as the original had it,
+    /// uncompressed, rebuilt from that, and the update fits it. The update's own hash tree says whether it really does.
+    /// </summary>
+    public DataSource OpenAsOriginal(NcaFsSection section)
+    {
+        if (KeptOriginal.FirstOrDefault(s => s.Index == section.Index) is { } kept)
+            return new KeptOriginalSource(OpenRomFsImage(section, null), kept, Name, IsRebuiltCompressed(section) ? "compressed" : "repacked");
+        return IsRebuiltCompressed(section) ? new UncompressedRomFsSource(OpenRomFsImage(section, null)) : OpenPhysical(section);
+    }
+
+    /// <summary>For a copy with an update in it already, where that update kept each part of the original, which a newer one reads.</summary>
+    public List<UpdateMap.Section> KeptOriginal { get; } = [];
+
+    /// <summary>
+    /// Where the parts of the original an update's section keeps as they were end up in the game data it makes. Through its table to
+    /// where it keeps them, and if it's compressed, through its compression table to where a stretch stored as it is ends up. What's
+    /// kept in its hash levels, or inside what it compresses, isn't there as it was, and is left out.
+    /// </summary>
+    public UpdateMap.Range[] KeptInImage(NcaFsSection section, NcaFile? baseNca)
+    {
+        long data = section.DataLevelOffset;
+        var kept = new List<(long virt, long original, long length)>();
+        foreach (var r in KeptFromOriginal(section))
+        {
+            long skip = Math.Max(data - r.Virtual, 0);
+            if (skip < r.Length)
+                kept.Add((r.Virtual + skip - data, r.Original + skip, r.Length - skip));
+        }
+        if (!section.HasCompression)
+            return [.. kept.Select(k => new UpdateMap.Range(k.original, k.virt, k.length))];
+
+        // The compression table is new data of the update's own, at the end of its data level.
+        var stream = new SubSource(OpenLogical(section, baseNca), data, section.DataLevelSize);
+        long offset = section.CompressionOffset, size = section.CompressionSize;
+        if (size <= 0 || size > int.MaxValue || !Ranges.Fits(offset, size, stream.Length))
+            throw new ToolException($"{Name} section {section.Index} has a compression table outside its data");
+        var table = new byte[size];
+        stream.Read(offset, table, 0, table.Length);
+        int count = BucketTree.ReadHeader(section.CompressionHeader, Name);
+        var virt = new long[count];
+        var phys = new long[count];
+        var types = new byte[count];
+        long end = BucketTree.EnumerateEntries(table, 0x18, count, Name, (i, e) =>
+        {
+            virt[i] = BinaryPrimitives.ReadInt64LittleEndian(e);
+            phys[i] = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
+            types[i] = e[0x10];
+        });
+        var stored = new List<(long phys, long length, long virt)>();
+        for (int i = 0; i < count; i++)
+        {
+            if (types[i] == 0)
+                stored.Add((phys[i], (i + 1 < count ? virt[i + 1] : end) - virt[i], virt[i]));
+        }
+        stored.Sort((a, b) => a.phys.CompareTo(b.phys));
+        var starts = stored.Select(s => s.phys).ToArray();
+
+        var ranges = new List<UpdateMap.Range>();
+        foreach (var (p, original, length) in kept)
+        {
+            int i = Array.BinarySearch(starts, p);
+            if (i < 0)
+                i = Math.Max(~i - 1, 0);
+            for (; i < stored.Count && stored[i].phys < p + length; i++)
+            {
+                long s = Math.Max(p, stored[i].phys), e = Math.Min(p + length, stored[i].phys + stored[i].length);
+                if (e > s)
+                    ranges.Add(new UpdateMap.Range(original + (s - p), stored[i].virt + (s - stored[i].phys), e - s));
+            }
+        }
+        return [.. ranges];
+    }
+
+    /// <summary>The parts of the original an update's section reads as they were, from its table, by where they are in the section.</summary>
+    private (long Virtual, long Original, long Length)[] KeptFromOriginal(NcaFsSection section)
+    {
+        const int EntrySize = 0x14;
+        var table = ReadMetaTable(section, section.IndirectOffset, section.IndirectSize);
+        int count = BucketTree.ReadHeader(section.IndirectHeader, Name);
+        var virt = new long[count];
+        var phys = new long[count];
+        var fromPatch = new bool[count];
+        long end = BucketTree.EnumerateEntries(table, EntrySize, count, Name, (i, e) =>
+        {
+            virt[i] = BinaryPrimitives.ReadInt64LittleEndian(e);
+            phys[i] = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
+            fromPatch[i] = BinaryPrimitives.ReadInt32LittleEndian(e[0x10..]) != 0;
+        });
+        var ranges = new List<(long, long, long)>();
+        for (int i = 0; i < count; i++)
+        {
+            if (!fromPatch[i])
+                ranges.Add((virt[i], phys[i], (i + 1 < count ? virt[i + 1] : end) - virt[i]));
+        }
+        return [.. ranges];
+    }
+
+    /// <summary>
+    /// Compressed by this tool, which only ever writes key generation 0. Its makers can't have compressed a game with that: compression came
+    /// with firmware 12, and games made for it have a far newer key generation. How the section is laid out doesn't say: versions before 1.4
+    /// put the hash levels first, as games their makers compressed do, and the ones since put the game data first, as it's written as it's made.
+    /// </summary>
+    public bool IsRebuiltCompressed(NcaFsSection section) =>
+        section.FsType == NcaFsSection.FsRomFs && section.HasCompression && !section.HasSparse && GenerationIndex == 0;
+
+    private readonly Dictionary<int, bool> _readsStored = [];
+
+    /// <summary>Whether a few blocks of an update's section that come from its base check out against its own hashes, read this way.</summary>
+    private bool Fits(NcaFsSection section, IndirectSource logical)
+    {
+        if (section.FsType != NcaFsSection.FsRomFs)
+            return true;
+        try
+        {
+            var data = OpenIntegrityData(section, logical, $"{Name} section {section.Index}", "", true);
+            long start = section.DataLevelOffset;
+            var fromBase = logical.FromOriginal().Where(v => v >= start && v - start < data.Length).ToList();
+            var one = new byte[1];
+            for (int i = 0; i < 8 && fromBase.Count > 0; i++)
+                data.Read(fromBase[fromBase.Count * i / 8] - start, one, 0, 1);
+            return true;
+        }
+        catch (ToolException)
+        {
+            return false;
+        }
     }
 
     /// <summary>The plain RomFS image of a section, with decompression and normally hash checking applied.</summary>
@@ -285,7 +452,7 @@ internal sealed class NcaFile
     /// <summary>The update tables always use plain AES-CTR with the section's own counter value.</summary>
     private byte[] ReadMetaTable(NcaFsSection section, long offset, long size)
     {
-        if (offset < 0 || size <= 0 || offset + size > section.Size || size > int.MaxValue)
+        if (size <= 0 || size > int.MaxValue || !Ranges.Fits(offset, size, section.Size))
             throw new ToolException($"{Name} section {section.Index} has an update table outside the section");
 
         DataSource raw = new SubSource(_raw, section.Offset, section.Size);
@@ -308,43 +475,130 @@ internal sealed class NcaFile
         // SHA-3 trees exist in the format but SHA-3 isn't available on every OS this runs on: read them unchecked.
         bool verify = wantVerify && section.HashType == NcaFsSection.HashIntegrity;
         if (wantVerify && !verify)
-            Ui.Warn($"{what} uses a SHA-3 hash tree, so its data can't be checked");
+            Ui.Warn($"{what} 使用 SHA-3 哈希树，无法校验其数据");
 
-        byte[] hashes = h.Slice(0xC8, 0x20).ToArray();
         int levels = layers - 1;
+        var offsets = new long[levels];
+        var sizes = new long[levels];
+        var orders = new int[levels];
         for (int level = 0; level < levels; level++)
         {
             var info = h[(0x18 + level * 0x18)..];
-            long offset = BinaryPrimitives.ReadInt64LittleEndian(info);
-            long size = BinaryPrimitives.ReadInt64LittleEndian(info[8..]);
-            int order = BinaryPrimitives.ReadInt32LittleEndian(info[0x10..]);
-            if (offset < 0 || size < 0 || offset + size > logical.Length || order < 9 || order > 24)
+            offsets[level] = BinaryPrimitives.ReadInt64LittleEndian(info);
+            sizes[level] = BinaryPrimitives.ReadInt64LittleEndian(info[8..]);
+            orders[level] = BinaryPrimitives.ReadInt32LittleEndian(info[0x10..]);
+            // A hash level is read whole, and a real one is at most a few hundred MB, even for the largest game.
+            if (!Ranges.Fits(offsets[level], sizes[level], logical.Length) || (level < levels - 1 && sizes[level] > MostHashLevel) || orders[level] < 9 || orders[level] > 24)
                 throw new ToolException($"{what} has an invalid IVFC level {level}");
+        }
 
-            if (level == levels - 1)
-            {
-                var data = new SubSource(logical, offset, size);
-                return verify ? new VerifiedSource(data, hashes, 1 << order, what, hint) : data;
-            }
-            if (!verify)
-                continue;
+        var data = new SubSource(logical, offsets[levels - 1], sizes[levels - 1]);
+        if (!verify)
+            return data;
 
-            var bytes = new byte[size];
-            logical.Read(offset, bytes, 0, bytes.Length);
-            VerifiedSource.CheckBlocks(new BytesSource(bytes), 0, size, hashes, 1 << order, what, hint);
+        // Of each hash level, only the blocks the data under it uses are checked, as those are all the console ever reads: a section its
+        // developer compressed has hash levels made for its game data uncompressed, which can end in blocks nothing uses, and those don't hold
+        // what their hashes say. Monument Valley's did, and it was taken as damaged.
+        var used = new long[levels];
+        long BlocksOf(long bytes, int level) => (bytes + (1L << orders[level]) - 1) >> orders[level];
+        used[levels - 1] = BlocksOf(sizes[levels - 1], levels - 1);
+        for (int level = levels - 2; level >= 0; level--)
+            used[level] = Math.Min(BlocksOf(sizes[level], level), BlocksOf(used[level + 1] * 0x20, level));
+
+        byte[] hashes = h.Slice(0xC8, 0x20).ToArray();
+        for (int level = 0; level < levels - 1; level++)
+        {
+            var bytes = new byte[sizes[level]];
+            logical.Read(offsets[level], bytes, 0, bytes.Length);
+            VerifiedSource.CheckBlocks(new BytesSource(bytes), 0, Math.Min(sizes[level], used[level] << orders[level]), hashes, 1 << orders[level], what, hint);
             hashes = bytes;
         }
-        throw new InvalidOperationException();
+        return new VerifiedSource(data, hashes, 1 << orders[levels - 1], what, hint);
     }
+
+    private const long MostHashLevel = 1L << 30;
 
     private DataSource OpenCompressed(NcaFsSection section, DataSource data)
     {
         long offset = section.CompressionOffset, size = section.CompressionSize;
-        if (offset < 0 || size <= 0 || offset + size > data.Length || size > int.MaxValue)
+        if (size <= 0 || size > int.MaxValue || !Ranges.Fits(offset, size, data.Length))
             throw new ToolException($"{Name} section {section.Index} has a compression table outside its data");
 
         var table = new byte[size];
         data.Read(offset, table, 0, table.Length);
         return new CompressedImageSource(new SubSource(data, 0, offset), table, section.CompressionHeader, Name);
+    }
+}
+
+/// <summary>
+/// A RomFS section as an uncompressed game has it, laid out as <see cref="Nca.RomFs"/> writes it and as the original was: the hash
+/// levels, then the image and its padding. The hash levels take a pass over the whole image, so they're only worked out if
+/// something reads them.
+/// </summary>
+internal sealed class UncompressedRomFsSource : DataSource
+{
+    private readonly DataSource _image;
+    private readonly long _levelsSize;
+    private readonly long _dataSize;
+    private readonly object _gate = new();
+    private byte[]? _levels;
+
+    public UncompressedRomFsSource(DataSource image)
+    {
+        _image = image;
+        _dataSize = image.Length + IvfcBuilder.PadSize(image.Length);
+        _levelsSize = IvfcBuilder.HashLevelsSize(_dataSize);
+    }
+
+    public override long Length => _levelsSize + _dataSize;
+    public override bool ReadsAtOnce => _image.ReadsAtOnce;
+
+    public override void Read(long offset, byte[] buffer, int bufferOffset, int count)
+    {
+        while (count > 0)
+        {
+            int n;
+            if (offset < _levelsSize)
+            {
+                n = (int)Math.Min(count, _levelsSize - offset);
+                Buffer.BlockCopy(Levels(), (int)offset, buffer, bufferOffset, n);
+            }
+            else if (offset - _levelsSize < _image.Length)
+            {
+                n = (int)Math.Min(count, _image.Length - (offset - _levelsSize));
+                _image.Read(offset - _levelsSize, buffer, bufferOffset, n);
+            }
+            else
+            {
+                n = count;
+                Array.Clear(buffer, bufferOffset, n);
+            }
+            offset += n;
+            bufferOffset += n;
+            count -= n;
+        }
+    }
+
+    public override void Release() => _image.Release();
+
+    private byte[] Levels()
+    {
+        lock (_gate)
+        {
+            if (_levels is not null)
+                return _levels;
+            var ivfc = new IvfcBuilder();
+            var buffer = new byte[IvfcBuilder.BlockSize * 512];
+            for (long position = 0; position < _dataSize;)
+            {
+                int n = (int)Math.Min(_dataSize - position, buffer.Length);
+                int fromImage = (int)Math.Min(n, Math.Max(_image.Length - position, 0));
+                _image.Read(position, buffer, 0, fromImage);
+                Array.Clear(buffer, fromImage, n - fromImage);
+                ivfc.Add(buffer, 0, n);
+                position += n;
+            }
+            return _levels = ivfc.Finish(_image.Length).HashLevels;
+        }
     }
 }

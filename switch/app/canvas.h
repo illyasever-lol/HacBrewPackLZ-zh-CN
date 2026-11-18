@@ -73,10 +73,14 @@ public:
     void image(const Image& image, int x, int y, int radius = 0);
     /// Soft shadow under a rounded card.
     void shadow(Rect r, int radius, int spread, Color color);
+    /// The whole screen as it is now, to put back later with restore, which is far less work than drawing it all again.
+    void keep(std::vector<u32>& into);
+    void restore(const std::vector<u32>& kept);
 
     /// Draws from a baseline. Returns where it ended.
     float text(Font& font, float x, float baseline, const std::string& text, float size, Color color, bool bold = false);
     /// Cut short with an ellipsis if it doesn't fit.
+    /// Text in the room there is: a little smaller when it's a little too long, and only cut short, with an ellipsis, when even that won't do.
     void textFit(Font& font, float x, float baseline, const std::string& text, float size, float maxWidth, Color color, bool bold = false);
     void textRight(Font& font, float right, float baseline, const std::string& text, float size, Color color, bool bold = false);
     void textCenter(Font& font, float center, float baseline, const std::string& text, float size, Color color, bool bold = false);
@@ -95,6 +99,8 @@ private:
 };
 
 std::string fitText(Font& font, const std::string& text, float size, float maxWidth, bool bold = false);
+/// Where text that had to be shortened to fit goes, while a frame is drawn, so the tests can say what was cut: nowhere when it's null.
+void setCutLog(std::vector<std::string>* log);
 std::vector<std::string> wrapText(Font& font, const std::string& text, float size, float maxWidth);
 
 }  // namespace hbp

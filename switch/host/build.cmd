@@ -10,9 +10,11 @@ set SW=%~dp0..
 set OUT=%~f1
 set FLAGS=/nologo /std:c++17 /O2 /EHsc /W3 /utf-8 /wd4267 /wd4244 /wd4996 /D_CRT_SECURE_NO_WARNINGS /D_SILENCE_CXX17_U8PATH_DEPRECATION_WARNING /DNOMINMAX /DWIN32_LEAN_AND_MEAN
 set CORE=%SW%\core\common.cpp %SW%\core\crypto.cpp %SW%\core\source.cpp %SW%\core\lz4.cpp %SW%\core\zstd.cpp %SW%\core\ncz.cpp %SW%\core\nca.cpp %SW%\core\nacp.cpp %SW%\core\ncaout.cpp %SW%\core\title.cpp %SW%\core\build.cpp %SW%\core\console.cpp %SW%\core\remote.cpp %SW%\host\host_sys.cpp %SW%\host\host_remote.cpp
-set APP=%SW%\app\canvas.cpp %SW%\app\app.cpp %SW%\app\app_saved.cpp %SW%\app\app_lists.cpp %SW%\app\app_work.cpp %SW%\app\app_actions.cpp %SW%\app\app_input.cpp %SW%\app\app_draw.cpp
+set APP=%SW%\app\canvas.cpp %SW%\app\app.cpp %SW%\app\app_saved.cpp %SW%\app\app_lists.cpp %SW%\app\app_work.cpp %SW%\app\app_actions.cpp %SW%\app\app_input.cpp %SW%\app\app_draw.cpp %SW%\app\app_help.cpp %SW%\app\app_problems.cpp %SW%\app\app_inside.cpp %SW%\app\app_picture.cpp %SW%\app\app_mono_font.cpp %SW%\app\app_built.cpp
 if not exist "%OUT%\obj" mkdir "%OUT%\obj"
-cl %FLAGS% /c /Fo:"%OUT%\obj\\" %CORE% %APP% %SW%\host\sim_console.cpp %SW%\host\hbptool.cpp %SW%\host\replace_test.cpp %SW%\host\app_test.cpp /MP4
+cl /nologo /O2 /W3 /std:c11 /c /Fo:"%OUT%\obj\\" %SW%\third_party\qrcodegen\qrcodegen.c
+if errorlevel 1 exit /b 1
+cl %FLAGS% /c /Fo:"%OUT%\obj\\" %CORE% %APP% %SW%\host\sim_console.cpp %SW%\host\hbptool.cpp %SW%\host\replace_test.cpp %SW%\host\app_test.cpp %SW%\host\app_check.cpp /MP4
 if errorlevel 1 exit /b 1
 cd /d "%OUT%\obj"
 set COREOBJ=common.obj crypto.obj source.obj lz4.obj zstd.obj ncz.obj nca.obj nacp.obj ncaout.obj title.obj build.obj console.obj remote.obj host_sys.obj host_remote.obj
@@ -20,5 +22,5 @@ link /nologo /OUT:"%OUT%\hbptool.exe" %COREOBJ% hbptool.obj
 if errorlevel 1 exit /b 1
 link /nologo /OUT:"%OUT%\replace_test.exe" %COREOBJ% sim_console.obj replace_test.obj
 if errorlevel 1 exit /b 1
-link /nologo /OUT:"%OUT%\app_test.exe" %COREOBJ% sim_console.obj canvas.obj app.obj app_saved.obj app_lists.obj app_work.obj app_actions.obj app_input.obj app_draw.obj app_test.obj ole32.lib oleaut32.lib windowscodecs.lib
+link /nologo /OUT:"%OUT%\app_test.exe" %COREOBJ% sim_console.obj canvas.obj app.obj app_saved.obj app_lists.obj app_work.obj app_actions.obj app_input.obj app_draw.obj app_help.obj app_problems.obj app_inside.obj app_picture.obj app_mono_font.obj app_built.obj qrcodegen.obj app_test.obj app_check.obj ole32.lib oleaut32.lib windowscodecs.lib /STACK:67108864
 exit /b %ERRORLEVEL%

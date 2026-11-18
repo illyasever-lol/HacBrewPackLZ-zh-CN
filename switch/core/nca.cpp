@@ -3,6 +3,8 @@
 #include <algorithm>
 
 #include "lz4.h"
+#include "ncaout.h"
+#include "sys.h"
 
 namespace hbp {
 
@@ -33,10 +35,10 @@ i64 entryStorageSize(int entries, int entrySize) { return entrySetCount(entries,
 
 int readHeader(const u8* header, const std::string& what) {
     if (rd32(header) != Magic || rd32(header + 4) > Version)
-        throw ToolError(what + "的 BKTR 表头无效");
+        throw ToolError(what + " 的 BKTR 表头无效");
     int entries = rdi32(header + 8);
     if (entries <= 0)
-        throw ToolError(what + "的 BKTR 表为空");
+        throw ToolError(what + " 的 BKTR 表为空");
     return entries;
 }
 
@@ -44,7 +46,7 @@ i64 enumerateEntries(const Bytes& table, int entrySize, int entryCount, const st
     i64 entryStorage = nodeStorageSize(entryCount, entrySize);
     int sets = entrySetCount(entryCount, entrySize);
     if (entryStorage + sets * (i64)NodeSize > (i64)table.size())
-        throw ToolError(what + "的 BKTR 表小于其条目数所需大小");
+        throw ToolError(what + " 的 BKTR 表小于其条目数所需大小");
 
     int perSet = (NodeSize - NodeHeaderSize) / entrySize;
     int seen = 0;
@@ -55,7 +57,7 @@ i64 enumerateEntries(const Bytes& table, int entrySize, int entryCount, const st
         int count = rdi32(node + 4);
         i64 setEnd = rdi64(node + 8);
         if (index != set || count <= 0 || count > perSet || seen + count > entryCount || setEnd < end)
-            throw ToolError(what + "的 BKTR 条目集已损坏");
+            throw ToolError(what + " 的 BKTR 条目集已损坏");
         for (int i = 0; i < count; i++)
             visit(seen + i, node + NodeHeaderSize + i * entrySize);
         seen += count;
@@ -338,12 +340,22 @@ public:
             else if (_original)
                 _original->read(source, out, n);
             else
-                throw ToolError(_name + "需要其本体游戏，但未提供");
+                throw ToolError(_name + " 需要其本体游戏，但未提供");
 
             offset += (i64)n;
             out += n;
             count -= n;
         }
+    }
+
+    /// Where each part read from the base game starts.
+    std::vector<i64> fromOriginal() const {
+        std::vector<i64> starts;
+        for (size_t i = 0; i < _virtual.size(); i++) {
+            if (!_fromPatch[i])
+                starts.push_back(_virtual[i]);
+        }
+        return starts;
     }
 
 private:
@@ -418,7 +430,7 @@ void checkBlocks(u8* buffer, size_t capacity, size_t length, i64 position, const
     size_t blocks = (length + (size_t)blockSize - 1) / (size_t)blockSize;
     i64 firstBlock = position / blockSize;
     if ((firstBlock + (i64)blocks) * HashSize > (i64)hashes.size())
-        throw ToolError(what + "：哈希表短于其数据所需长度，文件已损坏" + hint);
+        throw MismatchError(what + "：哈希表短于其数据所需长度，文件已损坏" + hint);
 
     if (length % (size_t)blockSize != 0) {
         size_t padding = (size_t)blockSize - length % (size_t)blockSize;
@@ -431,7 +443,7 @@ void checkBlocks(u8* buffer, size_t capacity, size_t length, i64 position, const
         u8 hash[HashSize];
         sha256(buffer + i * (size_t)blockSize, (size_t)blockSize, hash);
         if (memcmp(hash, hashes.data() + (firstBlock + (i64)i) * HashSize, HashSize) != 0)
-            throw ToolError(format("%s: hash check failed at offset 0x%llx. The file is damaged%s", what.c_str(), (long long)((firstBlock + (i64)i) * blockSize), hint.c_str()));
+            throw MismatchError(format("%s: hash check failed at offset 0x%llx. The file is damaged%s", what.c_str(), (long long)((firstBlock + (i64)i) * blockSize), hint.c_str()));
     }
 }
 
@@ -502,9 +514,11 @@ public:
     void read(i64 offset, void* buffer, size_t count) override {
         u8* out = (u8*)buffer;
         while (count > 0) {
-            _cursor = findEntry(_virtual, _end, offset, _cursor);
-            if (_cursor < 0)
+            // Kept only when it's found, as the other readers do.
+            int found = findEntry(_virtual, _end, offset, _cursor);
+            if (found < 0)
                 throw ToolError(format("%s: offset 0x%llx isn't covered by the compression table", _name.c_str(), (long long)offset));
+            _cursor = found;
 
             size_t entry = (size_t)_cursor;
             i64 entryEnd = entry + 1 < _virtual.size() ? _virtual[entry + 1] : _end;
@@ -519,7 +533,7 @@ public:
                     break;
                 case 3:
                     if (entryEnd - _virtual[entry] > INT32_MAX)
-                        throw ToolError(_name + "含有一个过大的压缩块");
+                        throw ToolError(_name + " 含有一个过大的压缩块");
                     loadBlock(_cursor, (int)(entryEnd - _virtual[entry]));
                     memcpy(out, _block.data() + inEntry, n);
                     break;
@@ -547,7 +561,7 @@ private:
         _blockEntry = -1;
         _data->read(_physical[(size_t)entry], _compressed.data(), (size_t)physicalSize);
         if (lz4Decode(_compressed.data(), physicalSize, _block.data(), virtualSize) != virtualSize)
-            throw ToolError(format("%s: compressed block at 0x%llx failed to decode", _name.c_str(), (long long)_virtual[(size_t)entry]));
+            throw MismatchError(format("%s: compressed block at 0x%llx failed to decode", _name.c_str(), (long long)_virtual[(size_t)entry]));
         _blockEntry = entry;
     }
 
@@ -578,7 +592,7 @@ NcaFile::NcaFile(SourcePtr raw, std::string name, const Keyset& keyset, const Ti
     _raw->read(0, _header.data(), _header.size());
     aesXts(keyset.headerKey(), _header.data(), _header.size(), false);
     if (memcmp(&_header[0x200], "NCA3", 4) != 0)
-        throw ToolError(_name + "不是可读的 NCA3，可能已损坏，或 header_key 有误");
+        throw ToolError(_name + " 不是可读的 NCA3，可能已损坏，或 header_key 有误");
 
     for (int i = 0; i < SectionCount; i++) {
         i64 start = rd32(&_header[0x240 + (size_t)i * 0x10]) * 0x200LL;
@@ -642,19 +656,21 @@ const Bytes& NcaFile::contentKey() {
 }
 
 SourcePtr NcaFile::openSparse(const NcaFsSection& section) {
-    if (_ncz)
-        throw ToolError(format("%s section %d is only there in part, which can't be read from an NCZ", _name.c_str(), section.index));
     // With nothing listed, none of it is here at all, and the update has all of it.
     if (rdi32(section.sparseTableHeader() + 8) == 0)
         return std::make_shared<ZeroSource>(section.size);
 
-    i64 start = section.sparseDataOffset() + section.sparseTableOffset(), size = section.sparseTableSize();
-    if (section.sparseDataOffset() < 0 || section.sparseTableOffset() < 0 || size <= 0 || start + size > _raw->length() || size > INT32_MAX)
+    i64 size = section.sparseTableSize();
+    if (!fitsWithin(section.sparseDataOffset(), section.sparseTableOffset(), _raw->length()) || size <= 0 || size > INT32_MAX ||
+        !fitsWithin(section.sparseDataOffset() + section.sparseTableOffset(), size, _raw->length()))
         throw ToolError(format("%s section %d has a sparse table outside the file", _name.c_str(), section.index));
+    i64 start = section.sparseDataOffset() + section.sparseTableOffset();
 
-    // Its table is encrypted where it now is, with a counter that says which time this section was cut down.
+    // Its table is encrypted where it now is, with a counter that says which time this section was cut down. The console decrypts it
+    // whatever the section's own data is, so a copy that keeps its data unencrypted still has it encrypted, and it's read the same way.
+    // An NCZ, as NXPress writes one of a game cut down (NCZSECT2), holds the table decrypted, as it does each piece.
     SourcePtr raw = std::make_shared<SubSource>(_raw, start, size);
-    if (section.encryption() != NcaFsSection::EncryptNone)
+    if (!_ncz)
         raw = std::make_shared<AesCtrSource>(raw, contentKey().data(), start, (u64)section.secureValue() << 32 | (u32)section.sparseGeneration() << 16);
     Bytes table((size_t)size);
     raw->read(0, table.data(), table.size());
@@ -691,11 +707,54 @@ SourcePtr NcaFile::openLogical(const NcaFsSection& section, NcaFile* baseNca) {
     if (!section.hasIndirect())
         return physical;
 
-    SourcePtr original;
-    if (baseNca && baseNca->section(section.index))
-        original = baseNca->openPhysical(*baseNca->section(section.index));
     Bytes table = readMetaTable(section, section.indirectOffset(), section.indirectSize());
+    SourcePtr original;
+    if (baseNca && baseNca->section(section.index)) {
+        const NcaFsSection& baseSection = *baseNca->section(section.index);
+        original = baseNca->openAsOriginal(baseSection);
+        // A copy this compressed is read as the original was, which is what an update made for the original reads. An update made for
+        // the copy itself, as stored, reads it as it is: whichever its own hashes say it is, worked out once.
+        if (baseNca->isRebuiltCompressed(baseSection) && baseNca->keptOriginal.empty()) {
+            sys::Lock lock(_choiceMutex);
+            auto known = _readsStored.find(section.index);
+            bool stored;
+            if (known != _readsStored.end()) {
+                stored = known->second;
+            } else {
+                // An update this app made isn't encrypted, as an official one always is, and it was made for a copy as it's stored, which is quick
+                // to see. Seeing whether an update reads a copy as its original was can take working out what the original had before its data,
+                // over all of it, so that's only looked at first for an official update, which always reads the original.
+                auto asStored = std::make_shared<IndirectSource>(baseNca->openPhysical(baseSection), physical, table, section.indirectHeader(), _name);
+                stored = section.encryption() == NcaFsSection::EncryptNone
+                             ? fits(section, asStored)
+                             : !fits(section, std::make_shared<IndirectSource>(original, physical, table, section.indirectHeader(), _name)) && fits(section, asStored);
+                _readsStored[section.index] = stored;
+            }
+            if (stored)
+                original = baseNca->openPhysical(baseSection);
+        }
+    }
     return std::make_shared<IndirectSource>(original, physical, table, section.indirectHeader(), _name);
+}
+
+bool NcaFile::fits(const NcaFsSection& section, const std::shared_ptr<DataSource>& logical) {
+    if (section.fsType() != NcaFsSection::FsRomFs)
+        return true;
+    try {
+        SourcePtr data = openIntegrityData(section, logical, format("%s section %d", _name.c_str(), section.index), "", true);
+        i64 start = section.dataLevelOffset();
+        std::vector<i64> fromBase;
+        for (i64 v : static_cast<IndirectSource*>(logical.get())->fromOriginal()) {
+            if (v >= start && v - start < data->length())
+                fromBase.push_back(v);
+        }
+        u8 one;
+        for (size_t i = 0; i < 8 && !fromBase.empty(); i++)
+            data->read(fromBase[fromBase.size() * i / 8] - start, &one, 1);
+        return true;
+    } catch (const ToolError&) {
+        return false;
+    }
 }
 
 SourcePtr NcaFile::openRomFsImage(const NcaFsSection& section, NcaFile* baseNca, bool verify) {
@@ -703,7 +762,7 @@ SourcePtr NcaFile::openRomFsImage(const NcaFsSection& section, NcaFile* baseNca,
         throw ToolError(format("%s section %d is not a RomFS", _name.c_str(), section.index));
 
     SourcePtr logical = openLogical(section, baseNca);
-    std::string hint = section.hasIndirect() ? "，或者该升级补丁不属于此本体游戏" : "";
+    std::string hint = section.hasIndirect() ? "，或者该更新补丁不属于此本体游戏" : "";
     std::string what = format("%s section %d", _name.c_str(), section.index);
     if (section.hashType() != NcaFsSection::HashIntegrity && section.hashType() != NcaFsSection::HashIntegritySha3)
         throw ToolError(format("%s has a RomFS with hash type %d, which isn't supported", what.c_str(), section.hashType()));
@@ -718,9 +777,210 @@ std::unique_ptr<Pfs0Archive> NcaFile::openPfs0(const NcaFsSection& section, NcaF
     return Pfs0Archive::open(logical, section, format("%s section %d", _name.c_str(), section.index), verify);
 }
 
+namespace {
+
+/// A RomFS section as an uncompressed game has it, laid out as Sections::romFs writes it and as the original was: the hash levels,
+/// then the image and its padding. The hash levels take a pass over the whole image, so they're only worked out if something reads them.
+class UncompressedRomFsSource : public DataSource {
+public:
+    explicit UncompressedRomFsSource(SourcePtr image) : _image(std::move(image)) {
+        _dataSize = _image->length() + IvfcBuilder::padSize(_image->length());
+        _levelsSize = IvfcBuilder::hashLevelsSize(_dataSize);
+    }
+
+    i64 length() const override { return _levelsSize + _dataSize; }
+    bool readsAtOnce() const override { return _image->readsAtOnce(); }
+
+    void read(i64 offset, void* buffer, size_t count) override {
+        u8* out = (u8*)buffer;
+        while (count > 0) {
+            size_t n;
+            if (offset < _levelsSize) {
+                n = (size_t)std::min<i64>((i64)count, _levelsSize - offset);
+                const Bytes& levels = this->levels();
+                memcpy(out, levels.data() + offset, n);
+            } else if (offset - _levelsSize < _image->length()) {
+                n = (size_t)std::min<i64>((i64)count, _image->length() - (offset - _levelsSize));
+                _image->read(offset - _levelsSize, out, n);
+            } else {
+                n = count;
+                memset(out, 0, n);
+            }
+            offset += (i64)n;
+            out += n;
+            count -= n;
+        }
+    }
+
+    void release() override { _image->release(); }
+
+private:
+    const Bytes& levels() {
+        sys::Lock lock(_mutex);
+        if (_ready)
+            return _levels;
+        IvfcBuilder ivfc;
+        Bytes buffer((size_t)IvfcBuilder::BlockSize * 512);
+        for (i64 position = 0; position < _dataSize;) {
+            // It goes over all of the game, which takes minutes on a console: being asked to stop has to stop it, or whatever waits on it
+            // waits all that time, as the screen did analyzing a game kept with an update this app made for it.
+            checkStop();
+            size_t n = (size_t)std::min<i64>(_dataSize - position, (i64)buffer.size());
+            size_t fromImage = (size_t)std::min<i64>((i64)n, std::max<i64>(_image->length() - position, 0));
+            _image->read(position, buffer.data(), fromImage);
+            memset(buffer.data() + fromImage, 0, n - fromImage);
+            ivfc.add(buffer.data(), n);
+            position += (i64)n;
+        }
+        _levels = ivfc.finish(_image->length()).hashLevels;
+        _ready = true;
+        return _levels;
+    }
+
+    SourcePtr _image;
+    i64 _dataSize = 0;
+    i64 _levelsSize = 0;
+    sys::Mutex _mutex;
+    bool _ready = false;
+    Bytes _levels;
+};
+
+/// The original game's section as an update reads it, from a copy that has an earlier update in it: each part the earlier update kept
+/// is where it put it, in the copy's game data. A part it didn't keep isn't there, and says so.
+class KeptOriginalSource : public DataSource {
+public:
+    /// kind is how the game it reads was made, "compressed" or "repacked", which a part it doesn't have is said with.
+    KeptOriginalSource(SourcePtr image, const KeptSection& kept, std::string name, const char* kind)
+        : _image(std::move(image)), _kept(kept), _name(std::move(name)), _kind(kind) {
+        std::stable_sort(_kept.ranges.begin(), _kept.ranges.end(), [](const KeptRange& a, const KeptRange& b) { return a.original < b.original; });
+        for (auto& range : _kept.ranges)
+            _length = std::max(_length, range.original + range.length);
+    }
+
+    i64 length() const override { return _length; }
+    bool readsAtOnce() const override { return _image->readsAtOnce(); }
+
+    void read(i64 offset, void* buffer, size_t count) override {
+        u8* out = (u8*)buffer;
+        auto& ranges = _kept.ranges;
+        while (count > 0) {
+            auto after = std::upper_bound(ranges.begin(), ranges.end(), offset, [](i64 value, const KeptRange& r) { return value < r.original; });
+            // Of the parts starting at or before it, one that reaches it: parts can overlap, as an update can take one part twice.
+            const KeptRange* found = nullptr;
+            for (auto it = after; it != ranges.begin() && !found;) {
+                --it;
+                if (offset < it->original + it->length)
+                    found = &*it;
+            }
+            if (!found)
+                throw MismatchError(_name + ": the update needs a part of the original game that the " + _kind + " game doesn't have");
+            size_t n = (size_t)std::min<i64>((i64)count, found->original + found->length - offset);
+            _image->read(found->image + (offset - found->original), out, n);
+            offset += (i64)n;
+            out += n;
+            count -= n;
+        }
+    }
+
+    void release() override { _image->release(); }
+
+private:
+    SourcePtr _image;
+    KeptSection _kept;
+    std::string _name;
+    std::string _kind;
+    i64 _length = 0;
+};
+
+}  // namespace
+
+SourcePtr NcaFile::openAsOriginal(const NcaFsSection& section) {
+    for (auto& kept : keptOriginal) {
+        if (kept.index == section.index)
+            return std::make_shared<KeptOriginalSource>(openRomFsImage(section, nullptr), kept, _name, isRebuiltCompressed(section) ? "compressed" : "repacked");
+    }
+    if (isRebuiltCompressed(section))
+        return std::make_shared<UncompressedRomFsSource>(openRomFsImage(section, nullptr));
+    return openPhysical(section);
+}
+
+bool NcaFile::isRebuiltCompressed(const NcaFsSection& section) const {
+    return section.fsType() == NcaFsSection::FsRomFs && section.hasCompression() && !section.hasSparse() && generationIndex() == 0;
+}
+
+std::vector<KeptRange> NcaFile::keptInImage(const NcaFsSection& section, NcaFile* baseNca) {
+    // The parts kept, by where they are in the section, as (where, original, length).
+    struct Kept {
+        i64 at, original, length;
+    };
+    std::vector<Kept> kept;
+    {
+        Bytes table = readMetaTable(section, section.indirectOffset(), section.indirectSize());
+        int count = BucketTree::readHeader(section.indirectHeader(), _name);
+        std::vector<i64> virt((size_t)count), phys((size_t)count);
+        std::vector<char> fromPatch((size_t)count);
+        i64 end = BucketTree::enumerateEntries(table, 0x14, count, _name, [&](int i, const u8* e) {
+            virt[(size_t)i] = rdi64(e);
+            phys[(size_t)i] = rdi64(e + 8);
+            fromPatch[(size_t)i] = rdi32(e + 0x10) != 0;
+        });
+        i64 data = section.dataLevelOffset();
+        for (size_t i = 0; i < (size_t)count; i++) {
+            if (fromPatch[i])
+                continue;
+            i64 length = (i + 1 < (size_t)count ? virt[i + 1] : end) - virt[i];
+            i64 skip = std::max<i64>(data - virt[i], 0);
+            if (skip < length)
+                kept.push_back(Kept{virt[i] + skip - data, phys[i] + skip, length - skip});
+        }
+    }
+    std::vector<KeptRange> ranges;
+    if (!section.hasCompression()) {
+        for (auto& k : kept)
+            ranges.push_back(KeptRange{k.original, k.at, k.length});
+        return ranges;
+    }
+
+    // The compression table is new data of the update's own, at the end of its data level.
+    SourcePtr stream = std::make_shared<SubSource>(openLogical(section, baseNca), section.dataLevelOffset(), section.dataLevelSize());
+    i64 offset = section.compressionOffset(), size = section.compressionSize();
+    if (size <= 0 || size > INT32_MAX || !fitsWithin(offset, size, stream->length()))
+        throw ToolError(format("%s section %d has a compression table outside its data", _name.c_str(), section.index));
+    Bytes table((size_t)size);
+    stream->read(offset, table.data(), table.size());
+    int count = BucketTree::readHeader(section.compressionHeader(), _name);
+    std::vector<i64> virt((size_t)count), phys((size_t)count);
+    std::vector<u8> types((size_t)count);
+    i64 end = BucketTree::enumerateEntries(table, 0x18, count, _name, [&](int i, const u8* e) {
+        virt[(size_t)i] = rdi64(e);
+        phys[(size_t)i] = rdi64(e + 8);
+        types[(size_t)i] = e[0x10];
+    });
+    struct Stored {
+        i64 phys, length, virt;
+    };
+    std::vector<Stored> stored;
+    for (size_t i = 0; i < (size_t)count; i++) {
+        if (types[i] == 0)
+            stored.push_back(Stored{phys[i], (i + 1 < (size_t)count ? virt[i + 1] : end) - virt[i], virt[i]});
+    }
+    std::stable_sort(stored.begin(), stored.end(), [](const Stored& a, const Stored& b) { return a.phys < b.phys; });
+    for (auto& k : kept) {
+        auto it = std::upper_bound(stored.begin(), stored.end(), k.at, [](i64 value, const Stored& s) { return value < s.phys; });
+        if (it != stored.begin())
+            --it;
+        for (; it != stored.end() && it->phys < k.at + k.length; ++it) {
+            i64 s = std::max(k.at, it->phys), e = std::min(k.at + k.length, it->phys + it->length);
+            if (e > s)
+                ranges.push_back(KeptRange{k.original + (s - k.at), it->virt + (s - it->phys), e - s});
+        }
+    }
+    return ranges;
+}
+
 /// The update tables always use plain AES-CTR with the section's own counter value.
 Bytes NcaFile::readMetaTable(const NcaFsSection& section, i64 offset, i64 size) {
-    if (offset < 0 || size <= 0 || offset + size > section.size || size > INT32_MAX)
+    if (size <= 0 || size > INT32_MAX || !fitsWithin(offset, size, section.size))
         throw ToolError(format("%s section %d has an update table outside the section", _name.c_str(), section.index));
 
     SourcePtr raw = std::make_shared<SubSource>(_raw, section.offset, section.size);
@@ -734,7 +994,7 @@ Bytes NcaFile::readMetaTable(const NcaFsSection& section, i64 offset, i64 size) 
 SourcePtr NcaFile::openIntegrityData(const NcaFsSection& section, SourcePtr logical, const std::string& what, const std::string& hint, bool wantVerify) {
     const u8* h = section.header.data();
     if (memcmp(h + 0x08, "IVFC", 4) != 0)
-        throw ToolError(what + "没有 IVFC 头");
+        throw ToolError(what + " 没有 IVFC 头");
     int layers = rdi32(h + 0x14);
     if (layers < 2 || layers > 7)
         throw ToolError(format("%s has %d IVFC layers", what.c_str(), layers));
@@ -742,42 +1002,54 @@ SourcePtr NcaFile::openIntegrityData(const NcaFsSection& section, SourcePtr logi
     // SHA-3 trees exist in the format, but aren't worth carrying an implementation for: read them unchecked.
     bool verify = wantVerify && section.hashType() == NcaFsSection::HashIntegrity;
     if (wantVerify && !verify)
-        sink().warning(what + "使用 SHA-3 哈希树，因此无法校验其数据");
+        sink().warning(what + " 使用 SHA-3 哈希树，因此无法校验其数据");
 
-    Bytes hashes(h + 0xC8, h + 0xE8);
     int levels = layers - 1;
+    std::vector<i64> offsets((size_t)levels), sizes((size_t)levels);
+    std::vector<int> orders((size_t)levels);
     for (int level = 0; level < levels; level++) {
         const u8* info = h + 0x18 + level * 0x18;
-        i64 offset = rdi64(info);
-        i64 size = rdi64(info + 8);
-        int order = rdi32(info + 0x10);
-        if (offset < 0 || size < 0 || offset + size > logical->length() || order < 9 || order > 24)
+        offsets[(size_t)level] = rdi64(info);
+        sizes[(size_t)level] = rdi64(info + 8);
+        orders[(size_t)level] = rdi32(info + 0x10);
+        // A hash level is read whole, and a real one is at most a few hundred MB, even for the largest game.
+        constexpr i64 MostHashLevel = 1LL << 30;
+        if (!fitsWithin(offsets[(size_t)level], sizes[(size_t)level], logical->length()) || (level < levels - 1 && sizes[(size_t)level] > MostHashLevel) ||
+            orders[(size_t)level] < 9 || orders[(size_t)level] > 24)
             throw ToolError(format("%s has an invalid IVFC level %d", what.c_str(), level));
+    }
 
-        if (level == levels - 1) {
-            SourcePtr data = std::make_shared<SubSource>(logical, offset, size);
-            if (!verify)
-                return data;
-            return std::make_shared<VerifiedSource>(data, std::move(hashes), 1 << order, what, hint);
-        }
-        if (!verify)
-            continue;
+    SourcePtr data = std::make_shared<SubSource>(logical, offsets[(size_t)levels - 1], sizes[(size_t)levels - 1]);
+    if (!verify)
+        return data;
 
-        int blockSize = 1 << order;
-        Bytes bytes((size_t)size);
-        logical->read(offset, bytes.data(), bytes.size());
+    // Of each hash level, only the blocks the data under it uses are checked, as those are all the console ever reads: a section its developer
+    // compressed has hash levels made for its game data uncompressed, which can end in blocks nothing uses, and those don't hold what their
+    // hashes say. Monument Valley's did, and it was taken as damaged.
+    auto blocksOf = [&](i64 bytes, int level) { return (bytes + (1LL << orders[(size_t)level]) - 1) >> orders[(size_t)level]; };
+    std::vector<i64> used((size_t)levels);
+    used[(size_t)levels - 1] = blocksOf(sizes[(size_t)levels - 1], levels - 1);
+    for (int level = levels - 2; level >= 0; level--)
+        used[(size_t)level] = std::min(blocksOf(sizes[(size_t)level], level), blocksOf(used[(size_t)level + 1] * HashSize, level));
+
+    Bytes hashes(h + 0xC8, h + 0xE8);
+    for (int level = 0; level < levels - 1; level++) {
+        int blockSize = 1 << orders[(size_t)level];
+        Bytes bytes((size_t)sizes[(size_t)level]);
+        logical->read(offsets[(size_t)level], bytes.data(), bytes.size());
         // Checked in a copy, so the padding a short last block gets doesn't end up in the hashes of the next level down.
-        Bytes padded((size_t)((size + blockSize - 1) / blockSize * blockSize));
-        memcpy(padded.data(), bytes.data(), bytes.size());
-        checkBlocks(padded.data(), padded.size(), bytes.size(), 0, hashes, blockSize, what, hint);
+        size_t checked = (size_t)std::min(sizes[(size_t)level], used[(size_t)level] * blockSize);
+        Bytes padded((checked + (size_t)blockSize - 1) / (size_t)blockSize * (size_t)blockSize);
+        memcpy(padded.data(), bytes.data(), checked);
+        checkBlocks(padded.data(), padded.size(), checked, 0, hashes, blockSize, what, hint);
         hashes = std::move(bytes);
     }
-    throw ToolError("内部错误：没有 IVFC 数据层");
+    return std::make_shared<VerifiedSource>(data, std::move(hashes), 1 << orders[(size_t)levels - 1], what, hint);
 }
 
 SourcePtr NcaFile::openCompressed(const NcaFsSection& section, SourcePtr data) {
     i64 offset = section.compressionOffset(), size = section.compressionSize();
-    if (offset < 0 || size <= 0 || offset + size > data->length() || size > INT32_MAX)
+    if (size <= 0 || size > INT32_MAX || !fitsWithin(offset, size, data->length()))
         throw ToolError(format("%s section %d has a compression table outside its data", _name.c_str(), section.index));
 
     Bytes table((size_t)size);
@@ -796,7 +1068,7 @@ Bytes Pfs0Archive::readAll(const Entry& entry) const {
 
 std::unique_ptr<Pfs0Archive> Pfs0Archive::open(SourcePtr logical, const NcaFsSection& section, const std::string& what, bool verify) {
     if (section.fsType() != NcaFsSection::FsPartition)
-        throw ToolError(what + "不是 PFS0");
+        throw ToolError(what + " 不是 PFS0");
     if (section.hashType() != NcaFsSection::HashSha256 && section.hashType() != NcaFsSection::HashSha3)
         throw ToolError(format("%s has a PFS0 with hash type %d, which isn't supported", what.c_str(), section.hashType()));
 
@@ -806,8 +1078,11 @@ std::unique_ptr<Pfs0Archive> Pfs0Archive::open(SourcePtr logical, const NcaFsSec
     i64 tableSize = rdi64(h + 0x38);
     i64 dataOffset = rdi64(h + 0x40);
     i64 dataSize = rdi64(h + 0x48);
-    if (blockSize <= 0 || tableOffset < 0 || tableSize < 0 || tableOffset + tableSize > logical->length() || dataOffset < 0 || dataSize < 0x10 || dataOffset + dataSize > logical->length())
-        throw ToolError(what + "的 PFS0 布局无效");
+    // The largest hash block taken: real ones are 4 or 64 KB, and a damaged one is read whole.
+    constexpr int MostBlock = 16 << 20;
+    if (blockSize <= 0 || blockSize > MostBlock || tableSize > MostTable || !fitsWithin(tableOffset, tableSize, logical->length()) || dataSize < 0x10 ||
+        !fitsWithin(dataOffset, dataSize, logical->length()))
+        throw ToolError(what + " 的 PFS0 布局无效");
 
     auto archive = std::make_unique<Pfs0Archive>();
     archive->_data = std::make_shared<SubSource>(logical, dataOffset, dataSize);
@@ -841,12 +1116,12 @@ void Pfs0Archive::readEntries(const std::string& what) {
     u8 head[0x10];
     _data->read(0, head, sizeof(head));
     if (memcmp(head, "PFS0", 4) != 0)
-        throw ToolError(what + "不以 PFS0 头开头");
+        throw ToolError(what + " 不以 PFS0 头开头");
     int count = rdi32(head + 4);
     int nameTable = rdi32(head + 8);
     i64 tableSize = count * 0x18LL + nameTable;
-    if (count < 0 || nameTable < 0 || 0x10 + tableSize > _data->length())
-        throw ToolError(what + "的 PFS0 头已损坏");
+    if (count < 0 || nameTable < 0 || nameTable > MostTable || !fitsWithin(0x10, tableSize, _data->length()))
+        throw ToolError(what + " 的 PFS0 头已损坏");
 
     Bytes table((size_t)tableSize);
     _data->read(0x10, table.data(), table.size());
@@ -857,8 +1132,8 @@ void Pfs0Archive::readEntries(const std::string& what) {
         i64 offset = rdi64(e);
         i64 size = rdi64(e + 8);
         int nameOffset = rdi32(e + 0x10);
-        if (offset < 0 || size < 0 || dataStart + offset + size > _data->length() || nameOffset < 0 || nameOffset >= nameTable)
-            throw ToolError(what + "的 PFS0 条目已损坏");
+        if (!fitsWithin(offset, size, _data->length() - dataStart) || nameOffset < 0 || nameOffset >= nameTable)
+            throw ToolError(what + " 的 PFS0 条目已损坏");
         const char* name = (const char*)names + nameOffset;
         std::string text(name, strnlen(name, (size_t)(nameTable - nameOffset)));
         LocalNames::checkEntryName(text, what);
@@ -872,8 +1147,8 @@ constexpr u32 RomFsEmpty = 0xFFFFFFFF;
 constexpr i64 MaxRomFsTable = 1LL << 30;
 
 const u8* tableSlice(const Bytes& table, i64 offset, i64 size, const std::string& what) {
-    if (offset < 0 || size < 0 || offset + size > (i64)table.size())
-        throw ToolError(what + "的 RomFS 表已损坏");
+    if (!fitsWithin(offset, size, (i64)table.size()))
+        throw ToolError(what + " 的 RomFS 表已损坏");
     return table.data() + offset;
 }
 
@@ -887,8 +1162,8 @@ std::string tableName(const Bytes& table, u32 entry, int sizeField, int nameFiel
 }
 
 Bytes readRomFsTable(const SourcePtr& image, i64 offset, i64 size, const std::string& what) {
-    if (offset < 0 || size < 0 || size > MaxRomFsTable || offset + size > image->length())
-        throw ToolError(what + "的 RomFS 头已损坏");
+    if (size > MaxRomFsTable || !fitsWithin(offset, size, image->length()))
+        throw ToolError(what + " 的 RomFS 头已损坏");
     Bytes table((size_t)size);
     image->read(offset, table.data(), table.size());
     return table;
@@ -899,15 +1174,17 @@ Bytes readRomFsTable(const SourcePtr& image, i64 offset, i64 size, const std::st
 RomFsArchive RomFsArchive::open(const SourcePtr& image, const std::string& what) {
     u8 head[0x50];
     if (image->length() < (i64)sizeof(head))
-        throw ToolError(what + "太小，无法容纳 RomFS");
+        throw ToolError(what + " 太小，无法容纳 RomFS");
     image->read(0, head, sizeof(head));
     auto field = [&](int i) { return rdi64(head + i * 8); };
     if (field(0) != 0x50)
-        throw ToolError(what + "不以 RomFS 头开头");
+        throw ToolError(what + " 不以 RomFS 头开头");
 
     Bytes dirs = readRomFsTable(image, field(3), field(4), what);
     Bytes files = readRomFsTable(image, field(7), field(8), what);
     i64 partition = field(9);
+    if (partition < 0 || partition > image->length())
+        throw ToolError(what + " 的 RomFS 头已损坏");
 
     RomFsArchive archive;
     std::set<u32> seenDirs, seenFiles;
@@ -917,15 +1194,15 @@ RomFsArchive RomFsArchive::open(const SourcePtr& image, const std::string& what)
         auto [dir, path] = pending.back();
         pending.pop_back();
         if (!seenDirs.insert(dir).second)
-            throw ToolError(what + "的目录表中存在循环");
+            throw ToolError(what + " 的目录表中存在循环");
 
         for (u32 file = tableField(dirs, dir, 0x0C, what); file != RomFsEmpty; file = tableField(files, file, 0x04, what)) {
             if (!seenFiles.insert(file).second)
-                throw ToolError(what + "的文件表中存在循环");
+                throw ToolError(what + " 的文件表中存在循环");
             std::string name = tableName(files, file, 0x1C, 0x20, what);
             i64 offset = rdi64(tableSlice(files, (i64)file + 0x08, 8, what));
             i64 size = rdi64(tableSlice(files, (i64)file + 0x10, 8, what));
-            if (offset < 0 || size < 0 || partition + offset + size > image->length())
+            if (!fitsWithin(offset, size, image->length() - partition))
                 throw ToolError(format("%s: file %s%s lies outside the RomFS", what.c_str(), path.c_str(), name.c_str()));
             archive.files.push_back(Entry{path + name, partition + offset, size});
         }
@@ -963,25 +1240,12 @@ std::string forFileSystem(const std::string& name) {
 }
 
 std::string forOutputName(const std::string& text) {
-    // The Switch only reliably handles ASCII paths. Game titles are often Chinese
-    // or Japanese, and this name becomes a folder (unpacked games) or a file name
-    // (NSPs), so fold every non-ASCII UTF-8 sequence into a single underscore.
-    // Pure-ASCII input produces exactly the same result as upstream.
-    std::string clean;
-    clean.reserve(text.size());
-    for (size_t i = 0; i < text.size();) {
-        unsigned char c = (unsigned char)text[i];
-        if (c >= 0x80) {
-            size_t width = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-            if (i + width > text.size())
-                width = 1;  // truncated sequence: consume one byte
-            i += width;
-            if (clean.empty() || clean.back() != '_')
-                clean += '_';
-            continue;
-        }
-        clean += (isBadCharacter((char)c) || c == '/' || c == '\\') ? '_' : (char)c;
-        ++i;
+    std::string clean = text;
+    for (char& c : clean) {
+        // The Switch's file system doesn't take non-ASCII names; a Chinese or Japanese
+        // game title must never become (part of) an output folder or file name.
+        if ((unsigned char)c >= 0x80 || isBadCharacter(c) || c == '/' || c == '\\')
+            c = '_';
     }
     while (!clean.empty() && (clean.back() == ' ' || clean.back() == '.'))
         clean.pop_back();

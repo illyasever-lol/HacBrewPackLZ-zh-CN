@@ -72,8 +72,12 @@ public:
     const u8* titleKey(const std::string& rightsIdHex) const;
     const u8* find(const std::string& name, size_t size) const;
     bool empty() const { return _keys.empty(); }
+    /// Every key's value in lowercase hex, so that whatever's shared can be made sure not to hold any of them.
+    std::vector<std::string> secrets() const;
 
 private:
+    void deriveMissing();
+
     std::map<std::string, Bytes> _keys;
     std::map<std::string, Bytes> _titleKeys;
 };

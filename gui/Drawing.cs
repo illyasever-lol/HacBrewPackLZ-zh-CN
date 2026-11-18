@@ -33,6 +33,22 @@ internal static class Fonts
     public static readonly Font Hero = new(18, Semibold);
 
     public static Font Icon(int size) => new(size, IconFamily);
+
+    /// <summary>For text and bytes inside a game, every character as wide as the others, as on the Switch.</summary>
+    public static readonly Font Mono = new(13, "Consolas");
+}
+
+/// <summary>What a game saves, on its bar: one green, stronger the more it saves, as on the Switch. A saving of 10% or less is the quietest,
+/// one of 60% or more the strongest, brighter on dark and deeper on light, so the bigger saving always stands out more from the track.</summary>
+internal static class SavingColor
+{
+    public static Rgb For(double saved)
+    {
+        double strength = Math.Clamp((saved - 0.10) / 0.50, 0, 1);
+        var (quiet, strong) = Theme.IsDark ? (Rgb.Hex(0x277448), Rgb.Hex(0x34C778)) : (Rgb.Hex(0x84C296), Rgb.Hex(0x189652));
+        byte Mix(byte a, byte b) => (byte)Math.Round(a + (b - a) * strength);
+        return new Rgb(Mix(quiet.R, strong.R), Mix(quiet.G, strong.G), Mix(quiet.B, strong.B));
+    }
 }
 
 /// <summary>Glyphs from Segoe MDL2 Assets, which every Windows 10 and 11 has.</summary>
@@ -52,6 +68,9 @@ internal static class Glyph
     public const char ChevronDown = '';
     public const char Stop = '';
     public const char Document = '';
+    public const char Send = '';
+    public const char Log = '';
+    public const char Back = '';
 }
 
 internal sealed record Palette(
@@ -63,10 +82,11 @@ internal sealed record Palette(
 internal static class Theme
 {
     // Text is at least 4.5:1 against whatever it's drawn on, and outlines of things to click at least 3:1.
+    // No pure white: cards are a soft off-white on a deeper grey, so a large window isn't glaring.
     private static readonly Palette Light = new(
-        Rgb.Hex(0xE6E8EB), Rgb.Hex(0xFFFFFF), Rgb.Hex(0xDADDE2), Rgb.Hex(0xCBCFD5), Rgb.Hex(0xC9CDD3), Rgb.Hex(0x868D96),
-        Rgb.Hex(0x15171A), Rgb.Hex(0x454A51), Rgb.Hex(0x61676F), Rgb.Hex(0x0A6878), Rgb.Hex(0x0B7285), Rgb.Hex(0x07505C), Rgb.Hex(0xFFFFFF),
-        Rgb.Hex(0x1B6E34), Rgb.Hex(0x865A00), Rgb.Hex(0xB42222), Rgb.Hex(0xFCE9C0));
+        Rgb.Hex(0xD8DBDF), Rgb.Hex(0xECEEF1), Rgb.Hex(0xDEE1E5), Rgb.Hex(0xCED2D7), Rgb.Hex(0xC3C7CD), Rgb.Hex(0x7A818A),
+        Rgb.Hex(0x15171A), Rgb.Hex(0x41464D), Rgb.Hex(0x5A6068), Rgb.Hex(0x0A6878), Rgb.Hex(0x0B7285), Rgb.Hex(0x07505C), Rgb.Hex(0xFFFFFF),
+        Rgb.Hex(0x1B6E34), Rgb.Hex(0x7C5400), Rgb.Hex(0xB42222), Rgb.Hex(0xF0DFB8));
 
     private static readonly Palette Dark = new(
         Rgb.Hex(0x1C1D20), Rgb.Hex(0x26282C), Rgb.Hex(0x2E3035), Rgb.Hex(0x36393E), Rgb.Hex(0x35383D), Rgb.Hex(0x50545B),
@@ -261,7 +281,7 @@ internal abstract unsafe class NativeWindow
             Win32.CW_USEDEFAULT, Win32.CW_USEDEFAULT, Win32.CW_USEDEFAULT, Win32.CW_USEDEFAULT, owner, IntPtr.Zero, Win32.GetModuleHandleW(null), IntPtr.Zero);
         t_creating = null;
         if (Handle == IntPtr.Zero)
-            throw new InvalidOperationException($"Couldn't create a window (error {Marshal.GetLastWin32Error()})");
+            throw new InvalidOperationException($"无法创建窗口（错误码 {Marshal.GetLastWin32Error()}）");
     }
 
     protected abstract IntPtr OnMessage(uint message, IntPtr wParam, IntPtr lParam);
@@ -291,7 +311,7 @@ internal abstract unsafe class NativeWindow
                     ClassName = (IntPtr)classNameChars,
                 };
                 if (Win32.RegisterClassExW(ref windowClass) == 0)
-                    throw new InvalidOperationException($"Couldn't register a window class (error {Marshal.GetLastWin32Error()})");
+                    throw new InvalidOperationException($"无法注册窗口类（错误码 {Marshal.GetLastWin32Error()}）");
             }
         }
     }
@@ -350,6 +370,46 @@ internal sealed class Picture : IDisposable
             release(stream);
         }
     }
+
+    /// <summary>
+    /// A picture as big as it is, or smaller to fit, keeping its shape; one smaller than the room is made bigger by whole steps, up to four
+    /// times, so it stays sharp, as on the Switch. Null if it isn't a picture GDI+ can read.
+    /// </summary>
+    public static unsafe Picture? DecodeFitted(byte[] data, int maxWidth, int maxHeight, out int width, out int height)
+    {
+        width = height = 0;
+        IntPtr stream = Win32.SHCreateMemStream(data, (uint)data.Length);
+        if (stream == IntPtr.Zero)
+            return null;
+        try
+        {
+            if (Win32.GdipCreateBitmapFromStream(stream, out IntPtr full) != 0)
+                return null;
+            try
+            {
+                if (Win32.GdipGetImageWidth(full, out uint w) != 0 || Win32.GdipGetImageHeight(full, out uint h) != 0 || w == 0 || h == 0)
+                    return null;
+                (width, height) = ((int)w, (int)h);
+                double scale = w > maxWidth || h > maxHeight ? Math.Min((double)maxWidth / w, (double)maxHeight / h)
+                    : Math.Max(1, Math.Min(Math.Min(maxWidth / (int)w, maxHeight / (int)h), 4));
+                uint fitW = (uint)Math.Max(1, Math.Round(w * scale)), fitH = (uint)Math.Max(1, Math.Round(h * scale));
+                return Win32.GdipGetImageThumbnail(full, fitW, fitH, out IntPtr fitted, IntPtr.Zero, IntPtr.Zero) == 0 ? new Picture(fitted) { Width = (int)fitW, Height = (int)fitH } : null;
+            }
+            finally
+            {
+                Win32.GdipDisposeImage(full);
+            }
+        }
+        finally
+        {
+            var release = (delegate* unmanaged[Stdcall]<IntPtr, uint>)(*(*(void***)stream + 2));
+            release(stream);
+        }
+    }
+
+    /// <summary>The size it's kept at, for a picture made by <see cref="DecodeFitted"/>.</summary>
+    public int Width { get; private init; }
+    public int Height { get; private init; }
 
     public void Dispose()
     {

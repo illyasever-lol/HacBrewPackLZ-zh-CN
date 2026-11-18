@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace hbp {
 
 Image Image::scaledTo(int width, int height) const {
@@ -952,9 +956,17 @@ float Font::measure(const std::string& text, float size, bool bold) {
     return width;
 }
 
+namespace {
+std::vector<std::string>* g_cutLog = nullptr;
+}
+
+void setCutLog(std::vector<std::string>* log) { g_cutLog = log; }
+
 std::string fitText(Font& font, const std::string& text, float size, float maxWidth, bool bold) {
     if (font.measure(text, size, bold) <= maxWidth)
         return text;
+    if (g_cutLog)
+        g_cutLog->push_back(text);
     static const std::string ellipsis = "\xE2\x80\xA6";
     float room = maxWidth - font.measure(ellipsis, size, bold);
     float width = 0;
@@ -1042,6 +1054,42 @@ static inline u32 blend(u32 d, Color c, u32 alpha) {
     return rb | g << 8 | 0xFF000000u;
 }
 
+/// `color` laid over a run of pixels at `alpha`. A screen darkened under a question or the menu is nearly a million of them, and on the console,
+/// where the compiler leaves this loop one pixel at a time, that took several milliseconds of a frame's 16.7: there it's four pixels at a time,
+/// every channel summed and rounded just as one at a time, so both give the same.
+static void blendSpan(u32* out, int count, Color color, u32 alpha) {
+    int i = 0;
+#if defined(__aarch64__)
+    uint8x8_t inverse = vdup_n_u8((u8)(255 - alpha));
+    const uint16_t add[8] = {(uint16_t)(color.r * alpha + 0x80), (uint16_t)(color.g * alpha + 0x80), (uint16_t)(color.b * alpha + 0x80), 0x80,
+                             (uint16_t)(color.r * alpha + 0x80), (uint16_t)(color.g * alpha + 0x80), (uint16_t)(color.b * alpha + 0x80), 0x80};
+    uint16x8_t base = vld1q_u16(add);
+    uint32x4_t opaque = vdupq_n_u32(0xFF000000u);
+    for (; i + 4 <= count; i += 4) {
+        uint8x16_t d = vreinterpretq_u8_u32(vld1q_u32(out + i));
+        uint16x8_t low = vmlal_u8(base, vget_low_u8(d), inverse);
+        uint16x8_t high = vmlal_u8(base, vget_high_u8(d), inverse);
+        uint8x16_t mixed = vcombine_u8(vshrn_n_u16(low, 8), vshrn_n_u16(high, 8));
+        vst1q_u32(out + i, vorrq_u32(vreinterpretq_u32_u8(mixed), opaque));
+    }
+#endif
+    for (; i < count; i++)
+        out[i] = blend(out[i], color, alpha);
+}
+
+void Canvas::keep(std::vector<u32>& into) {
+    into.resize((size_t)_w * _h);
+    for (int y = 0; y < _h; y++)
+        memcpy(into.data() + (size_t)y * _w, _pixels + (size_t)y * _stride, (size_t)_w * sizeof(u32));
+}
+
+void Canvas::restore(const std::vector<u32>& kept) {
+    if (kept.size() != (size_t)_w * _h)
+        return;
+    for (int y = 0; y < _h; y++)
+        memcpy(_pixels + (size_t)y * _stride, kept.data() + (size_t)y * _w, (size_t)_w * sizeof(u32));
+}
+
 void Canvas::clear(Color color) {
     u32 value = packed(color);
     for (int y = 0; y < _h; y++)
@@ -1055,12 +1103,10 @@ void Canvas::blendRow(int x, int y, int count, Color color) {
     if (x0 >= x1)
         return;
     u32* row = _pixels + (size_t)y * _stride;
-    if (color.a == 255) {
+    if (color.a == 255)
         std::fill(row + x0, row + x1, packed(color));
-    } else {
-        for (int i = x0; i < x1; i++)
-            row[i] = blend(row[i], color, color.a);
-    }
+    else
+        blendSpan(row + x0, x1 - x0, color, color.a);
 }
 
 void Canvas::blendPixel(int x, int y, Color color, int coverage) {
@@ -1216,10 +1262,20 @@ void Canvas::image(const Image& source, int x, int y, int radius) {
 }
 
 void Canvas::shadow(Rect r, int radius, int spread, Color color) {
+    // Each ring two pixels wide, as dark as the layers over it would have added up to: from the faintest, outermost, in.
+    double step = 2.0 / std::max(spread, 1);
     for (int i = spread; i > 0; i -= 2) {
+        int layers = (spread - i) / 2 + 1;
+        double alpha = 1 - std::pow(1 - step, layers);
         Rect ring{r.x - i, r.y - i + spread / 2, r.w + i * 2, r.h + i * 2};
-        fillRound(ring, radius + i, color.withAlpha(255 * 2 / std::max(spread, 1)));
+        strokeRound(ring, radius + i, 2, color.withAlpha((int)(255 * alpha)));
     }
+    // Under what casts it, where it's offset below it, the darkest of them all.
+    double inner = 1 - std::pow(1 - step, spread / 2 + 1);
+    Rect under{r.x, r.y + spread / 2, r.w, r.h};
+    Rect below{under.x, std::max(under.y, r.bottom() - radius), under.w, under.bottom() - std::max(under.y, r.bottom() - radius)};
+    if (below.h > 0)
+        fillRound(below, radius, color.withAlpha((int)(255 * inner)));
 }
 
 float Canvas::text(Font& font, float x, float baseline, const std::string& text, float size, Color color, bool bold) {
@@ -1248,7 +1304,11 @@ float Canvas::text(Font& font, float x, float baseline, const std::string& text,
 }
 
 void Canvas::textFit(Font& font, float x, float baseline, const std::string& value, float size, float maxWidth, Color color, bool bold) {
-    text(font, x, baseline, fitText(font, value, size, maxWidth, bold), size, color, bold);
+    // A little too long gets a little smaller first, down to 82%: only what doesn't fit even then is cut short.
+    float fits = size;
+    while (fits > size * 0.82f && font.measure(value, fits, bold) > maxWidth)
+        fits -= 0.5f;
+    text(font, x, baseline, fitText(font, value, fits, maxWidth, bold), fits, color, bold);
 }
 
 void Canvas::textRight(Font& font, float right, float baseline, const std::string& value, float size, Color color, bool bold) {

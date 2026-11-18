@@ -2,6 +2,8 @@
 """
 Makes NSZ, XCI and XCZ files from NSPs, the way nsz and cartridge dumps lay them out, with the real Zstandard library.
 Decrypted sections get compressed as NCZ for Program and PublicData NCAs, and everything else is copied. Prints no keys.
+A section only there in part, as in a game Nintendo cut down to go with its update, is written as NXPress writes it, as NCZSECT2: each
+piece stored is a section of its own, with the counter offset that says where it sits in the game, and the table of contents another.
 
 usage: make_game_files.py keys out_dir kind in.nsp [in.nsp...]
 Kinds:
@@ -138,8 +140,33 @@ class Converter:
         kaek = bytes.fromhex(self.keys[f'key_area_key_application_{generation:02x}'])
         return ecb_decrypt(kaek, bytes(header[0x300:0x340]))[0x20:0x30]
 
+    def sparse_regions(self, nca, header, fs, offset, key, upper):
+        """A section only there in part, as NXPress lays it out (docs/ncz-sparse.md): each stored piece decrypted with the counter of where it
+        sits in the game, which counterOffset says, and the table of contents decrypted with the counter of the time it was cut down."""
+        generation = struct.unpack_from('<H', fs, 0x170)[0]
+        physical = struct.unpack_from('<Q', fs, 0x168)[0]
+        table_offset, table_size = struct.unpack_from('<qq', fs, 0x148)
+        secure = struct.unpack_from('<I', fs, 0x144)[0]
+        sparse_upper = (secure << 32) | (generation << 16)
+        table_at = physical + table_offset
+        table = ctr(key, nca[table_at:table_at + table_size], table_at, sparse_upper)
+        regions = []
+        if struct.unpack_from('<i', fs, 0x158 + 8)[0] > 0:
+            virtual_end = struct.unpack_from('<q', table, 8)[0]
+            entries = [struct.unpack_from('<qqi', e) for e in bktr_entries(table, 0x14)]
+            for j, (virtual, stored, storage) in enumerate(entries):
+                following = entries[j + 1][0] if j + 1 < len(entries) else virtual_end
+                if storage != 0 or following <= virtual:
+                    continue
+                at, length = physical + stored, following - virtual
+                counter_offset = (offset + virtual) - at
+                regions.append((at, length, 3, key, upper.to_bytes(8, 'big') + bytes(8),
+                                ctr(key, nca[at:at + length], at + counter_offset, upper), counter_offset))
+        regions.append((table_at, table_size, 3, key, sparse_upper.to_bytes(8, 'big') + bytes(8), table, 0))
+        return regions
+
     def sections_of(self, nca):
-        """(offset, size, crypto type, key, counter, plain bytes) for all the encrypted regions, in file order."""
+        """(offset, size, crypto type, key, counter, plain bytes, counter offset) for all the encrypted regions, in file order."""
         header = xts_decrypt(self.header_key, nca[:0xC00])
         key = None
         regions = []
@@ -152,12 +179,16 @@ class Converter:
             upper = struct.unpack_from('<Q', fs, 0x140)[0]
             raw = nca[offset:offset + size]
             encryption = fs[4]
+            if struct.unpack_from('<H', fs, 0x170)[0] != 0:
+                key = key or self.content_key(header)
+                regions += self.sparse_regions(nca, header, fs, offset, key, upper)
+                continue
             if encryption == 1:
-                regions.append((offset, size, 1, b'\0' * 16, b'\0' * 16, raw))
+                regions.append((offset, size, 1, b'\0' * 16, b'\0' * 16, raw, 0))
                 continue
             key = key or self.content_key(header)
             if encryption == 3:
-                regions.append((offset, size, 3, key, upper.to_bytes(8, 'big') + bytes(8), ctr(key, raw, offset, upper)))
+                regions.append((offset, size, 3, key, upper.to_bytes(8, 'big') + bytes(8), ctr(key, raw, offset, upper), 0))
                 continue
             if encryption != 4:
                 raise ValueError(f'encryption type {encryption}')
@@ -176,23 +207,37 @@ class Converter:
                     continue
                 counter = (secure << 32) | entry[5]
                 regions.append((offset + begin, stop - begin, 3, key, counter.to_bytes(8, 'big') + bytes(8),
-                                ctr(key, raw[begin:stop], offset + begin, counter)))
+                                ctr(key, raw[begin:stop], offset + begin, counter), 0))
             tables_start = struct.unpack_from('<q', fs, 0x100)[0]
             regions.append((offset + tables_start, size - tables_start, 3, key, upper.to_bytes(8, 'big') + bytes(8),
-                            ctr(key, raw[tables_start:], offset + tables_start, upper)))
+                            ctr(key, raw[tables_start:], offset + tables_start, upper), 0))
         return sorted(regions, key=lambda r: r[0])
 
     def ncz(self, nca, solid):
         regions = self.sections_of(nca)
-        table = b'NCZSECTN' + struct.pack('<Q', len(regions))
+        # NXPress's own kind, only when a piece needs a counter offset: then, as it writes them, the sections cover all of the NCA after its
+        # header, what's between them listed too, as it is.
+        sparse = any(r[6] for r in regions)
+        if sparse:
+            covered = []
+            at = NCZ_HEADER
+            for region in regions:
+                if region[0] > at:
+                    covered.append((at, region[0] - at, 1, b'\0' * 16, b'\0' * 16, nca[at:region[0]], 0))
+                covered.append(region)
+                at = region[0] + region[1]
+            if at < len(nca):
+                covered.append((at, len(nca) - at, 1, b'\0' * 16, b'\0' * 16, nca[at:], 0))
+            regions = covered
+        table = (b'NCZSECT2' if sparse else b'NCZSECTN') + struct.pack('<Q', len(regions))
         stream = bytearray()
 
         # As nsz does: a gap before the first section goes first in the stream, but isn't listed.
         first = regions[0][0]
         if first > NCZ_HEADER:
             stream += nca[NCZ_HEADER:first]
-        for offset, size, crypto, key, counter, plain in regions:
-            table += struct.pack('<QQQQ', offset, size, crypto, 0) + key + counter
+        for offset, size, crypto, key, counter, plain, counter_offset in regions:
+            table += struct.pack('<QQQq', offset, size, crypto, counter_offset) + key + counter
             stream += plain
 
         out = bytearray(nca[:NCZ_HEADER]) + table

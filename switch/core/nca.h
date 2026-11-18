@@ -100,11 +100,33 @@ struct NcaFsSection {
         int layers = rdi32(&header[0x14]);
         return memcmp(&header[0x08], "IVFC", 4) == 0 && layers >= 2 && layers <= 7 ? rdi64(&header[0x18 + (size_t)(layers - 2) * 0x18 + 8]) : 0;
     }
+    /// Where the data level of its IVFC hash tree starts, past the hash levels, and how long it is.
+    i64 dataLevelOffset() const { return dataLevelField(0); }
+    i64 dataLevelSize() const { return dataLevelField(8); }
+    i64 dataLevelField(int at) const {
+        int layers = rdi32(&header[0x14]);
+        return layers >= 2 && layers <= 7 ? rdi64(&header[0x18 + (size_t)(layers - 2) * 0x18 + at]) : 0;
+    }
 };
 
 class Pfs0Archive;
 class NcaFile;
 using NcaPtr = std::shared_ptr<NcaFile>;
+
+/// Bytes of the original game from `original` on, which the updated game data has at `image`.
+struct KeptRange {
+    i64 original = 0;
+    i64 image = 0;
+    i64 length = 0;
+};
+
+/// Where an update kept each part of the original in one section of one content.
+struct KeptSection {
+    u8 contentType = 0;
+    u8 idOffset = 0;
+    int index = 0;
+    std::vector<KeptRange> ranges;
+};
 
 class NcaFile {
 public:
@@ -126,6 +148,10 @@ public:
 
     /// Data that can only be read efficiently from front to back, which is the case for a solid NCZ.
     bool readsInOrder() const { return _ncz && _ncz->isSolid(); }
+    /// What keeping its decoded stream aside takes, for a solid NCZ an update reads out of order. Zero for anything else.
+    i64 solidBytes() const { return readsInOrder() ? _ncz->streamSize() : 0; }
+    /// Packed with Zstandard, as in an NSZ or XCZ, which the console can't read, so every installer unpacks it.
+    bool packed() const { return _ncz != nullptr; }
     /// Lets go of what a compressed source holds on to. It's picked up again if the NCA is read again.
     void releaseMemory() { if (_ncz) _ncz->releaseMemory(); }
 
@@ -139,11 +165,32 @@ public:
     /// Up to the size given, it's only read the once, however many times its contents get gone through.
     std::unique_ptr<Pfs0Archive> openPfs0(const NcaFsSection& section, NcaFile* baseNca, bool verify = true, i64 keepInMemory = 0);
 
+    /// What an update reads from this as its base game. An update is made against the original's stored bytes, which compressing
+    /// changes, but a compressed copy this tool made holds the very same game data. So the section is given as the original had it,
+    /// uncompressed, rebuilt from that, and the update fits it. A copy with an update in it already gives each part of the original
+    /// its update kept from where it put it. The update's own hash tree says whether it really does fit.
+    SourcePtr openAsOriginal(const NcaFsSection& section);
+    /// Compressed by this tool, which only ever writes key generation 0. Its makers can't have compressed a game with that: compression came
+    /// with firmware 12, and games made for it have a far newer key generation. How the section is laid out doesn't say: versions before 1.4
+    /// put the hash levels first, as games their makers compressed do, and the ones since put the game data first, as it's written as it's made.
+    bool isRebuiltCompressed(const NcaFsSection& section) const;
+    /// For a copy with an update in it already, where that update kept each part of the original, which a newer one reads.
+    std::vector<KeptSection> keptOriginal;
+    /// Where the parts of the original an update's section keeps as they were end up in the game data it makes. Through its table to
+    /// where it keeps them, and if it's compressed, through its compression table to where a stretch stored as it is ends up. What's
+    /// kept in its hash levels, or inside what it compresses, isn't there as it was, and is left out.
+    std::vector<KeptRange> keptInImage(const NcaFsSection& section, NcaFile* baseNca);
+
 private:
     const Bytes& contentKey();
     Bytes readMetaTable(const NcaFsSection& section, i64 offset, i64 size);
     SourcePtr openSparse(const NcaFsSection& section);
     SourcePtr openIntegrityData(const NcaFsSection& section, SourcePtr logical, const std::string& what, const std::string& hint, bool wantVerify);
+    /// Whether a few blocks of an update's section that come from its base check out against its own hashes, read this way.
+    bool fits(const NcaFsSection& section, const std::shared_ptr<DataSource>& logical);
+    /// Of each section, whether the base is read as stored rather than as the original was.
+    std::map<int, bool> _readsStored;
+    sys::Mutex _choiceMutex;
     SourcePtr openCompressed(const NcaFsSection& section, SourcePtr data);
 
     SourcePtr _raw;

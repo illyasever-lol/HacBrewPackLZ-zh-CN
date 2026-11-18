@@ -25,28 +25,32 @@ internal sealed class NspWriter : IDisposable
     private readonly List<PosixSignalRegistration> _signals = [];
     private bool _finished;
 
-    /// <param name="contentCount">How many content NCAs will be written, not counting the meta NCAs.</param>
-    /// <param name="metaCount">How many CNMT meta NCAs will be written: one per title packed into the NSP.</param>
-    public NspWriter(string path, int contentCount, int metaCount = 1)
+    /// <param name="contentCount">How many NCAs will be written, not counting the meta NCAs.</param>
+    /// <param name="titleCount">How many titles go in, each with a meta NCA of its own: a game and its DLC.</param>
+    public NspWriter(string path, int contentCount, int titleCount = 1)
     {
         _path = path;
         _partPath = path + ".part";
-        _expectedFiles = contentCount + metaCount;
-        _dataStart = HeaderSize(contentCount, metaCount);
+        _expectedFiles = contentCount + titleCount;
+        _dataStart = HeaderSize(contentCount, titleCount);
 
         _file = new FileStream(_partPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20);
         _file.SetLength(_dataStart);
         _file.Position = _dataStart;
 
         // On Windows these also cover Ctrl-Break and closing the console window, so a stopped build leaves no partial file.
-        foreach (var signal in new[] { PosixSignal.SIGINT, PosixSignal.SIGQUIT, PosixSignal.SIGHUP, PosixSignal.SIGTERM })
-            _signals.Add(PosixSignalRegistration.Create(signal, _ => Abandon()));
+        // Android apps get no signals: they're stopped from the app, which cleans up the same way.
+        if (!OperatingSystem.IsAndroid())
+        {
+            foreach (var signal in new[] { PosixSignal.SIGINT, PosixSignal.SIGQUIT, PosixSignal.SIGHUP, PosixSignal.SIGTERM })
+                _signals.Add(PosixSignalRegistration.Create(signal, _ => Abandon()));
+        }
     }
 
-    public static long HeaderSize(int contentCount, int metaCount = 1)
+    public static long HeaderSize(int contentCount, int titleCount = 1)
     {
-        int nameTable = Align(contentCount * (NcaNameLength + 1) + metaCount * (MetaNcaNameLength + 1), 0x20);
-        return 0x10 + (contentCount + metaCount) * PfsEntrySize + nameTable;
+        int nameTable = Align(contentCount * (NcaNameLength + 1) + titleCount * (MetaNcaNameLength + 1), 0x20);
+        return 0x10 + (contentCount + titleCount) * PfsEntrySize + nameTable;
     }
 
     public NcaInfo WriteNca(NcaWriter writer, string label, NcaContentType type, ulong titleId, NcaSection?[] sections, RSA? signer,

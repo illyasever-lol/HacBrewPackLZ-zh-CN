@@ -82,10 +82,10 @@ internal sealed class Verifier
     private void Fail(string message)
     {
         _failures++;
-        Ui.Error($"  FAIL: {message}");
+        Ui.Error($"  失败：{message}");
     }
 
-    private void Pass(string message) => Ui.Detail($"  ok: {message}");
+    private void Pass(string message) => Ui.Detail($"  通过：{message}");
 
     private void VerifyNsp()
     {
@@ -94,6 +94,8 @@ internal sealed class Verifier
             throw new ToolException("不是 NSP（PFS0 魔数错误）");
         int count = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(4));
         int nameTable = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(8));
+        if (count < 0 || count > 0x10000 || nameTable < 0 || nameTable > Ranges.MostTable || !Ranges.Fits(0x10, count * 0x18L + nameTable, _nsp.Length))
+            throw new ToolException("Not an NSP (its PFS0 header is damaged)");
         var table = ReadExact(0x10, count * 0x18 + nameTable);
         long dataStart = 0x10 + count * 0x18L + nameTable;
         long expected = dataStart;
@@ -103,8 +105,11 @@ internal sealed class Verifier
             long offset = BinaryPrimitives.ReadInt64LittleEndian(e);
             long size = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
             int nameOffset = BinaryPrimitives.ReadInt32LittleEndian(e[0x10..]);
+            if (nameOffset < 0 || nameOffset >= nameTable)
+                throw new ToolException($"Not an NSP (entry {i} of its PFS0 header is damaged)");
             var names = table.AsSpan(count * 0x18 + nameOffset);
-            string name = Encoding.UTF8.GetString(names[..names.IndexOf((byte)0)]);
+            int end = names.IndexOf((byte)0);
+            string name = Encoding.UTF8.GetString(end >= 0 ? names[..end] : names);
             _files[name] = (dataStart + offset, size);
             expected += size;
         }
@@ -129,9 +134,9 @@ internal sealed class Verifier
             if (file.size != size)
                 Fail($"content meta size of {name} is {size}, the file has {file.size}");
             if (!_hashes.TryGetValue(name, out var actual) || !actual.AsSpan().SequenceEqual(hash))
-                Fail($"content meta hash of {name} does not match");
+                Fail($"{name} 的内容元数据哈希不匹配");
             else
-                Ui.Detail($"cnmt record ok: {name} type {type}");
+                Ui.Detail($"内容元数据记录通过：{name}，类型 {type}");
         }
     }
 
@@ -210,7 +215,7 @@ internal sealed class Verifier
                     VerifyRomFsSection(i, fsHeader, section, contentType);
                     break;
                 case 5 or 6:
-                    Pass($"section {i}: uses a SHA-3 hash tree, which wasn't checked");
+                    Pass($"区段 {i}：使用 SHA-3 哈希树，未做逐块校验");
                     break;
                 default:
                     Fail($"section {i}: unexpected hash type {fsHeader[3]}");
@@ -317,14 +322,20 @@ internal sealed class Verifier
             blockSizes[l] = 1 << BinaryPrimitives.ReadInt32LittleEndian(f[(0x28 + l * 0x18)..]);
         }
 
-        // The header's master hash covers level 0, each level's hashes cover the next, and the last level is the data.
+        // The header's master hash covers level 0, each level's hashes cover the next, and the last level is the data. Of each hash level,
+        // only the blocks the data under it uses are checked, as the console does: a section its developer compressed has hash levels made for
+        // its game data uncompressed, which can end in blocks nothing uses, and those don't hold what their hashes say.
+        var used = new long[levels];
+        used[levels - 1] = (sizes[levels - 1] + blockSizes[levels - 1] - 1) / blockSizes[levels - 1];
+        for (int l = levels - 2; l >= 0; l--)
+            used[l] = Math.Min((sizes[l] + blockSizes[l] - 1) / blockSizes[l], (used[l + 1] * 0x20 + blockSizes[l] - 1) / blockSizes[l]);
         var parent = f.Slice(0xC8, 0x20).ToArray();
         for (int l = 0; l < levels; l++)
         {
             int block = blockSizes[l];
             byte[]? child = l == levels - 1 ? null : section.ReadBytes(offsets[l], (int)sizes[l]);
             var buffer = new byte[block];
-            long blocks = (sizes[l] + block - 1) / block;
+            long blocks = used[l];
             for (long b = 0; b < blocks; b++)
             {
                 int n = (int)Math.Min(block, sizes[l] - b * block);
@@ -384,13 +395,15 @@ internal sealed class Verifier
         var buffer = new byte[Lz4Encoder.MaxBlockSize];
         var decoded = new byte[Lz4Encoder.MaxBlockSize];
         long lz4 = 0, stored = 0, physicalTotal = 0;
-        long previousPhysicalEnd = 0;
+        // Data is stored in order. Where the same data is held again, an entry points back at what was stored before it instead: the very same
+        // LZ4 block, or bytes stored as they are, which can run on into what's stored next.
+        var storedPhysical = new StoredPhysical();
         foreach (var (entry, end) in tree.EnumerateAll())
         {
             long virtualSize = end - entry.VirtualOffset;
             bool isLz4 = entry.Type == CompressionType.Lz4;
             long physicalSize = isLz4 ? entry.PhysicalSize : virtualSize;
-            if (entry.PhysicalOffset < 0 || entry.PhysicalOffset < previousPhysicalEnd)
+            if (entry.PhysicalOffset < 0 || !storedPhysical.Take(entry.PhysicalOffset, physicalSize, isLz4, out long added))
             {
                 Fail($"section {index}: entry at 0x{entry.VirtualOffset:x} overlaps the previous one");
                 return null;
@@ -436,8 +449,7 @@ internal sealed class Verifier
                 Fail($"section {index}: entry at 0x{entry.VirtualOffset:x} has unexpected type {(int)entry.Type}");
                 return null;
             }
-            physicalTotal += physicalSize;
-            previousPhysicalEnd = entry.PhysicalOffset + physicalSize;
+            physicalTotal += added;
             entries.Add((entry, end));
         }
 
@@ -719,6 +731,62 @@ internal sealed class Verifier
                 bufferOffset += n;
                 count -= n;
             }
+        }
+    }
+
+    /// <summary>
+    /// What a compression table's entries have stored so far, in the order the entries come. New data only ever goes after what's stored. An
+    /// entry can also point back at what was stored, where the same data is held again: the very same LZ4 block, or bytes stored as they
+    /// are, which can run on into new bytes stored right after them.
+    /// </summary>
+    private sealed class StoredPhysical
+    {
+        private readonly Dictionary<long, long> _lz4 = [];
+        /// <summary>Bytes stored as they are, in order, those that meet joined.</summary>
+        private readonly List<(long Start, long End)> _raw = [];
+        private long _end;
+
+        /// <summary>False if the entry doesn't fit that. Added is how much of it is new.</summary>
+        public bool Take(long physical, long size, bool lz4, out long added)
+        {
+            added = 0;
+            if (lz4)
+            {
+                if (physical < _end)
+                    return _lz4.TryGetValue(physical, out long known) && known == size;
+                _lz4[physical] = size;
+                added = size;
+                _end = physical + size;
+                return true;
+            }
+            long end = physical + size;
+            if (physical < _end && !IsRaw(physical, Math.Min(end, _end)))
+                return false;
+            if (end > _end)
+            {
+                long start = Math.Max(physical, _end);
+                if (_raw.Count > 0 && _raw[^1].End == start)
+                    _raw[^1] = (_raw[^1].Start, end);
+                else
+                    _raw.Add((start, end));
+                added = end - start;
+                _end = end;
+            }
+            return true;
+        }
+
+        private bool IsRaw(long start, long end)
+        {
+            int low = 0, high = _raw.Count;
+            while (low < high)
+            {
+                int middle = (low + high) >>> 1;
+                if (_raw[middle].End <= start)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            return low < _raw.Count && _raw[low].Start <= start && end <= _raw[low].End;
         }
     }
 }

@@ -21,11 +21,21 @@ internal static class GuiProgram
 
             using var session = new Session();
             Ui.Sink = session;
+            ProblemReports.ReportText = session.ReportText;
+            AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            {
+                if (e.ExceptionObject is Exception crash)
+                    ProblemReports.Crashed(crash);
+            };
             var window = new MainWindow(session);
             Updater.Tidy();
             window.Show();
             if (args.Length > 0)
                 session.AddInputs(args);
+            ProblemReports.Opened();
+            // Windows' own word for a window that hasn't taken its messages for a while.
+            ProblemReports.WatchForFreezes(() => !Win32.IsHungAppWindow(window.Handle), session.Doing);
+            ProblemReports.MakeTestProblem();
 
             while (Win32.GetMessageW(out var message, IntPtr.Zero, 0, 0) > 0)
             {
@@ -44,7 +54,8 @@ internal static class GuiProgram
     /// <summary>Exceptions can't cross back into Windows, so anything unexpected is shown here rather than vanishing.</summary>
     public static void Fatal(Exception e)
     {
-        Win32.MessageBoxW(IntPtr.Zero, $"Something went wrong and the program has to close.\n\n{e.GetType().Name}: {e.Message}\n\n{e.StackTrace}", AppInfo.Name, Win32.MB_OK | Win32.MB_ICONERROR);
+        ProblemReports.Crashed(e);
+        Win32.MessageBoxW(IntPtr.Zero, $"程序发生意外错误，必须关闭。\n\n{e.GetType().Name}: {e.Message}\n\n{e.StackTrace}", AppInfo.Name, Win32.MB_OK | Win32.MB_ICONERROR);
         Environment.Exit(1);
     }
 }

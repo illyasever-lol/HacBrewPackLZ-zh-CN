@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """End-to-end test matrix. Prints no key material. See README.md. usage: matrix.py <section> [...]
-Sections: prepare batch analyze selection titles formats zstd engine diff options edges matrix l2. "prepare" must have run once before the others.
+Sections: prepare batch analyze selection titles copies names extracting folders formats zstd engine diff options edges matrix l2. "prepare" must have run once before the others.
 The engine section also needs HBPTOOL, the PC build of the Switch version's engine: see switch/README.md."""
 import hashlib, os, re, shutil, signal, struct, subprocess, sys, time
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives import hashes
 
+# Nothing a test does may reach the real report service.
+os.environ['HACBREWPACKLZ_REPORT_SITE'] = 'none'
+os.environ['HBP_TEST_REPORT_SITE'] = 'none'
 S = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get('TESTDIR', os.path.join(S, 'out'))
 T1 = os.path.join(OUT, 't1')
@@ -14,7 +17,7 @@ WORK = os.path.join(OUT, 'work')
 TOOL = os.environ.get('TOOL', os.path.join(S, '..', '..', '_tools', 'hacbrewpacklz', 'hacbrewpacklz.exe'))
 HBP = os.environ.get('HACBREWPACK', os.path.join(S, '..', '..', '_tools', 'hacbrewpack', 'hacbrewpack.exe'))
 KEYS = os.environ.get('KEYS', os.path.join(os.path.dirname(HBP), 'prod.keys'))
-LIBHAC = ['dotnet', os.path.join(S, 'libhac_check', 'bin', 'Release', 'net8.0', 'libhac_check.dll')]
+LIBHAC = ['dotnet', os.path.join(S, 'libhac_check', 'bin', 'Release', 'net10.0', 'libhac_check.dll')]
 REF_NSP = os.path.join(T1, 'hbp_nosig', 'hacbrewpack_nsp', '0100abcd12340000.nsp')
 results = []
 
@@ -24,8 +27,9 @@ def report(name, ok, detail=''):
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
 
 
-def run(cmd, cwd=None):
-    p = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+def run(cmd, cwd=None, env=None):
+    p = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace',
+                       env=None if env is None else {**os.environ, **env})
     return p.returncode, p.stdout
 
 
@@ -127,6 +131,43 @@ def section_analyze():
         rc, out = run([TOOL, 'analyze', '-k', KEYS, update])
         report(f'{variant}: analyze refuses an update alone and says why', 'without its base game' in out)
 
+    # A game with copies of its own files, which the estimate sees from the file table, and files it mustn't take for copies. Without the
+    # copies it would come to over 7 MB more than it does, and with the language versions or the unrelated files taken for copies, megabytes
+    # less: each engine against what it makes itself.
+    d = fresh('analyze_copies')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'copies'])
+    if rc != 0:
+        report('copies: test title generated', False, out[-300:])
+    else:
+        base, update = os.path.join(d, 'base.nsp'), os.path.join(d, 'update.nsp')
+        engine = os.environ.get('HBPTOOL')
+        for who, tool in [('this tool', TOOL)] + ([('the Switch engine', engine)] if engine and os.path.exists(engine) else []):
+            for name, inputs in (('the game alone', [base]), ('with its update', [base, update])):
+                rc, out = run([tool, 'analyze', '-k', KEYS, *inputs])
+                target = os.path.join(d, 'out_' + str(abs(hash((who, name)))))
+                shutil.rmtree(target, ignore_errors=True)
+                rc2, out2 = run([tool, 'convert', '-k', KEYS, *inputs, '--nspdir', target])
+                made = os.listdir(target) if rc2 == 0 else []
+                if rc != 0 or len(made) != 1:
+                    report(f'copies, {who}, {name}: analyze and convert', False, (out + out2)[-300:])
+                    continue
+                check_estimate(f'copies estimate, {who}: {name}', out, os.path.getsize(os.path.join(target, made[0])), False)
+
+        # Measured, a game under 1 GB is measured exactly, every block compressed: each engine comes to what it makes, with no margin, and
+        # both to the same figure.
+        target = os.path.join(d, 'out_measured')
+        shutil.rmtree(target, ignore_errors=True)
+        rc, out = run([TOOL, 'convert', '-k', KEYS, base, update, '--nspdir', target])
+        made = os.listdir(target) if rc == 0 else []
+        figures = {}
+        for who, cmd in [('this tool', [TOOL, 'analyze', '-k', KEYS, base, update, '--measure', '--minsaving', '99'])] + \
+                        ([('the Switch engine', [engine, 'measure', '-k', KEYS, base, update])] if engine and os.path.exists(engine) else []):
+            rc, out = run(cmd)
+            figures[who] = estimated(out)
+            if len(made) == 1:
+                check_estimate(f'measured exactly, {who}', out, os.path.getsize(os.path.join(target, made[0])), True)
+        report('measured exactly: both engines come to the same figure', len(set(figures.values())) == 1, str(figures))
+
     d = fresh('analyze_nothing')
     before = set(os.listdir(d))
     rc, out = run([TOOL, 'analyze', '-k', KEYS] + dirs, cwd=d)
@@ -165,9 +206,17 @@ def section_selection():
     rc, out, made = outputs()
     report('with no minimum, everything is compressed', rc == 0 and len(made) == 3, str(made))
 
+    # What a first look can't vouch for is left out, saying --measure finds out, and with it, what's measured to save too little is left out
+    # saying what it saves.
     rc, out, made = outputs('--minsaving', '20')
-    report('a minimum leaves out what saves too little', rc == 0 and made == ['0100AAAA00000000'], f'{made} {out[-200:]}')
-    report('and says so, with the reason and a count', 'below the 20% minimum' in out and '2 left out as not worth it' in out and '1 of 1 succeeded' in out, out[-300:])
+    report('a minimum leaves out what saves too little or isn\'t sure to', rc == 0 and made == ['0100AAAA00000000'], f'{made} {out[-200:]}')
+    report('and says so, with what --measure does and a count', 'not sure yet, may save more: --measure reads it in full' in out and '2 left out as not worth it' in out
+           and '1 of 1 succeeded' in out, out[-300:])
+    rc, out, made = outputs('--minsaving', '20', '--measure')
+    report('with --measure, what\'s measured to save too little is left out too', rc == 0 and made == ['0100AAAA00000000'], f'{made} {out[-200:]}')
+    # Measured, what grows by less than compressing ever makes anything grow is as small as it gets, not "would grow by 0%".
+    report('and says what it saves', "nothing to gain: it's already as small as it gets" in out and 'would grow by 0%' not in out and 'Measured' in out
+           and '2 left out as not worth it' in out, out[-300:])
 
     rc, out, made = outputs('--hidesmall')
     report('--hidesmall leaves out a game under 1 MB with nothing else to it', rc == 0 and made == ['0100AAAA00000000', '0100BBBB00000000'], f'{made} {out[-200:]}')
@@ -188,7 +237,14 @@ def section_selection():
     rc, out = run([TOOL, 'analyze', '-k', KEYS, *games, '--minsaving', '20'])
     ranking = out[out.find('Most worthwhile first'):]
     report('analyze ranks the titles, best first', rc == 0 and ranking.find('compressible [') < ranking.find('tiny [') and ranking.find('compressible [') > 0, ranking[:300])
-    report('and gives the command for only the ones worth it', 'convert --only 0100AAAA00000000' in out and ranking.count('left out') >= 2, ranking[-300:])
+    # What would grow a hair by a first look isn't left out on its say: --measure reads it in full.
+    hint = [line.strip() for line in out.splitlines() if 'convert --only' in line]
+    # A game with no figure says "not sure" where its figure would be; one with a figure says it after its name.
+    report('and gives the command for only the ones sure to be worth it', hint == ["To compress only what's sure to be worth it: convert --only 0100AAAA00000000"]
+           and any('incompressible [0100BBBB00000000]' in line and 'not sure' in line for line in ranking.splitlines()) and 'add --measure' in out, ranking[-400:])
+    rc, out = run([TOOL, 'analyze', '-k', KEYS, *games, '--minsaving', '20', '--measure'])
+    ranking = out[out.find('Most worthwhile first'):]
+    report('analyze --measure reads what isn\'t sure in full and says what it saves', rc == 0 and 'Measured' in out and 'not sure' not in ranking, ranking[-400:])
 
     for wrong, why in ((['--minsaving', '150'], 'percent'), (['--minsaving', 'lots'], 'percent'), (['--alwaysupto', '1G'], 'Unknown option')):
         rc, out = run([TOOL, 'convert', '-k', KEYS, good, *wrong])
@@ -250,7 +306,8 @@ def section_titles():
     write(os.path.join(folder, 'control', 'control.nacp'), packed(names))
     dirs = ['--exefsdir', os.path.join(folder, 'exefs'), '--romfsdir', os.path.join(folder, 'romfs'), '--logodir', os.path.join(folder, 'logo'), '--controldir', os.path.join(folder, 'control')]
     target = os.path.join(d, 'built')
-    rc, out = run([TOOL, '-k', KEYS, '--nspdir', target] + dirs)
+    # Built uncompressed, as a game from the shop is, or converting it would leave it out as already compressed.
+    rc, out = run([TOOL, '-k', KEYS, '--nspdir', target, '--nocompress'] + dirs)
     made = os.listdir(target) if rc == 0 else []
     report('a game with compressed names builds', len(made) == 1, out[-300:] if rc else '')
     if made:
@@ -283,17 +340,20 @@ def section_engine():
         report('HBPTOOL points at the engine', False, str(engine))
         return
 
-    def compare(d, name, inputs, *args):
+    def compare(d, name, inputs, *args, files=None):
         a, b = os.path.join(d, 'cs'), os.path.join(d, 'cpp')
         shutil.rmtree(a, ignore_errors=True)
         shutil.rmtree(b, ignore_errors=True)
         rc1, out1 = run([TOOL, 'convert', '-k', KEYS, *inputs, '--nspdir', a, '--nosignncasig2', *args])
         rc2, out2 = run([engine, 'convert', '-k', KEYS, *inputs, '--nspdir', b, '--nosignncasig2', *args])
-        names = (sorted(os.listdir(a)) if rc1 == 0 else None, sorted(os.listdir(b)) if rc2 == 0 else None)
+        names = (sorted(os.listdir(a)) if rc1 == 0 and os.path.isdir(a) else None, sorted(os.listdir(b)) if rc2 == 0 and os.path.isdir(b) else None)
         same = rc1 == 0 and rc2 == 0 and names[0] == names[1] and nsp_hashes(a) == nsp_hashes(b)
-        report(f'{name}: the same bytes', same and len(names[0]) > 0, '' if same else f'{rc1} {rc2} {names} {out2[-300:]}')
+        ok = same and len(names[0]) == (files or len(names[0])) > 0
+        report(f'{name}: the same bytes', ok, '' if ok else f'{rc1} {rc2} {names} {out2[-300:]}')
 
-    for variant in ('plain', 'compressed_update', 'compressed_both'):
+    # The last is a game that holds some of its own data again, which both have to find the same way.
+    went_back_somewhere = set()
+    for variant in ('plain', 'compressed_update', 'compressed_both', 'repeats'):
         d = fresh('engine_' + variant)
         rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, variant])
         if rc != 0:
@@ -302,6 +362,8 @@ def section_engine():
         base, update, dlc, romfs_new = [os.path.join(d, n) for n in ('base.nsp', 'update.nsp', 'dlc.nsp', 'romfs_new')]
 
         compare(d, f'{variant}, NSPs', [base, update, dlc])
+        if variant == 'repeats':
+            compare(d, f'{variant}, the base game alone', [base])
         compare(d, f'{variant}, NSPs, no compression', [base, update, dlc], '--nocompress')
         compare(d, f'{variant}, level 1, 4K blocks', [base, update, dlc], '--level', '1', '--blocksize', '4096')
         compare(d, f'{variant}, level 3, 16K blocks', [base, update, dlc], '--level', '3', '--blocksize', '16384')
@@ -352,6 +414,42 @@ def section_engine():
             rc2, out2 = run([engine, 'extract', '-k', KEYS, *inputs, '--outdir', x2])
             report(f'{variant}, {kind}: the same files extracted', rc1 == 0 and rc2 == 0 and tree_hashes(x1) == tree_hashes(x2), out2[-300:] if rc2 else '')
 
+        # A solid game and update read out of order, kept aside each way the console keeps them, come to the same bytes, and leave no copy
+        # behind. With no section kept as it goes past, the update goes back as a big update does. Read again every time, nothing is kept;
+        # as it comes, a copy is made only once it has gone back more than three times, which a test game may or may not do; kept from the
+        # first time back, it goes in memory, in a file, or both. A game read in order has nothing to keep.
+        for kind in ('solid', 'xcz-solid'):
+            if kind not in forms:
+                continue
+            ways = (('read again', {'HBP_TEST_REWINDS_BEFORE_KEEPING': '1000000'}, ('temporary copy', 'kept in memory'), ()),
+                    ('as it comes', {}, ('kept in memory',), ()),
+                    ('in memory', {'HBP_TEST_SPARE_MEMORY': str(1 << 30)}, ('temporary copy',), ('kept in memory',)),
+                    ('its start in memory, the rest in a file', {'HBP_TEST_SPARE_MEMORY': str(1 << 20), 'HBP_TEST_REWINDS_BEFORE_KEEPING': '0'}, (),
+                     ('MB in memory, and a temporary copy of the rest',)),
+                    ('in a file', {'HBP_TEST_REWINDS_BEFORE_KEEPING': '0'}, ('kept in memory',), ('a temporary copy of up to',)))
+            made = {}
+            went_back = True
+            for name, env, never, said in ways:
+                target, temp = os.path.join(d, 'keep_out'), os.path.join(d, 'keep_temp')
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.rmtree(temp, ignore_errors=True)
+                os.makedirs(temp)
+                rc, out = run([engine, 'convert', '-k', KEYS, *forms[kind], '--nspdir', target, '--tempdir', temp, '--nosignncasig2'],
+                              env={'HBP_TEST_MOST_KEPT_SECTION': '1', **env})
+                made[name] = nsp_hashes(target) if rc == 0 else None
+                left = os.listdir(temp)
+                # Nothing is kept of a stream that never had to go back.
+                if name == 'read again':
+                    went_back = 'decoded from its start again' in out
+                    print(f'      {variant}, {kind}: ' + ('goes back' if went_back else 'read in order, so there is nothing to keep'))
+                    if went_back:
+                        went_back_somewhere.add(kind)
+                if not went_back:
+                    never, said = ('temporary copy', 'kept in memory'), ()
+                report(f'{variant}, {kind}, kept {name}: made, saying so, and no copy left',
+                       rc == 0 and made[name] and not left and all(s in out for s in said) and not any(n in out for n in never), f'{rc} {left} {out[-300:]}')
+            report(f'{variant}, {kind}: the same bytes however it is kept', len(set(map(str, made.values()))) == 1 and made['read again'], str(made)[:300])
+
         # Building from the folders that extracting leaves, with the version that's in their name.
         x = os.path.join(d, 'x_build')
         shutil.rmtree(x, ignore_errors=True)
@@ -396,6 +494,38 @@ def section_engine():
         else:
             report(f'{variant}: a signed build is made', False, out[-300:])
         shutil.rmtree(d, ignore_errors=True)
+    for kind in ('solid', 'xcz-solid'):
+        report(f'{kind}: some test game goes back, so each way of keeping it is tried', kind in went_back_somewhere, str(sorted(went_back_somewhere)))
+
+    # A game and its DLC in one file, with the smaller DLC given first, so both have to put them in title ID order.
+    d = fresh('engine_dlcs')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'dlcs'])
+    if rc != 0:
+        report('dlcs: test titles generated', False, out[-300:])
+    inputs = [os.path.join(d, n + '.nsp') for n in ('dlc_small', 'base', 'update', 'dlc')]
+    compare(d, 'dlcs, a game and its DLC in one file', inputs, files=1)
+    compare(d, 'dlcs, each DLC in a file of its own, none left out', inputs, '--separatedlc', '--minsaving', '5', files=3)
+    compare(d, 'dlcs, a merged file', [os.path.join(d, 'merged.nsp')], files=1)
+    compare(d, 'dlcs, DLC without their game in one file', inputs[:1] + inputs[3:], files=1)
+    compare(d, 'dlcs, and with --separatedlc in two', inputs[:1] + inputs[3:], '--separatedlc', files=2)
+
+    # A copy made again, here with a DLC its file doesn't hold. It keeps the map of what its update kept of the original, so a newer update can
+    # still be made part of it.
+    copy = os.path.join(d, 'copy')
+    rc, out = run([TOOL, 'convert', '-k', KEYS, inputs[1], inputs[2], '--nspdir', copy, '--nosignncasig2'])
+    copies = [os.path.join(copy, f) for f in os.listdir(copy)] if rc == 0 else []
+    if len(copies) == 1:
+        compare(d, 'dlcs, a copy made again with a DLC', [copies[0], inputs[0]], files=1)
+        made = [os.path.join(d, 'cs', f) for f in os.listdir(os.path.join(d, 'cs'))] if os.path.isdir(os.path.join(d, 'cs')) else []
+        x = os.path.join(d, 'x_again')
+        rc, out = run([TOOL, 'extract', '-k', KEYS, *made[:1], '--outdir', x])
+        kept = [os.path.join(r, f) for r, _, fs in os.walk(x) for f in fs if f == 'hacbrewpacklz_update_map.txt']
+        report('dlcs: a copy made again keeps its update map', len(made) == 1 and len(kept) == 1, f'{made} {kept} {out[-200:]}')
+        rc, out = run([TOOL, 'convert', '-k', KEYS, *made[:1], os.path.join(d, 'update_v2.nsp'), '--nspdir', os.path.join(d, 'v2'), '--nosignncasig2'])
+        report('dlcs: and takes a newer update', rc == 0 and 'made part of it' in out and len(os.listdir(os.path.join(d, 'v2'))) == 1, out[-300:])
+    else:
+        report('dlcs: a copy of the game and its update is made', False, out[-300:])
+    shutil.rmtree(d, ignore_errors=True)
 
     d = fresh('engine_broken')
     rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'plain'])
@@ -473,7 +603,7 @@ def section_zstd():
     report('corpus made by the real library', rc == 0, out.strip().splitlines()[-1][:90] if out.strip() else '')
     if rc != 0:
         return
-    check = os.path.join(S, 'zstd_check', 'bin', 'Release', 'net8.0', 'zstd_check.dll')
+    check = os.path.join(S, 'zstd_check', 'bin', 'Release', 'net10.0', 'zstd_check.dll')
     rc, out = run(['dotnet', check, corpus])
     report('every frame decodes to exactly what went in', rc == 0 and 'ZSTD: ALL OK' in out, out.strip().splitlines()[-1][:120] if rc == 0 else out[-500:])
     rc, out = run(['dotnet', check, corpus, '--fuzz', '40'])
@@ -487,7 +617,8 @@ def nsp_hashes(folder):
 
 def section_formats():
     """Whatever form a game arrives in, the same NSP has to come out, and the same files."""
-    fixed = ['--nosignncasig2']
+    # Each DLC in a file of its own, so each file can be compared with the estimate for its title.
+    fixed = ['--nosignncasig2', '--separatedlc']
     for variant in ('plain', 'compressed_update', 'compressed_both'):
         d = fresh('formats_' + variant)
         rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, variant])
@@ -526,12 +657,18 @@ def section_formats():
                 forms[name] = [os.path.join(made, file)]
 
         for name, inputs in forms.items():
+            # An NSZ or XCZ is counted at what it takes installed, which installing unpacks it to, while what's made of it installs as it is.
+            packed = 'NSZ' in name or 'XCZ' in name
             for mode, args in (('compressed', fixed), ('plain', fixed + ['--nocompress'])):
                 target = os.path.join(d, 'out')
                 shutil.rmtree(target, ignore_errors=True)
                 rc, out = run([TOOL, 'convert', '-k', KEYS, *inputs, '--nspdir', target, '--verify'] + args)
                 same = rc == 0 and nsp_hashes(target) == reference[mode]
                 report(f'{variant}: {name} gives the same NSPs, {mode}', same and out.count('OK: all checks passed') == 2, out[-400:] if not same else '')
+                if mode == 'compressed':
+                    said = 'installed as it is' in out
+                    report(f'{variant}: {name} sums up against {"what it takes installed" if packed else "the file"}', rc == 0 and said == packed,
+                           '\n'.join(line for line in out.splitlines() if line.startswith('Size:')))
 
             rc, out = run([TOOL, 'analyze', '-k', KEYS, *inputs, '--nocompress'])
             target_sizes = sorted(int(m) for m in re.findall(r'In bytes:\s+(\d+) \+/- 0', out))
@@ -543,6 +680,8 @@ def section_formats():
 
             rc, out = run([TOOL, 'analyze', '-k', KEYS, *inputs])
             report(f'{variant}: {name} can be analyzed', rc == 0 and 'In bytes:' in out, out[-300:] if rc else '')
+            report(f'{variant}: {name} analyzed {"says what its files come to, unpacked when installed" if packed else "has nothing to say about packing"}',
+                   rc == 0 and ('As a file:' in out) == packed, '\n'.join(line for line in out.splitlines() if 'Now:' in line or 'As a file:' in line))
 
             x = os.path.join(d, 'x')
             shutil.rmtree(x, ignore_errors=True)
@@ -676,7 +815,7 @@ def section_batch():
         # A base game cut down to what its update still reads from it, which has the same version as that update.
         sparse = os.path.join(d, 'base_sparse.nsp')
         rc, out = run([TOOL, 'analyze', '-k', KEYS, sparse, update])
-        report(f'{variant}: a cut down base game gets analyzed with its update', rc == 0 and 'repacked as one title' in out and 'section' not in out, out[-300:])
+        report(f'{variant}: a cut down base game gets analyzed with its update', rc == 0 and 'with its update' in out and 'section' not in out, out[-300:])
         rc, out = run([TOOL, 'convert', '-k', KEYS, sparse, update, '--nspdir', os.path.join(d, 'sparse_out'), '--verify'])
         names = os.listdir(os.path.join(d, 'sparse_out')) if rc == 0 else []
         report(f'{variant}: a cut down base game and its update become one NSP', rc == 0 and len(names) == 1 and 'OK: all checks passed' in out, names[0] if names else out[-400:])
@@ -731,14 +870,17 @@ def section_batch():
     shutil.copy(dlc, folder)
     rc, out = run([TOOL, 'convert', '-k', KEYS, folder])
     made = sorted(n for _, _, ns in os.walk(folder) for n in ns if '[LZ4]' in n)
-    report('a folder is searched and grouped: base + update + DLC give two NSPs', rc == 0 and len(made) == 2 and '2 of 2 succeeded' in out, str(made) + (out[-300:] if rc else ''))
+    report('a folder is searched and grouped: base + update + DLC give one NSP', rc == 0 and len(made) == 1 and '2 of 2 succeeded' in out, str(made) + (out[-300:] if rc else ''))
     rc, out = run([TOOL, 'convert', '-k', KEYS, folder])
     made2 = sorted(n for _, _, ns in os.walk(folder) for n in ns if '[LZ4]' in n)
     report('running it again ignores its own output', rc == 0 and made == made2 and 'already compressed' in out, out[-300:] if rc else '')
 
     rc, out = run([TOOL, base, update, '-k', KEYS, '--nspdir', os.path.join(d, 'drop')])
     made = os.listdir(os.path.join(d, 'drop')) if rc == 0 else []
-    report('files with no command convert when nobody can answer the prompt', rc == 0 and len(made) == 1 and 'repacked as one title' in out, out[-300:] if rc else '')
+    # These are the last variant's files, where the base is a compressed copy: known by what's in it, whatever its name, it's said to be
+    # made one title with its update rather than repacked as one.
+    report('files with no command convert when nobody can answer the prompt', rc == 0 and len(made) == 1 and 'with its update' in out,
+           out[-300:])
 
     # Slow settings, so the build is still running when it gets stopped.
     stopped = os.path.join(d, 'stopped')
@@ -759,6 +901,208 @@ def section_batch():
     time.sleep(0.5)
     left = os.listdir(stopped)
     report('stopping a build leaves no partial or temporary file', seen and running and not left, f'seen={seen} running={running} left={left}')
+
+    # A game's DLC goes into its new file, or each into a file of its own with --separatedlc, and once the game's file is made none is left
+    # out. The smaller DLC is given first, so the order in the file has to come from the title IDs.
+    d = fresh('batch_dlcs')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'dlcs'])
+    report('dlcs: test titles generated', rc == 0, out[-600:] if rc else '')
+    base, update, dlc, small, merged, small2 = [os.path.join(d, n + '.nsp') for n in ('base', 'update', 'dlc', 'dlc_small', 'merged', 'dlc_small2')]
+
+    def made(name, *args, inputs=(small, base, update, dlc), env=None):
+        target = os.path.join(d, name)
+        rc, out = run([TOOL, 'convert', '-k', KEYS, *inputs, '--nspdir', target, '--nosignncasig2', *args], env=env)
+        return rc, out, sorted(os.path.join(target, f) for f in os.listdir(target)) if os.path.isdir(target) else []
+
+    def whole(nsp, dlcs):
+        """check reads all of it back, and details counts its DLC."""
+        rc1, out1 = run([TOOL, 'check', '-k', KEYS, nsp])
+        rc2, out2 = run([TOOL, 'details', '-k', KEYS, nsp])
+        said = re.search(r'^\s*DLC\s+(\S+)', out2, re.M)
+        return rc1 == 0 and 'every game read back as it should' in out1 and rc2 == 0 and said is not None and said.group(1) == str(dlcs), out1[-200:] + out2[-200:]
+
+    rc, out, together = made('together')
+    ok, detail = whole(together[0], 2) if rc == 0 and len(together) == 1 else (False, out[-400:])
+    report("dlcs: a game's DLC goes into its file, which reads back whole", ok and 'In the game\'s file' in out, f'{together} {detail}')
+    rc, out, apart = made('apart', '--separatedlc', '--minsaving', '5')
+    names = [os.path.basename(p) for p in apart]
+    report('dlcs: with --separatedlc each DLC gets its own file, even one that saves nothing', rc == 0 and len(apart) == 3 and any(n.startswith('dlc_small') for n in names),
+           f'{names} {out[-300:]}')
+    if len(together) == 1 and len(apart) == 3:
+        game = next(p for p in apart if not os.path.basename(p).startswith('dlc'))
+        each = [game, next(p for p in apart if os.path.basename(p).startswith('dlc [')), next(p for p in apart if os.path.basename(p).startswith('dlc_small'))]
+        same = nsp_names(together[0]) == [n for p in each for n in nsp_names(p)]
+        report("dlcs: the game's file holds each title as its own file does, then its DLC in title ID order", same,
+               '' if same else f'{nsp_names(together[0])} {[nsp_names(p) for p in each]}')
+
+    rc, out, one = made('merged', inputs=(merged,))
+    ok, detail = whole(one[0], 2) if rc == 0 and len(one) == 1 else (False, out[-400:])
+    report('dlcs: a merged file comes out as one file with all its DLC', ok, f'{one} {detail}')
+    rc, out, three = made('merged_apart', '--separatedlc', inputs=(merged,))
+    report('dlcs: and with --separatedlc as three', rc == 0 and len(three) == 3, f'{three} {out[-300:]}')
+
+    # DLC without their game go together into one file, named as the one with the lowest title ID would be on its own. The smaller is given
+    # first, so the order comes from the title IDs. With --separatedlc, each gets a file.
+    def metas(nsp):
+        return sum(n.endswith('.cnmt.nca') for n in nsp_names(nsp))
+
+    def checked(nsp):
+        rc, out = run([TOOL, 'check', '-k', KEYS, nsp])
+        return rc == 0 and 'every game read back as it should' in out
+
+    rc, out, alone = made('alone', inputs=(small, dlc))
+    names = [os.path.basename(p) for p in alone]
+    report('dlcs: DLC without their game go into one file, named as the first DLC, which reads back whole',
+           rc == 0 and names == ['dlc [LZ4].nsp'] and metas(alone[0]) == 2 and checked(alone[0]) and 'In one file with the other DLC' in out, f'{names} {out[-300:]}')
+    rc, out, apart = made('alone_apart', '--separatedlc', inputs=(small, dlc))
+    report('dlcs: and with --separatedlc as two', rc == 0 and len(apart) == 2, f'{apart} {out[-300:]}')
+    if len(alone) == 1:
+        folder = os.path.join(d, 'alone_folder')
+        os.makedirs(folder)
+        for each in (small, dlc, alone[0]):
+            shutil.copy(each, folder)
+        rc, out = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+        report('dlcs: and that file given with them again makes nothing new', rc == 0 and len(os.listdir(folder)) == 3, f'{os.listdir(folder)} {out[-300:]}')
+
+    # Copies this tool made. One of the game and its update made without DLC, given with merged.nsp, which holds the original and both DLC: the
+    # original is used, and the new file holds the game and both DLC.
+    rc, out, copies = made('copy', inputs=(base, update))
+    copy = copies[0] if rc == 0 and len(copies) == 1 else None
+    report('dlcs: a copy of the game and its update is made', copy is not None, out[-300:])
+    if copy:
+        rc, out, one = made('merged_copy', inputs=(merged, copy))
+        ok, detail = whole(one[0], 2) if rc == 0 and len(one) == 1 else (False, out[-400:])
+        report('dlcs: a copy without the DLC its original holds gives way to the original, and the new file holds them all', ok, f'{one} {detail}')
+        # The same copy with a DLC and no original: it's made again with the DLC in its file, and a second time nothing new is made.
+        folder = os.path.join(d, 'copy_folder')
+        os.makedirs(folder)
+        for each in (copy, small):
+            shutil.copy(each, folder)
+        rc1, out1 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+        first = sorted(os.listdir(folder))
+        new = [os.path.join(folder, n) for n in first if n not in (os.path.basename(copy), 'dlc_small.nsp')]
+        ok, detail = whole(new[0], 1) if rc1 == 0 and len(new) == 1 else (False, out1[-400:])
+        report('dlcs: a copy given with a DLC not in its file is made again with it', ok and "Its DLC isn't in its file" in out1, f'{first} {detail}')
+        rc2, out2 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+        report('dlcs: and converting that folder again makes nothing new', rc1 == 0 and rc2 == 0 and sorted(os.listdir(folder)) == first,
+               f'{sorted(os.listdir(folder))} {out2[-300:]}')
+        # Given with the original base game, which is older than it, and a DLC: the copy is newer, so it's made again with the DLC.
+        rc, out, one = made('copy_base', inputs=(copy, base, small))
+        ok, detail = whole(one[0], 1) if rc == 0 and len(one) == 1 else (False, out[-400:])
+        report('dlcs: a copy newer than the original given beside it is made again with its DLC', ok and "Its DLC isn't in its file" in out, f'{one} {detail}')
+        # Given with its original and each DLC in a file of its own, as 1.5.0 left them: the copy is kept and made again from itself with them,
+        # rather than the original compressed again.
+        rc, out, one = made('copy_original_loose', inputs=(copy, base, update, dlc, small))
+        ok, detail = whole(one[0], 2) if rc == 0 and len(one) == 1 else (False, out[-400:])
+        report('dlcs: a copy given with its original and its DLC in files of their own is kept, and made again from itself with them',
+               ok and "Its DLC isn't in its file" in out and "Compressed from 'base.nsp' and 'update.nsp'" in out, f'{one} {detail}')
+        # With --separatedlc, a DLC with nothing to compress whose only copy is inside the merged original gets a file of its own beside the
+        # copy, with a minimum saving or without, and given that file, a second run makes nothing new.
+        for minimum in ('off', '5'):
+            folder = os.path.join(d, f'copy_merged_apart_{minimum}')
+            os.makedirs(folder)
+            shutil.copy(copy, folder)
+            again = [TOOL, 'convert', '-k', KEYS, merged, folder, '--nspdir', folder, '--nosignncasig2', '--separatedlc', '--minsaving', minimum]
+            rc1, out1 = run(again)
+            first = sorted(os.listdir(folder))
+            rc2, out2 = run(again)
+            report(f'dlcs: with --separatedlc and minimum {minimum}, a DLC only inside the merged original gets a file of its own beside the copy',
+                   rc1 == 0 and len(first) == 3 and any('0100ABCD12341002' in n for n in first), f'{first} {out1[-400:]}')
+            report(f'dlcs: and with minimum {minimum}, a second run makes nothing new', rc2 == 0 and sorted(os.listdir(folder)) == first,
+                   f'{sorted(os.listdir(folder))} {out2[-300:]}')
+
+    # The same twice for things that would otherwise be made again on every run: DLC without their game that have nothing to compress, which
+    # go into one file as they are, and a DLC that can't be made, as its file lacks an NCA its content meta lists.
+    def twice(name, files, wanted):
+        folder = os.path.join(d, name)
+        os.makedirs(folder)
+        for each in files:
+            if isinstance(each, tuple):
+                open(os.path.join(folder, each[0]), 'wb').write(each[1])
+            else:
+                shutil.copy(each, folder)
+        rc1, out1 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+        first = sorted(os.listdir(folder))
+        rc2, out2 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+        return len(first) == wanted and sorted(os.listdir(folder)) == first, f'{first} {sorted(os.listdir(folder))} {out1[-200:]} {out2[-300:]}', out1
+
+    ok, detail, out = twice('small_folder', (small, small2), 3)
+    report('dlcs: DLC without their game and with nothing to compress go into one file, and a second run makes nothing new', ok, detail)
+    ok, detail, out = twice('broken_folder', (base, update, dlc, ('dlc_small.nsp', without_tickets(small, keep=lambda n: n.endswith('.cnmt.nca')))), 5)
+    report("dlcs: a DLC that can't be made is said to be, and a second run makes nothing new", ok and 'is missing' in out, detail)
+
+    rc, out, older = made('older', inputs=(dlc,))
+    if rc == 0 and len(older) == 1:
+        rc, out, one = made('with_older', inputs=(base, update, older[0]))
+        ok, detail = whole(one[0], 1) if rc == 0 and len(one) == 1 else (False, out[-400:])
+        report('dlcs: a DLC compressed before goes into the game\'s file, which reads back whole', ok, f'{one} {detail}')
+    else:
+        report('dlcs: a DLC compressed before goes into the game\'s file, which reads back whole', False, out[-300:])
+
+    # A disk with room for the game but not its DLC as well. Without compressing, the size is known exactly, and 64 MB is kept free on top.
+    def needs(*inputs):
+        rc, out = run([TOOL, 'analyze', '-k', KEYS, *inputs, '--nocompress', '--nosignncasig2'])
+        return sum(int(n) + int(m) for n, m in re.findall(r'In bytes:\s+(\d+) \+/- (\d+)', out)[:len(inputs)])
+    free = needs(base, update) + (64 << 20) + needs(dlc, small) // 2
+    rc, out, left = made('room', '--nocompress', env={'HACBREWPACKLZ_TEST_FREE_SPACE': str(free)})
+    report("dlcs: with no room for the game and its DLC, it says so before anything is written, and what to do",
+           rc != 0 and 'It needs about' in out and "Turning off Game and DLC in one file (--separatedlc) makes it smaller." in out, out[-300:])
+    report("dlcs: and its DLC aren't made on their own in the same run",
+           not left and out.count("Left out: its game's file couldn't be made") == 2, f'{left} {out[-300:]}')
+    rc, out, alone = made('room_alone', '--nocompress', inputs=(base, update), env={'HACBREWPACKLZ_TEST_FREE_SPACE': str(free)})
+    report('dlcs: and the game alone fits', rc == 0 and len(alone) == 1, out[-300:])
+
+    # A damaged DLC stops the game's file too, and the error under the game names the DLC.
+    bad = os.path.join(d, 'damaged', 'dlc.nsp')
+    os.makedirs(os.path.dirname(bad))
+    data = bytearray(open(dlc, 'rb').read())
+    data[len(data) - 30000] ^= 0xFF
+    open(bad, 'wb').write(data)
+    rc, out, left = made('damaged_out', inputs=(base, update, bad))
+    first = re.sub(r'[0-9A-Fa-f]{32}', '<id>', next((line for line in out.splitlines() if line.startswith('FAILED')), ''))
+    report("dlcs: a damaged DLC is named as the DLC, not the game", rc != 0 and "Its DLC 0100ABCD12341001 in 'dlc.nsp'" in first and not left, f'{first[:200]} {left}')
+    failed = [line for line in out.splitlines() if line.startswith('FAILED')]
+    report("dlcs: and counts as one failure, as it isn't tried again on its own", len(failed) == 1 and "Left out: its game's file couldn't be made" in out,
+           f'{len(failed)} failed {out[-300:]}')
+
+    # The same folder again makes nothing new: the game is this tool's copy, the DLC that compressed is in it, and the one with nothing to
+    # compress is left out.
+    folder = os.path.join(d, 'folder')
+    os.makedirs(folder)
+    for each in (base, update, dlc, small):
+        shutil.copy(each, folder)
+    rc1, out1 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+    first = sorted(os.listdir(folder))
+    rc2, out2 = run([TOOL, 'convert', '-k', KEYS, folder, '--nosignncasig2'])
+    again = sorted(os.listdir(folder))
+    report('dlcs: converting the same folder again makes nothing new', rc1 == 0 and rc2 == 0 and len(first) == 5 and again == first and 'nothing to gain' in out2,
+           f'{first} {again} {out2[-300:]}')
+
+    # Slow settings, so the DLC is still being written when the stop comes, just after the game's content meta.
+    stopped = os.path.join(d, 'stopped')
+    os.makedirs(stopped)
+    p = subprocess.Popen([TOOL, 'convert', '-k', KEYS, base, update, dlc, '--level', '12', '--blocksize', '4K', '--nspdir', stopped], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    seen = False
+    for line in p.stdout:
+        if 'Writing Meta NCA: done' in line:
+            seen = True
+            p.send_signal(signal.CTRL_BREAK_EVENT)
+            break
+    p.communicate(timeout=60)
+    time.sleep(0.5)
+    left = os.listdir(stopped)
+    report('dlcs: stopping while the DLC is written leaves nothing, not even the game', seen and p.returncode != 0 and not left, f'seen={seen} rc={p.returncode} left={left}')
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def nsp_names(path):
+    """The files in an NSP, in the order its header lists them."""
+    with open(path, 'rb') as f:
+        count, table = struct.unpack('<II', f.read(0x10)[4:12])
+        header = f.read(count * 0x18 + table)
+    names = header[count * 0x18:]
+    return [names[at:names.index(b'\0', at)].decode() for at in (struct.unpack_from('<I', header, i * 0x18 + 0x10)[0] for i in range(count))]
 
 
 def section_matrix():
@@ -1044,6 +1388,270 @@ def section_l2():
     report('L2 tree: 5.9 GB at 4K blocks', ok and lh, f'nsp={os.path.getsize(nsp) if nsp else 0} {took:.1f}s')
     shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(os.path.join(WORK, 'l2'), ignore_errors=True)
+
+
+def without_tickets(path, keep=lambda name: not name.endswith(('.tik', '.cert'))):
+    """An NSP's files less its tickets and certificates, as an NSP: an update that can't be read for want of its title key. keep says which
+    files stay, otherwise."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    count, size = struct.unpack_from('<II', data, 4)
+    strings = data[0x10 + count * 0x18:0x10 + count * 0x18 + size]
+    start = 0x10 + count * 0x18 + size
+    files = []
+    for i in range(count):
+        offset, length, name_at, _ = struct.unpack_from('<QQII', data, 0x10 + i * 0x18)
+        name = strings[name_at:strings.index(b'\0', name_at)].decode()
+        if keep(name):
+            files.append((name, data[start + offset:start + offset + length]))
+    names = bytearray()
+    places = []
+    for name, _ in files:
+        places.append(len(names))
+        names += name.encode() + b'\0'
+    names += b'\0' * (-len(names) % 0x20)
+    out = bytearray(b'PFS0' + struct.pack('<III', len(files), len(names), 0))
+    position = 0
+    for (name, body), at in zip(files, places):
+        out += struct.pack('<QQII', position, len(body), at, 0)
+        position += len(body)
+    out += names
+    for _, body in files:
+        out += body
+    return bytes(out)
+
+
+def section_names():
+    """What's saved never goes over a file that's there: converted where something has the name it would get, such as an original game named
+    the way this names what it makes, a game comes out as "... (2).nsp", then "... (3).nsp", and what was there stays as it was."""
+    d = fresh('names')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'plain'])
+    if rc != 0:
+        report('names: test title generated', False, out[-300:])
+        return
+    base = os.path.join(d, 'base.nsp')
+    target = os.path.join(d, 'out')
+
+    def convert():
+        rc, out = run([TOOL, 'convert', '-k', KEYS, base, '--nspdir', target, '--nosignncasig2'])
+        return rc, out, sorted(f for f in os.listdir(target) if f.endswith('.nsp')) if os.path.isdir(target) else []
+
+    rc, out, first = convert()
+    report('names: converted once', rc == 0 and len(first) == 1, out[-300:])
+    if len(first) != 1:
+        return
+    # Something else of that name where it goes. What it's made from is in another folder, so nothing there is one of its inputs.
+    taken = os.path.join(target, first[0])
+    write(taken, b"somebody else's file")
+    stem = first[0][:-4]
+    rc, out, second = convert()
+    report("names: converted beside a file of that name, it's saved as '... (2).nsp'", rc == 0 and second == sorted([first[0], stem + ' (2).nsp']), str(second))
+    rc, out, third = convert()
+    report("names: and again, as '... (3).nsp'", rc == 0 and third == sorted([first[0], stem + ' (2).nsp', stem + ' (3).nsp']), str(third))
+    with open(taken, 'rb') as f:
+        report('names: and the file that was there is as it was', f.read() == b"somebody else's file")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def section_extracting():
+    """Extracting never leaves half a game that looks like a whole one: a folder an extraction is going on in says so in a note until all of
+    it's out, one that fails or is stopped is deleted, one that's extracted already isn't done over, one that didn't finish is cleared and done
+    afresh, and a folder of somebody else's of that name is left alone."""
+    d = fresh('extracting')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'plain'])
+    if rc != 0:
+        report('extracting: test title generated', False, out[-300:])
+        return
+    base = os.path.join(d, 'base.nsp')
+    target = os.path.join(d, 'out')
+    note = 'Not finished extracting.txt'
+
+    def extract(nsp):
+        rc, out = run([TOOL, 'extract', '-k', KEYS, nsp, '--outdir', target])
+        return rc, out, sorted(os.listdir(target)) if os.path.isdir(target) else []
+
+    rc, out, folders = extract(base)
+    game = os.path.join(target, folders[0]) if len(folders) == 1 else None
+    report('extracting: a game is extracted, with no note left in it', rc == 0 and game is not None and os.path.isdir(os.path.join(game, 'exefs')) and
+           not os.path.exists(os.path.join(game, note)), out[-300:])
+    if game is None:
+        return
+    files = tree_hashes(game)
+    rc, out, _ = extract(base)
+    report("extracting: again over it, it says it's extracted already, and leaves it as it was", rc != 0 and 'extracted already' in out and tree_hashes(game) == files, out[-300:])
+
+    # What an extraction that didn't finish leaves: cleared away, and done afresh.
+    write(os.path.join(game, note), b'not finished')
+    write(os.path.join(game, 'romfs', 'left over.bin'), b'from before')
+    rc, out, _ = extract(base)
+    report("extracting: a folder one didn't finish in is cleared and done afresh", rc == 0 and tree_hashes(game) == files, out[-300:])
+
+    # Somebody else's folder of that name, with things in it, is left alone.
+    shutil.rmtree(game)
+    write(os.path.join(game, 'notes.txt'), b'mine')
+    rc, out, _ = extract(base)
+    report("extracting: a folder of that name with other things in it is left alone", rc != 0 and 'other things in it' in out and
+           sorted(os.listdir(game)) == ['notes.txt'], out[-300:])
+    shutil.rmtree(game)
+
+    # A link back to a folder it's in, in a game folder's romfs: building it says so, rather than going round until the program falls over.
+    rc, out, _ = extract(base)
+    loop = os.path.join(game, 'romfs', 'loop')
+    subprocess.run(['cmd', '/c', 'mklink', '/J', loop, os.path.join(game, 'romfs')], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if rc == 0 and os.path.isdir(loop):
+        args = [TOOL, '-k', KEYS, '--exefsdir', os.path.join(game, 'exefs'), '--romfsdir', os.path.join(game, 'romfs'), '--controldir', os.path.join(game, 'control'),
+                '--nspdir', os.path.join(d, 'built'), '--nosignncasig2']
+        args += ['--logodir', os.path.join(game, 'logo')] if os.path.isdir(os.path.join(game, 'logo')) else ['--nologo']
+        rc, out = run(args)
+        report("extracting: a link back to a folder it's in, in a game folder's romfs, is said, rather than going round for ever", rc != 0 and 'link back' in out, out[-300:])
+        os.rmdir(loop)
+    else:
+        report('extracting: a link to a folder could be made for the test', False, out[-300:])
+    shutil.rmtree(game, ignore_errors=True)
+
+    # A game whose data is damaged part of the way through: whatever came out before goes.
+    damaged = os.path.join(d, 'damaged.nsp')
+    data = bytearray(open(base, 'rb').read())
+    for at in range(len(data) * 3 // 5, len(data) * 3 // 5 + 0x4000):
+        data[at] ^= 0xA5
+    write(damaged, bytes(data))
+    rc, out, folders = extract(damaged)
+    report('extracting: a game that fails part of the way through leaves nothing behind', rc != 0 and folders == [], f'{folders} {out[-300:]}')
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def section_folders():
+    """The command line takes game folders as the screens do: one given, or found in a folder given, is listed, analyzed and built, named as
+    the screens name it, and what's in it isn't taken for games of their own."""
+    d = fresh('folders')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'plain'])
+    if rc != 0:
+        report('folders: test title generated', False, out[-300:])
+        return
+    base = os.path.join(d, 'base.nsp')
+    games = os.path.join(d, 'games')
+    rc, out = run([TOOL, 'extract', '-k', KEYS, base, '--outdir', games])
+    names = os.listdir(games) if rc == 0 and os.path.isdir(games) else []
+    folder = os.path.join(games, names[0]) if len(names) == 1 else None
+    report('folders: a game extracted to a folder', folder is not None, out[-300:])
+    if folder is None:
+        return
+    rc, out = run([TOOL, 'analyze', '-k', KEYS, games])
+    report('folders: analyzing the folder it is in lists it as a game folder, with what it comes to', rc == 0 and 'Found 0 title(s) and 1 game folder(s)' in out and
+           'game folder, v0' in out, out[-400:])
+    built = os.path.join(d, 'built')
+    rc, out = run([TOOL, 'convert', '-k', KEYS, games, '--nspdir', built, '--nosignncasig2'])
+    made = sorted(f for f in os.listdir(built) if f.endswith('.nsp')) if os.path.isdir(built) else []
+    report('folders: converting the folder it is in builds it, named as the screens name it', rc == 0 and len(made) == 1 and made[0].endswith('[0100ABCD12340000][v0][LZ4].nsp'),
+           f'{made} {out[-300:]}')
+    if len(made) == 1:
+        x = os.path.join(d, 'x')
+        rc, _ = run([TOOL, 'extract', '-k', KEYS, os.path.join(built, made[0]), '--outdir', x])
+        again = os.path.join(x, os.listdir(x)[0]) if rc == 0 and os.path.isdir(x) and len(os.listdir(x)) == 1 else None
+        report("folders: and it holds all of the folder's game data", again is not None and tree_hashes(os.path.join(again, 'romfs')) == tree_hashes(os.path.join(folder, 'romfs')))
+    rc, out = run([TOOL, 'convert', '-k', KEYS, folder, '--nspdir', built, '--nosignncasig2'])
+    made = sorted(f for f in os.listdir(built) if f.endswith('.nsp')) if os.path.isdir(built) else []
+    report('folders: the game folder given itself is built too, beside the first under a free name', rc == 0 and len(made) == 2 and any(f.endswith('[LZ4] (2).nsp') for f in made),
+           str(made))
+    rc, out = run([TOOL, 'extract', '-k', KEYS, games, '--outdir', os.path.join(d, 'x2')])
+    report("folders: extracting leaves a game folder out, as it's extracted already", 'extracted already' in out and not os.path.isdir(os.path.join(d, 'x2')), out[-300:])
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def section_copies():
+    """A compressed copy given with a newer update: made one title with it when the update fits, and otherwise listed by itself, with the
+    update saying why, which is only that the copy is missing parts of the original game when that's so. Each other update given with a copy
+    is noted once. A game repacked
+    with compression off takes a newer update too, from the map it was made with."""
+    d = fresh('copies_with_updates')
+    rc, out = run([sys.executable, '-I', os.path.join(S, 'make_patch_test.py'), KEYS, TOOL, T1, d, 'plain'])
+    if rc != 0:
+        report('copies: test title generated', False, out[-300:])
+        return
+    base, update, same = [os.path.join(d, n) for n in ('base.nsp', 'update.nsp', 'update_same.nsp')]
+
+    def made(name, inputs, *args):
+        target = os.path.join(d, name)
+        rc, out = run([TOOL, 'convert', '-k', KEYS, *inputs, '--nspdir', target, '--nosignncasig2', *args])
+        files = [os.path.join(target, f) for f in os.listdir(target) if f.endswith('.nsp')] if os.path.isdir(target) else []
+        return (files[0] if rc == 0 and len(files) == 1 else None), out
+
+    def game_data(nsp, name):
+        """The files of its game data, extracted, by their hashes."""
+        target = os.path.join(d, 'x_' + name)
+        shutil.rmtree(target, ignore_errors=True)
+        rc, _ = run([TOOL, 'extract', '-k', KEYS, nsp, '--outdir', target])
+        folders = [os.path.join(target, f) for f in os.listdir(target)] if rc == 0 and os.path.isdir(target) else []
+        return tree_hashes(os.path.join(folders[0], 'romfs')) if len(folders) == 1 else None
+
+    copy, out = made('copy', [base])
+    report('copies: a compressed copy of the game alone', copy is not None, out[-300:])
+    merged, out = made('merged', [base, update])
+    report('copies: and one with its update made part of it', merged is not None, out[-300:])
+    if not copy or not merged:
+        return
+
+    _, out = made('together', [copy, update])
+    report('copies: the copy and a newer update are made one title', 'is used in place of the original game' in out, out[-500:])
+
+    # The same update without its ticket can't be read for want of its title key, which is what it says.
+    noticket = os.path.join(d, 'update_noticket.nsp')
+    write(noticket, without_tickets(update))
+    _, out = made('noticket', [copy, noticket])
+    report("copies: an update that can't be read says why, rather than that the copy is missing parts of the original game",
+           "can't be made part of the compressed game" in out and 'title key' in out and 'needs parts of the original game' not in out, out[-600:])
+    report('copies: and the copy is still listed by itself', 'already compressed' in out, out[-600:])
+
+    # A copy with the update in it already, given with that update and another of the same version: each noted once.
+    _, out = made('notes', [merged, update, same])
+    report('copies: each update given with a copy is noted once', out.count("'update.nsp'") == 1 and out.count("'update_same.nsp'") == 1, out[-700:])
+
+    # A copy with its update in it takes a newer one through the map it was made with. One that reads parts of the original the earlier update
+    # replaced says the copy doesn't have them, and to give the original game: the earlier update's file has nothing the map hasn't.
+    _, out = made('merged_newer', [merged, os.path.join(d, 'update_v2.nsp')])
+    report('copies: a copy with its update in it and a newer update are made one title', 'is used in place of the original game' in out, out[-500:])
+    _, out = made('merged_all', [merged, os.path.join(d, 'update_same_v2.nsp')])
+    report('copies: a newer update needing parts the copy lacks says so, and to give the original game',
+           'needs parts of the original game that the compressed game' in out and 'Give the original game along with it' in out
+           and "that update's file" not in out, out[-500:])
+
+    # A game repacked with compression off, with its update in it, and a newer one, as on the Switch: the newer update reads the parts of the
+    # original the earlier one kept where the game has them, from the map it was made with, and the game data comes out as from the original.
+    # One that reads parts of the original the earlier update replaced can't be made from it, and says it needs the original game.
+    repacked, out = made('repacked', [base, update], '--nocompress')
+    report('copies: a game repacked with its update, compression off', repacked is not None, out[-300:])
+    if repacked:
+        newer = os.path.join(d, 'update_v2.nsp')
+        together, out = made('repacked_newer', [repacked, newer])
+        report('copies: the repacked game and a newer update are made one title', together is not None, out[-500:])
+        direct, out2 = made('original_newer', [base, newer])
+        if together and direct:
+            mine, theirs = game_data(together, 'repacked'), game_data(direct, 'original')
+            report('copies: with the same game data as the original game with that update', mine is not None and mine == theirs,
+                   f'{len(mine or {})} and {len(theirs or {})} files')
+        else:
+            report('copies: the original game with the newer update, to compare with', direct is not None, out2[-300:])
+        _, out = made('repacked_all', [repacked, os.path.join(d, 'update_same_v2.nsp')])
+        report('copies: a newer update reading what the earlier one replaced says the repacked game lacks part of the original game',
+               'a part of the original game that the repacked game' in out and 'damaged' not in out, out[-500:])
+
+    # The Switch's engine makes the same files from each of them, byte for byte, as it does from an original game and its update.
+    engine = os.environ.get('HBPTOOL')
+    if engine and os.path.exists(engine):
+        newer = os.path.join(d, 'update_v2.nsp')
+        cases = [('a compressed copy and a newer update', [copy, update]), ('a copy with its update in it and a newer one', [merged, newer])]
+        if repacked:
+            cases.append(('a repacked game and a newer update', [repacked, newer]))
+        for i, (name, inputs) in enumerate(cases):
+            a, b = os.path.join(d, f'pc_{i}'), os.path.join(d, f'switch_{i}')
+            rc1, _ = run([TOOL, 'convert', '-k', KEYS, *inputs, '--nspdir', a, '--nosignncasig2'])
+            rc2, out2 = run([engine, 'convert', '-k', KEYS, *inputs, '--nspdir', b, '--nosignncasig2'])
+            made_here = sorted(os.listdir(a)) if rc1 == 0 and os.path.isdir(a) else []
+            same = rc2 == 0 and len(made_here) == 1 and made_here == sorted(os.listdir(b)) and nsp_hashes(a) == nsp_hashes(b)
+            report(f'copies: the Switch engine makes the same from {name}', same, out2[-300:])
+    else:
+        report('HBPTOOL points at the engine', False, str(engine))
+    shutil.rmtree(d, ignore_errors=True)
 
 
 for sec in sys.argv[1:]:

@@ -13,8 +13,7 @@ void randomBytes(void* out, size_t size);
 class File {
 public:
     /// Sized is Create for a file that's most likely not there yet and whose size is known, given as the hint, which takes the card a good deal less work.
-    /// CreateOnce doesn't ask again if the system says it's out of handles, for when there's somewhere else to go instead.
-    enum class Mode { Read, Create, CreateOnce, Sized, Update };
+    enum class Mode { Read, Create, Sized, Update };
 
     File() = default;
     File(const std::string& path, Mode mode, i64 sizeHint = 0);
@@ -44,18 +43,39 @@ struct DirEntry {
     i64 size = 0;
 };
 
+/// Whether something's there. Only "未找到" means it isn't: the system can turn the question down for a while (see Refusals), or answer
+/// with another error, and then there's no telling.
+enum class Presence { There, Missing, CantTell };
+Presence presence(const std::string& path);
+/// Whether something's there, where not being able to tell counts as there. A refusal is never taken to mean something's missing: that had
+/// the welcome come back, remembered games forgotten, and could have had the record of a game left half replaced cleared away.
 bool exists(const std::string& path);
 bool isDirectory(const std::string& path);
-/// What's in a folder. Sizes only come with it if they cost nothing, or if they're asked for.
-std::vector<DirEntry> list(const std::string& path, bool sizes = true);
+/// Whether there's a folder there: a file of that name counts as none. Where it matters that a folder the system won't answer about isn't
+/// taken for one that isn't there, such as a game's romfs folder when it's built.
+Presence folderPresence(const std::string& path);
+/// What's in a folder. Sizes only come with it if they cost nothing, or if they're asked for. A folder that isn't there lists as empty. One
+/// the system turned down, or that couldn't all be read, lists as what it got, and says so through refused, when that's given.
+std::vector<DirEntry> list(const std::string& path, bool sizes = true, bool* refused = nullptr);
 /// Negative if it isn't there.
 i64 fileSize(const std::string& path);
-/// How many times the system has said it was out of handles, 2001-0106, and been asked again. For the log.
-i64 outOfHandlesCount();
+/// How many requests to the card the kernel has turned down, for the log: as being out of handles (2001-0105), and for an invalid memory state
+/// (2001-0106), and what the last one was for. Each is asked once (see askCard in nx_sys.cpp).
+struct Refusals {
+    i64 outOfHandles = 0;
+    i64 memoryState = 0;
+    std::string lastFor;
+    i64 total() const { return outOfHandles + memoryState; }
+};
+Refusals refusals();
+/// Each request the system turned down since this was last asked, the first few each time the app opens, in detail for the log: what was
+/// asked, how many other requests were going, and the state of the memory it was asked from. For working out why it happens.
+std::vector<std::string> takeRefusalDetails();
 
-/// How many threads wait on files at once. With custom firmware, everything goes through its fs.mitm module, shared with the whole system, which has
-/// been seen to abort, and take the console with it, under more than this. It isn't worth finding out how much more it would take.
-constexpr int FileThreads = 3;
+/// How many threads wait on files at once: one more than the app's sessions to the card (nx_main.cpp), so there's always a request ready when one
+/// comes back. Custom firmware's fs.mitm was seen to abort under more than three on 2 November, from requests turned down for short path buffers,
+/// which are full-size since.
+constexpr int FileThreads = 4;
 
 void makeDirectories(const std::string& path);
 /// Just the one, for when what it goes in is known to be there. With a great many of them, that adds up.
@@ -73,6 +93,19 @@ i64 largestFile(const std::string& path);
 i64 spareMemory();
 /// How much there is to work with, all told.
 i64 workMemory();
+/// What's taken of it and what's free, and with findLargest the most it can give in one piece, to 1 MB (which takes a moment), for the log
+/// when it runs out. Each is -1 where it can't be known. It allocates nothing unless asked for the largest piece.
+struct HeapUse {
+    i64 inUse = -1;
+    i64 free = -1;
+    i64 largestPiece = -1;
+};
+HeapUse heapUse(bool findLargest);
+/// The last times there wasn't room for something, how much it was and where it was asked for, for the log, and forgets them. Empty where
+/// that isn't kept.
+std::string refusedAllocations();
+/// Notes that there wasn't room for this much, from where it's called.
+void noteRefusalForLog(size_t size);
 /// Makes sure what was written is really on the card.
 void commit(const std::string& path);
 
@@ -83,6 +116,8 @@ public:
     Mutex(const Mutex&) = delete;
     void lock();
     void unlock();
+    /// Locked only if it can be straight away.
+    bool tryLock();
 
 private:
     friend class CondVar;

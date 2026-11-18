@@ -16,6 +16,8 @@ public:
     virtual ~Transport() = default;
     virtual void send(const void* data, size_t size) = 0;
     virtual void receive(void* data, size_t size) = 0;
+    /// The USB cable has the one way through, which every request takes turns on, so nothing can be read beside it on a second connection.
+    virtual bool onePipe() const { return false; }
 };
 
 /// The cable has one pair of endpoints and one shared 1 MiB buffer. Posting two transfers at
@@ -51,9 +53,15 @@ struct Peer {
 /// The PCs there are just now. Each platform says how it finds them.
 /// With the cable left out, the console's USB port isn't touched.
 std::vector<Peer> peers(bool cable = true);
-/// A PC on the cable that's also heard over the network is only kept on the cable, so its games are listed once, and read through the
-/// cable.
-void preferCable(std::vector<Peer>& peers);
+/// A PC on the cable that's also heard over the network is only kept on one of them, so its games are listed once: the cable, unless the
+/// settings put Wi-Fi first.
+void keepOneWayEach(std::vector<Peer>& peers);
+/// Which way a PC on both is read through: the cable to begin with, as a cable is faster and steadier than Wi-Fi. A PC heard over the
+/// network first, before the cable's PC has said its name, is read through the cable too once it has, when the cable comes first.
+void setWifiFirst(bool wifiFirst);
+bool wifiFirst();
+/// Connections made the way the settings had it are let go, so the next request goes the way they say now.
+void forgetLinks();
 /// Something has come or gone since this was last asked.
 bool peersChanged();
 /// The app is closing: whatever's been looking for PCs stops, before what it uses is taken down.
@@ -84,6 +92,16 @@ private:
     /// being worked on. Each request otherwise has to wait for the one before to come all the way across.
     struct Stream;
     bool fromStream(i64& offset, u8*& out, size_t& count);
+    /// What came across from the PC, and how long that took, for the log: how fast the way through was, as against how fast the file was
+    /// worked through.
+    struct Tally {
+        std::atomic<i64> bytes{0};
+        std::atomic<i64> micros{0};
+    };
+    Tally _tally;
+    i64 _given = 0;
+    double _firstAt = 0, _lastAt = 0;
+    bool _overCable = false;
 
     std::string _path;
     i64 _size;
@@ -96,10 +114,13 @@ private:
 };
 
 std::shared_ptr<RemoteFile> open(const std::string& path);
-std::vector<sys::DirEntry> list(const std::string& path);
+/// A folder the PC couldn't list (as against one that isn't there) says so through failed, when that's given, as sys::list does.
+std::vector<sys::DirEntry> list(const std::string& path, bool* failed = nullptr);
 /// Negative if it isn't there.
 i64 fileSize(const std::string& path);
 bool isDirectory(const std::string& path);
+/// Whether there's a folder there, with the PC failing to answer as can't tell, as sys::folderPresence does.
+sys::Presence folderPresence(const std::string& path);
 
 /// What the PC worked out itself about a game file or an extracted game's folder: its titles, names and icons, as lines and then the
 /// icons. False if it can't say, such as a version from before it could, and it's to be read here instead. Working it out can take a

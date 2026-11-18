@@ -20,6 +20,7 @@ public:
 
     /// Starts from a list of NSPs, as if they'd been installed.
     void install(const std::vector<std::string>& nspPaths, Storage storage);
+    std::vector<u64> cardApplications() override;
 
     /// The Nth call from now on loses power. Zero means it never does.
     void losePowerAt(int call) {
@@ -56,7 +57,27 @@ public:
     void deleteContent(Storage storage, const ContentId& id) override;
     void setLaunchVersion(u64 applicationId, u32 version) override { launchVersions[applicationId] = version; }
     std::map<u64, u32> launchVersions;
+    std::vector<VersionFigures> versionFigures(const std::vector<u64>& applicationIds) override {
+        std::vector<VersionFigures> figures;
+        for (u64 id : applicationIds) {
+            VersionFigures game;
+            game.application = id;
+            game.launchRequired = launchVersions.count(id) ? launchVersions[id] : 0;
+            if (versionList.count(id)) {
+                game.listed = true;
+                game.newest = versionList[id].first;
+                game.required = versionList[id].second;
+            }
+            figures.push_back(game);
+        }
+        return figures;
+    }
+    /// What the console's version list says of a game, set by a test: the newest version, then the required one.
+    std::map<u64, std::pair<u32, u32>> versionList;
+    /// The game the app has been opened through, as the homebrew menu is by holding R on one.
+    u64 runsThrough = 0;
     void setMeta(Storage storage, const MetaKey& key, const Bytes& installMeta) override;
+    Bytes getMeta(Storage storage, const MetaKey& key) override;
     bool hasMeta(Storage storage, const MetaKey& key) override;
     void removeMeta(Storage storage, const MetaKey& key) override;
     void setRecords(u64 applicationId, const std::vector<std::pair<MetaKey, Storage>>& records) override;
@@ -69,6 +90,10 @@ public:
 
     /// How often names and icons have been read, which is what takes the time on the real thing.
     std::atomic<int> controlReads{0};
+    /// Writes of new contents, and how many of them started or ended inside one of the 16 KB blocks the console encrypts an installed game
+    /// in on the SD card, other than where the content ends. Each of those has that block written twice on the real thing.
+    std::atomic<int> contentWrites{0};
+    std::atomic<int> blockSplittingWrites{0};
 
     std::string contentPath(Storage storage, const ContentId& id) const;
     std::string placeholderPath(Storage storage, const std::string& token) const;

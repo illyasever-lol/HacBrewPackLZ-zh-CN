@@ -15,7 +15,7 @@ internal sealed class Builder
     public Builder(Options options, Keyset keyset)
     {
         _options = options;
-        int generationIndex = Math.Max(options.KeyGeneration - 1, 0);
+        int generationIndex = options.KeyGeneration - 1;
         var keyAreaKey = keyset.TryKeyAreaKeyApplication(generationIndex)
             ?? throw new ToolException($"key_area_key_application_{generationIndex:x2} (for keygeneration {options.KeyGeneration}) is not present in the keyset file");
         _writer = new NcaWriter(keyset.HeaderKey, keyAreaKey, options.KeyAreaKey, options.KeyGeneration, options.SdkVersion);
@@ -96,7 +96,7 @@ internal sealed class Builder
         if (sections[2] is { } logo)
             builder.Add(2, logo);
 
-        summary = new CompressionSummary(compressed.VirtualSize, compressed.DataSize, compressed.Lz4Blocks, compressed.StoredBlocks, compressed.EntryCount);
+        summary = new CompressionSummary(compressed.VirtualSize, compressed.DataSize, compressed.Lz4Blocks, compressed.StoredBlocks, compressed.EntryCount, compressed.SharedBytes);
         return _nsp.EndNca(builder, NcaContentType.Program, titleId, signer);
     }
 
@@ -143,22 +143,24 @@ internal sealed class Builder
         Ui.Info("");
         Ui.Info($"Title ID: {titleId:x16}");
         uint sdk = _options.SdkVersion;
-        Ui.Info($"SDK 版本: {(sdk >> 24) & 0xFF}.{(sdk >> 16) & 0xFF}.{(sdk >> 8) & 0xFF}.{sdk & 0xFF}");
-        Ui.Info($"Section Crypto Type: {(_options.Plaintext ? "Plaintext" : "Regular Crypto")}");
-        Ui.Info($"密钥世代: {FirmwareVersions.Describe(_options.KeyGeneration)} (NCA 头部写入 0x{_options.KeyGeneration:X})");
-        Ui.Info($"Key area key 2: {Convert.ToHexString(_options.KeyAreaKey)}");
-        Ui.Info($"Program NCA RomFS Section: {(_options.NoRomfs ? "No" : summary is null ? "Yes (not compressed)" : "Yes (LZ4 compressed)")}");
-        Ui.Info($"Program NCA Logo Section: {(_options.NoLogo ? "No" : "Yes")}");
-        Ui.Info($"HtmlDoc NCA: {(_options.HtmlDocDir is null ? "No" : "Yes")}");
-        Ui.Info($"LegalInfo NCA: {(_options.LegalInfoDir is null ? "No" : "Yes")}");
+        Ui.Info($"SDK 版本：{(sdk >> 24) & 0xFF}.{(sdk >> 16) & 0xFF}.{(sdk >> 8) & 0xFF}.{sdk & 0xFF}");
+        Ui.Info($"区段加密方式：{(_options.Plaintext ? "不加密" : "常规加密")}");
+        Ui.Info($"密钥世代：{_options.KeyGeneration}");
+        Ui.Info($"密钥区密钥 2：{Convert.ToHexString(_options.KeyAreaKey)}");
+        Ui.Info($"Program NCA 的 RomFS 区段：{(_options.NoRomfs ? "无" : summary is null ? "有（未压缩）" : "有（LZ4 压缩）")}");
+        Ui.Info($"Program NCA 的 Logo 区段：{(_options.NoLogo ? "无" : "有")}");
+        Ui.Info($"HtmlDoc NCA：{(_options.HtmlDocDir is null ? "无" : "有")}");
+        Ui.Info($"LegalInfo NCA：{(_options.LegalInfoDir is null ? "无" : "有")}");
         if (summary is { } s)
         {
-            Ui.Info($"RomFS size: {ProgressReporter.Format(s.VirtualSize)}");
-            Ui.Info($"RomFS stored as: {ProgressReporter.Format(s.DataSize)} ({s.DataSize * 100.0 / s.VirtualSize:0.0}%, saved {ProgressReporter.Format(Math.Max(s.VirtualSize - s.DataSize, 0))})");
-            Ui.Info($"RomFS blocks: {s.Lz4Blocks} LZ4, {s.StoredBlocks} stored raw ({s.EntryCount} table entries, {ProgressReporter.Format(_options.BlockSize)} block size, level {_options.Level})");
+            Ui.Info($"RomFS 大小：{ProgressReporter.Format(s.VirtualSize)}");
+            Ui.Info($"RomFS 压缩为：{ProgressReporter.Format(s.DataSize)}（{s.DataSize * 100.0 / s.VirtualSize:0.0}%，节省 {ProgressReporter.Format(Math.Max(s.VirtualSize - s.DataSize, 0))}）");
+            Ui.Info($"RomFS 块：{s.Lz4Blocks} 个 LZ4，{s.StoredBlocks} 个原样存储（{s.EntryCount} 个表项，块大小 {ProgressReporter.Format(_options.BlockSize)}，级别 {_options.Level}）");
+            if (s.SharedBytes > 0)
+                Ui.Info($"RomFS 中的重复数据：{ProgressReporter.Format(s.SharedBytes)}，只存一份");
         }
         Ui.Info($"Created NSP: {nspPath} ({ProgressReporter.Format(new FileInfo(nspPath).Length)})");
     }
 
-    private sealed record CompressionSummary(long VirtualSize, long DataSize, long Lz4Blocks, long StoredBlocks, int EntryCount);
+    private sealed record CompressionSummary(long VirtualSize, long DataSize, long Lz4Blocks, long StoredBlocks, int EntryCount, long SharedBytes);
 }

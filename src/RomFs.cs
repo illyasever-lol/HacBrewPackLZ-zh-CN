@@ -32,6 +32,8 @@ internal static class RomFsBuilder
         public required long Size;
         public required DirNode Parent;
         public byte[]? Replacement;
+        /// <summary>Where it comes from, when it isn't a file on disk.</summary>
+        public DataSource? Source;
         public FileNode? Sibling;
         public uint EntryOffset;
         public long Offset;
@@ -45,8 +47,59 @@ internal static class RomFsBuilder
         var root = new DirNode { Name = [], SortKey = [], HostPath = directory };
         var dirs = new List<DirNode>();
         var files = new List<FileNode>();
-        Visit(root, dirs, files, replacements);
+        Visit(root, dirs, files, replacements, [RealPath(new DirectoryInfo(directory))]);
+        return Layout(root, dirs, files);
+    }
 
+    /// <summary>
+    /// A RomFS made from what files hold rather than from disk, such as a game's control data with something added. Paths are separated
+    /// by '/', and folders with nothing in them can be given too, so that one read in is laid out again just as it was.
+    /// </summary>
+    public static DataSource BuildFrom(IReadOnlyList<(string path, DataSource data)> entries, IEnumerable<string> folders)
+    {
+        var root = new DirNode { Name = [], SortKey = [], HostPath = "" };
+        var byPath = new Dictionary<string, DirNode>(StringComparer.Ordinal) { [""] = root };
+        var dirs = new List<DirNode>();
+        DirNode DirOf(string path)
+        {
+            if (byPath.TryGetValue(path, out var known))
+                return known;
+            int slash = path.LastIndexOf('/');
+            var parent = DirOf(slash < 0 ? "" : path[..slash]);
+            var name = Encoding.UTF8.GetBytes(slash < 0 ? path : path[(slash + 1)..]);
+            var dir = new DirNode { Name = name, SortKey = [.. parent.SortKey, (byte)'\\', .. name], HostPath = "", Parent = parent };
+            byPath[path] = dir;
+            dirs.Add(dir);
+            return dir;
+        }
+        foreach (var folder in folders)
+            DirOf(folder);
+        var files = new List<FileNode>();
+        foreach (var (path, data) in entries)
+        {
+            int slash = path.LastIndexOf('/');
+            var dir = DirOf(slash < 0 ? "" : path[..slash]);
+            var name = Encoding.UTF8.GetBytes(slash < 0 ? path : path[(slash + 1)..]);
+            files.Add(new FileNode { Name = name, SortKey = [.. dir.SortKey, (byte)'\\', .. name], HostPath = "", Size = data.Length, Parent = dir, Source = data });
+        }
+
+        // Each folder's own folders and files in order, as going through a folder on disk has them.
+        foreach (var dir in byPath.Values)
+        {
+            var childDirs = dirs.Where(d => d.Parent == dir).OrderBy(d => d.SortKey, Comparer<byte[]>.Create(KeyOrder)).ToList();
+            var childFiles = files.Where(f => f.Parent == dir).OrderBy(f => f.SortKey, Comparer<byte[]>.Create(KeyOrder)).ToList();
+            for (int i = 0; i + 1 < childDirs.Count; i++)
+                childDirs[i].Sibling = childDirs[i + 1];
+            for (int i = 0; i + 1 < childFiles.Count; i++)
+                childFiles[i].Sibling = childFiles[i + 1];
+            dir.FirstChild = childDirs.Count > 0 ? childDirs[0] : null;
+            dir.FirstFile = childFiles.Count > 0 ? childFiles[0] : null;
+        }
+        return Layout(root, dirs, files);
+    }
+
+    private static DataSource Layout(DirNode root, List<DirNode> dirs, List<FileNode> files)
+    {
         dirs.Sort((a, b) => KeyOrder(a.SortKey, b.SortKey));
         files.Sort((a, b) => KeyOrder(a.SortKey, b.SortKey));
         dirs.Insert(0, root);
@@ -129,7 +182,7 @@ internal static class RomFsBuilder
         foreach (var file in files)
         {
             image.Add(new ZeroSource(file.Offset - position));
-            image.Add(file.Replacement is { } data ? new BytesSource(data) : new FileSource(file.HostPath, file.Size));
+            image.Add(file.Replacement is { } data ? new BytesSource(data) : file.Source ?? new FileSource(file.HostPath, file.Size));
             position = file.Offset + file.Size;
         }
         image.Add(new ZeroSource(dirHashOffset - FilePartitionOffset - position));
@@ -140,7 +193,50 @@ internal static class RomFsBuilder
         return image;
     }
 
-    private static void Visit(DirNode dir, List<DirNode> allDirs, List<FileNode> allFiles, IReadOnlyDictionary<string, byte[]>? replacements)
+    /// <summary>
+    /// How much a folder holds, with all the folders in it, going through links to folders as building it does, and stopping the same way at
+    /// one back to a folder it's in: .NET's own walk through every folder went round such a link until Windows gave up, with an error about
+    /// a file no one could make sense of.
+    /// </summary>
+    public static long FolderBytes(string directory)
+    {
+        long total = 0;
+        var within = new List<string> { RealPath(new DirectoryInfo(directory)) };
+        void Walk(DirectoryInfo dir)
+        {
+            foreach (var entry in dir.EnumerateFileSystemInfos())
+            {
+                if (entry is FileInfo file)
+                {
+                    total += file.Length;
+                    continue;
+                }
+                var folder = (DirectoryInfo)entry;
+                string real = folder.LinkTarget is not null ? RealPath(folder) : Path.Combine(within[^1], folder.Name);
+                if (within.Contains(real, LocalNames.PathComparer))
+                    throw LinkBack(folder.FullName);
+                within.Add(real);
+                Walk(folder);
+                within.RemoveAt(within.Count - 1);
+            }
+        }
+        Walk(new DirectoryInfo(directory));
+        return total;
+    }
+
+    private static ToolException LinkBack(string path) =>
+        new($"'{path}' is a link back to a folder it's in, so it would go round for ever. Copy what it should hold in its place, or delete it");
+
+    /// <summary>Where a folder really is, through a link to it.</summary>
+    private static string RealPath(DirectoryInfo folder)
+    {
+        string path = folder.LinkTarget is not null ? folder.ResolveLinkTarget(true)?.FullName ?? folder.FullName : folder.FullName;
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+    }
+
+    /// <param name="within">Where each folder on the way here really is. A link to a folder is followed, so nothing in it is left out, but one
+    /// back to a folder it's in would go round for ever, until the program ran out of stack and vanished.</param>
+    private static void Visit(DirNode dir, List<DirNode> allDirs, List<FileNode> allFiles, IReadOnlyDictionary<string, byte[]>? replacements, List<string> within)
     {
         var childDirs = new List<DirNode>();
         var childFiles = new List<FileNode>();
@@ -178,7 +274,16 @@ internal static class RomFsBuilder
         allDirs.AddRange(childDirs);
         allFiles.AddRange(childFiles);
         foreach (var child in childDirs)
-            Visit(child, allDirs, allFiles, replacements);
+        {
+            // Where it really is: through a link, where that goes, and otherwise where the folder it's in really is.
+            var folder = new DirectoryInfo(child.HostPath);
+            string real = folder.LinkTarget is not null ? RealPath(folder) : Path.Combine(within[^1], folder.Name);
+            if (within.Contains(real, LocalNames.PathComparer))
+                throw LinkBack(child.HostPath);
+            within.Add(real);
+            Visit(child, allDirs, allFiles, replacements, within);
+            within.RemoveAt(within.Count - 1);
+        }
     }
 
     public static uint PathHash(uint parent, ReadOnlySpan<byte> name)

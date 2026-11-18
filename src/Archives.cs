@@ -8,6 +8,9 @@ internal sealed class Pfs0Archive
 {
     public sealed record Entry(string Name, long Offset, long Size);
 
+    /// <summary>The largest hash block taken: real ones are 4 or 64 KB, and a damaged one is read whole.</summary>
+    private const int MostBlock = 16 << 20;
+
     public DataSource Data { get; }
     public int HashBlockSize { get; }
     public List<Entry> Files { get; } = [];
@@ -40,7 +43,8 @@ internal sealed class Pfs0Archive
         long tableSize = BinaryPrimitives.ReadInt64LittleEndian(h[0x38..]);
         long dataOffset = BinaryPrimitives.ReadInt64LittleEndian(h[0x40..]);
         long dataSize = BinaryPrimitives.ReadInt64LittleEndian(h[0x48..]);
-        if (blockSize <= 0 || tableOffset < 0 || tableSize < 0 || tableOffset + tableSize > logical.Length || dataOffset < 0 || dataSize < 0x10 || dataOffset + dataSize > logical.Length)
+        if (blockSize <= 0 || blockSize > MostBlock || tableSize > Ranges.MostTable || !Ranges.Fits(tableOffset, tableSize, logical.Length) || dataSize < 0x10 ||
+            !Ranges.Fits(dataOffset, dataSize, logical.Length))
             throw new ToolException($"{what} has an invalid PFS0 layout");
 
         var data = new SubSource(logical, dataOffset, dataSize);
@@ -85,7 +89,7 @@ internal sealed class Pfs0Archive
         int count = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(4));
         int nameTable = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(8));
         long tableSize = count * 0x18L + nameTable;
-        if (count < 0 || nameTable < 0 || 0x10 + tableSize > Data.Length)
+        if (count < 0 || nameTable < 0 || nameTable > Ranges.MostTable || !Ranges.Fits(0x10, tableSize, Data.Length))
             throw new ToolException($"{what} has a damaged PFS0 header");
 
         var table = new byte[tableSize];
@@ -98,7 +102,7 @@ internal sealed class Pfs0Archive
             long offset = BinaryPrimitives.ReadInt64LittleEndian(e);
             long size = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
             int nameOffset = BinaryPrimitives.ReadInt32LittleEndian(e[0x10..]);
-            if (offset < 0 || size < 0 || dataStart + offset + size > Data.Length || nameOffset < 0 || nameOffset >= nameTable)
+            if (!Ranges.Fits(offset, size, Data.Length - dataStart) || nameOffset < 0 || nameOffset >= nameTable)
                 throw new ToolException($"{what} has a damaged PFS0 entry");
             var name = names[nameOffset..];
             int end = name.IndexOf((byte)0);
@@ -133,6 +137,8 @@ internal sealed class RomFsArchive
         var dirs = ReadTable(image, Field(3), Field(4), what);
         var files = ReadTable(image, Field(7), Field(8), what);
         long partition = Field(9);
+        if (partition < 0 || partition > image.Length)
+            throw new ToolException($"{what} has a damaged RomFS header");
 
         var archive = new RomFsArchive(image);
         var seenDirs = new HashSet<uint>();
@@ -152,7 +158,7 @@ internal sealed class RomFsArchive
                 string name = Name(files, file, 0x1C, 0x20, what);
                 long offset = BinaryPrimitives.ReadInt64LittleEndian(Slice(files, file + 0x08L, 8, what));
                 long size = BinaryPrimitives.ReadInt64LittleEndian(Slice(files, file + 0x10L, 8, what));
-                if (offset < 0 || size < 0 || partition + offset + size > image.Length)
+                if (!Ranges.Fits(offset, size, image.Length - partition))
                     throw new ToolException($"{what}: file {path}{name} lies outside the RomFS");
                 archive.Files.Add(new Entry(path + name, partition + offset, size));
             }
@@ -169,7 +175,7 @@ internal sealed class RomFsArchive
 
     private static byte[] ReadTable(DataSource image, long offset, long size, string what)
     {
-        if (offset < 0 || size < 0 || size > MaxTableSize || offset + size > image.Length)
+        if (size > MaxTableSize || !Ranges.Fits(offset, size, image.Length))
             throw new ToolException($"{what} has a damaged RomFS header");
         var table = new byte[size];
         image.Read(offset, table, 0, table.Length);

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+    <item name="android:colorAccent">#0A6878</item>
+    <item name="android:colorPrimary">#0A6878</item>
+    <item name="android:windowBackground">#D8DBDF</item>
+    <!-- Dark clock, battery and navigation icons, as the screen behind them is light. -->
+    <item name="android:windowLightStatusBar">true</item>
+    <item name="android:windowLightNavigationBar">true</item>
+  </style>
+  <color name="icon_background">#0E7A8B</color>
+</resources>

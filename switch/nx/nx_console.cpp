@@ -7,6 +7,7 @@
 #include <array>
 
 #include "nx_ipc.h"
+#include "nx_path.h"
 
 namespace hbp {
 
@@ -16,8 +17,12 @@ std::string codeOf(Result rc) { return format("%04u-%04u", 2000 + R_MODULE(rc), 
 
 /// Throws what went wrong, in words, with the system's code to go with it.
 void check(Result rc, const char* what) {
-    if (R_FAILED(rc))
-        throw ToolError(format("%s (%s)", what, codeOf(rc).c_str()));
+    if (!R_FAILED(rc))
+        return;
+    std::string message = format("%s (%s)", what, codeOf(rc).c_str());
+    if (isDamagedFileSystem(R_MODULE(rc), R_DESCRIPTION(rc)))
+        throw DamagedFileSystem(message);
+    throw ToolError(message);
 }
 
 NcmStorageId storageIdOf(Storage storage) {
@@ -107,6 +112,9 @@ private:
                 return file;
         }
 
+        // A game card has no file system of its own to read it through, only the content manager.
+        if (where != Storage::Sd && where != Storage::Nand)
+            return nullptr;
         OneStorage& mine = _storages[where == Storage::Sd ? 0 : 1];
         if (!mine.tried) {
             mine.tried = true;
@@ -127,9 +135,9 @@ private:
             inner.pop_back();
 
         FsFile opened;
-        if (R_FAILED(fsFsOpenFile(&mine.fs, inner.c_str(), FsOpenMode_Read, &opened))) {
+        if (R_FAILED(fsFsOpenFile(&mine.fs, FsPath(inner.c_str()), FsOpenMode_Read, &opened))) {
             // Not worth trying again for every read of everything.
-            sink().message("正在通过内容管理器读取" + std::string(storageName(where)));
+            sink().message("正在通过内容管理器读取 " + std::string(storageName(where)));
             fsFsClose(&mine.fs);
             mine.mounted = false;
             return nullptr;
@@ -169,6 +177,9 @@ class NxWriter : public ContentWriter {
 public:
     NxWriter(DirectReader& reader, NcmContentStorage* storage, i64 size) : _reader(reader), _storage(storage), _exact(size >= 0), _size(size >= 0 ? size : GrowBy) {
         check(ncmContentStorageGeneratePlaceHolderId(_storage, &_placeholder), "无法为新副本分配空间");
+    }
+
+    void create() override {
         // The content ID that goes with a placeholder only says which folder to make sure of, and the real one isn't known yet.
         NcmContentId unknown;
         memcpy(unknown.c, _placeholder.uuid.uuid, sizeof(unknown.c));
@@ -182,8 +193,12 @@ public:
     }
 
     ~NxWriter() override {
-        if (_created)
+        if (_created) {
+            // Atmosphere's ncm flushes a placeholder before deleting it, but nothing says every version of it does, and closing one with
+            // writes not yet flushed brings the whole console down.
+            flushWrites();
             ncmContentStorageDeletePlaceHolder(_storage, &_placeholder);
+        }
     }
 
     std::string token() const override { return toHex(_placeholder.uuid.uuid, sizeof(_placeholder.uuid.uuid)); }
@@ -201,8 +216,12 @@ public:
             in += n;
             offset += (i64)n;
             size -= n;
+            _unflushed += (i64)n;
         }
         _end = std::max(_end, end);
+        // Otherwise all of it could be waiting in ncm's open file until the end, and lost with it if the console goes down before then.
+        if (_unflushed >= FlushEvery)
+            flushWrites();
     }
 
     void setSize(i64 size) override {
@@ -234,6 +253,7 @@ public:
 private:
     /// It grows in large steps, so that it stays in as few pieces as possible.
     static constexpr i64 GrowBy = 1LL << 30;
+    static constexpr i64 FlushEvery = 256LL << 20;
 
     void grow(i64 end) {
         if (_exact)
@@ -256,6 +276,7 @@ private:
     void flushWrites() {
         if (hosversionAtLeast(3, 0, 0))
             ncmContentStorageFlushPlaceHolder(_storage);
+        _unflushed = 0;
     }
 
     void registerAs(const NcmContentId& content) {
@@ -276,6 +297,7 @@ private:
     bool _exact;
     i64 _size;
     i64 _end = 0;
+    i64 _unflushed = 0;
     bool _created = false;
     NcmContentId _held;
     bool _isHeld = false;
@@ -289,7 +311,7 @@ public:
 
     void read(const std::string& path, i64 offset, void* buffer, size_t size) override {
         FsFile file;
-        check(fsFsOpenFile(&_fs, path.c_str(), FsOpenMode_Read, &file), "固件无法打开新副本中的文件");
+        check(fsFsOpenFile(&_fs, FsPath(path.c_str()), FsOpenMode_Read, &file), "固件无法打开新副本中的文件");
         u64 got = 0;
         Result rc = fsFileRead(&file, offset, buffer, size, FsReadOption_None, &got);
         fsFileClose(&file);
@@ -331,6 +353,12 @@ public:
             if (side.databaseOpen)
                 ncmContentMetaDatabaseClose(&side.database);
         }
+        {
+            sys::Lock lock(_cardMutex);
+            closeCardLocked();
+        }
+        if (_operatorOpen)
+            fsDeviceOperatorClose(&_operator);
         if (_esOpen)
             serviceClose(&_es);
         if (_managerOpen)
@@ -366,7 +394,9 @@ public:
             InstalledMeta meta;
             meta.key = record.first;
             meta.storage = record.second;
+            // What's on a game card is read from the card while it's in, and listed without its contents otherwise, as before.
             if (meta.storage == Storage::GameCard) {
+                readContents(meta);
                 game.metas.push_back(meta);
             } else if (readContents(meta)) {
                 game.metas.push_back(meta);
@@ -378,9 +408,9 @@ public:
         if (R_SUCCEEDED(pmdmntGetApplicationProcessId(&process)))
             pminfoGetProgramId(&running, process);
         if (applicationId == self)
-            game.blocked = "本程序是通过该游戏启动的，请改用其他游戏启动本程序后再压缩它";
+            game.blocked = "hacBrewPackLZ 正通过该游戏运行：请从其他游戏打开";
         else if (applicationId == running)
-            game.blocked = "该游戏当前处于打开状态，请关闭后再压缩";
+            game.blocked = "该游戏正在运行：请关闭后再压缩";
         return game;
     }
 
@@ -401,7 +431,23 @@ public:
         readControlFromService(game);
     }
 
-    SourcePtr openContent(Storage storage, const ContentId& id, i64 size) override { return std::make_shared<NxContent>(*_reader, contentStorage(storage), storage, id, size); }
+    SourcePtr openContent(Storage storage, const ContentId& id, i64 size) override { return std::make_shared<NxContent>(*_reader, readableStorage(storage), storage, id, size); }
+
+    std::vector<u64> cardApplications() override {
+        std::vector<u64> list;
+        if (!openCard())
+            return list;
+        constexpr int Batch = 64;
+        NcmContentMetaKey keys[Batch];
+        s32 total = 0, written = 0;
+        if (R_FAILED(ncmContentMetaDatabaseList(&_card.database, &total, &written, keys, Batch, NcmContentMetaType_Application, 0, 0, UINT64_MAX, NcmContentInstallType_Full)))
+            return list;
+        for (s32 i = 0; i < written; i++)
+            list.push_back(keys[i].id);
+        std::sort(list.begin(), list.end());
+        list.erase(std::unique(list.begin(), list.end()), list.end());
+        return list;
+    }
 
     void addTitleKeys(TicketStore& store, const Keyset& keyset) override {
         loadTickets(keyset);
@@ -455,6 +501,22 @@ public:
         check(ncmContentMetaDatabaseCommit(database), "无法登记新副本");
     }
 
+    Bytes getMeta(Storage storage, const MetaKey& key) override {
+        NcmContentMetaKey ncm = toNcm(key);
+        NcmContentMetaDatabase* database = metaDatabase(storage);
+        u64 size = 0;
+        check(ncmContentMetaDatabaseGetSize(database, &size, &ncm), "无法读取游戏记录");
+        // A record is a header and a line for each of the game's parts, which comes nowhere near this.
+        if (size < 8 || size > (1 << 20))
+            throw ToolError(format("A game's record is %llu bytes, which isn't what one is", (unsigned long long)size));
+        Bytes record((size_t)size);
+        u64 got = 0;
+        check(ncmContentMetaDatabaseGet(database, &ncm, &got, record.data(), record.size()), "无法读取游戏记录");
+        if (got != size)
+            throw ToolError("A game's record came back shorter than it is");
+        return record;
+    }
+
     bool hasMeta(Storage storage, const MetaKey& key) override {
         NcmContentMetaKey ncm = toNcm(key);
         bool has = false;
@@ -474,6 +536,28 @@ public:
         Result rc = avmPushLaunchVersion(applicationId, version);
         avmExit();
         check(rc, "对方未接受");
+    }
+
+    std::vector<VersionFigures> versionFigures(const std::vector<u64>& applicationIds) override {
+        check(avmInitialize(), "相关服务无法启动");
+        std::vector<VersionFigures> figures;
+        for (u64 id : applicationIds) {
+            VersionFigures game;
+            game.application = id;
+            u32 version = 0;
+            if (R_SUCCEEDED(avmGetLaunchRequiredVersion(id, &version)))
+                game.launchRequired = version;
+            // A game the version list doesn't have is turned down, which only says that.
+            AvmVersionListEntry entry = {};
+            if (R_SUCCEEDED(avmGetVersionListEntry(id, &entry))) {
+                game.listed = true;
+                game.newest = entry.version;
+                game.required = entry.required;
+            }
+            figures.push_back(game);
+        }
+        avmExit();
+        return figures;
     }
 
     void setRecords(u64 applicationId, const std::vector<std::pair<MetaKey, Storage>>& list) override {
@@ -539,6 +623,45 @@ private:
         return &side.storage;
     }
 
+    /// Where a content can be read from: the console's own storage, the SD card, or a game card that's in.
+    NcmContentStorage* readableStorage(Storage storage) {
+        if (storage != Storage::GameCard)
+            return contentStorage(storage);
+        if (!openCard())
+            throw ToolError("The game card couldn't be read. Is it still in?");
+        return &_card.storage;
+    }
+
+    /// Whether a game card is in, with its records and contents open for reading. Another card, or the same one taken out and put back, is
+    /// opened again, as what was open is no use for it.
+    bool openCard() {
+        sys::Lock lock(_cardMutex);
+        if (!_operatorOpen)
+            _operatorOpen = R_SUCCEEDED(fsOpenDeviceOperator(&_operator));
+        bool inserted = false;
+        if (!_operatorOpen || R_FAILED(fsDeviceOperatorIsGameCardInserted(&_operator, &inserted)) || !inserted) {
+            closeCardLocked();
+            return false;
+        }
+        FsGameCardHandle handle = {};
+        bool known = R_SUCCEEDED(fsDeviceOperatorGetGameCardHandle(&_operator, &handle));
+        if (_card.storageOpen && _card.databaseOpen && known && handle.value == _cardHandle)
+            return true;
+        closeCardLocked();
+        _cardHandle = known ? handle.value : 0;
+        _card.storageOpen = R_SUCCEEDED(ncmOpenContentStorage(&_card.storage, NcmStorageId_GameCard));
+        _card.databaseOpen = R_SUCCEEDED(ncmOpenContentMetaDatabase(&_card.database, NcmStorageId_GameCard));
+        return _card.storageOpen && _card.databaseOpen;
+    }
+
+    void closeCardLocked() {
+        if (_card.storageOpen)
+            ncmContentStorageClose(&_card.storage);
+        if (_card.databaseOpen)
+            ncmContentMetaDatabaseClose(&_card.database);
+        _card.storageOpen = _card.databaseOpen = false;
+    }
+
     NcmContentMetaDatabase* metaDatabase(Storage storage) {
         if (storage != Storage::Sd && storage != Storage::Nand)
             throw ToolError(format("Can't work with what's on %s", storageName(storage)));
@@ -581,7 +704,7 @@ private:
 
     bool readFileFrom(FsFileSystem& fs, const char* path, Bytes& out, size_t limit) {
         FsFile file;
-        if (R_FAILED(fsFsOpenFile(&fs, path, FsOpenMode_Read, &file)))
+        if (R_FAILED(fsFsOpenFile(&fs, FsPath(path), FsOpenMode_Read, &file)))
             return false;
         s64 size = 0;
         bool ok = false;
@@ -659,12 +782,17 @@ private:
         NcmContentMetaKey key = toNcm(meta.key);
         Storage order[] = {meta.storage, Storage::Sd, Storage::Nand};
         for (Storage storage : order) {
-            if (storage != Storage::Sd && storage != Storage::Nand)
+            // What's on a game card is only read from the card's own records, while it's in.
+            if (meta.storage == Storage::GameCard ? storage != Storage::GameCard || !openCard() : storage != Storage::Sd && storage != Storage::Nand)
                 continue;
-            auto& side = _sides[indexOf(storage)];
+            auto& side = storage == Storage::GameCard ? _card : _sides[indexOf(storage)];
             bool has = false;
             if (!side.databaseOpen || R_FAILED(ncmContentMetaDatabaseHas(&side.database, &has, &key)) || !has)
                 continue;
+            // Only a base game's say anything the app goes by.
+            u8 attributes = 0;
+            if (meta.key.type == Cnmt::MetaApplication && R_SUCCEEDED(ncmContentMetaDatabaseGetAttributes(&side.database, &key, &attributes)))
+                meta.attributes = attributes;
 
             constexpr int Batch = 32;
             NcmContentInfo infos[Batch];
@@ -675,12 +803,14 @@ private:
                     InstalledContent content;
                     memcpy(content.id.bytes, infos[i].content_id.c, sizeof(content.id.bytes));
                     ncmContentInfoSizeToU64(&infos[i], (u64*)&content.size);
-                    // Sphaira's forwarders have the size of the file inside it recorded for this one, and what's stored is all there.
+                    content.type = infos[i].content_type;
+                    content.idOffset = infos[i].id_offset;
+                    // Sphaira's forwarders have the size of the file inside it recorded for this one, and what's stored is all there. Its
+                    // type is known first: looked at before it was set, every content was taken for the meta here, as the type starts as
+                    // that (no harm came of it, as a real NCA is never under 3 KB).
                     s64 stored = 0;
                     if (content.type == NcmContentType_Meta && content.size < 0xC00 && side.storageOpen && R_SUCCEEDED(ncmContentStorageGetSizeFromContentId(&side.storage, &stored, &infos[i].content_id)))
                         content.size = stored;
-                    content.type = infos[i].content_type;
-                    content.idOffset = infos[i].id_offset;
                     meta.contents.push_back(content);
                 }
                 if (written < Batch)
@@ -795,6 +925,12 @@ private:
     bool _esOpen = false;
     Service _es;
     Side _sides[2];
+    /// A game card's, while one is in.
+    Side _card;
+    sys::Mutex _cardMutex;
+    FsDeviceOperator _operator;
+    bool _operatorOpen = false;
+    u32 _cardHandle = 0;
 
     int _language = -2;
     bool _ticketsLoaded = false;

@@ -53,6 +53,10 @@ struct CompressedData {
     i64 tableSize = 0;
     i64 dataSize = 0;
     int entryCount = 0;
+    /// What points at a piece already stored.
+    i64 sharedBytes = 0;
+    /// What of that was found held again while compressing, rather than through the update, which no estimate knows of.
+    i64 foundBytes = 0;
     IvfcResult ivfc;
 };
 
@@ -65,7 +69,8 @@ public:
 
 /// Cuts an image into fixed size blocks, LZ4 compresses them in parallel and passes on the result plus its BKTR table. Blocks that
 /// do not shrink are stored raw. Every compressed block is decoded again and compared with its input before it is accepted, so a
-/// compressor fault cannot alter game data.
+/// compressor fault cannot alter game data. A piece held more than once, found while the image is read, is stored once, and only
+/// pointed at where it's held again once two hashes of all its bytes are seen to be the same.
 namespace RomFsCompressor {
 /// A hand-over between threads that stops waiting once it's closed.
 template <typename Item>
@@ -104,7 +109,61 @@ private:
 constexpr int AveragePadding = 8;
 /// A block has to save more than it costs: splitting a raw run adds table entries and padding, and every read has to decode it.
 int compressCapacity(int length);
-CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int level, int threads, Progress& progress);
+
+/// A game can hold the same data more than once. An update often reads the same part of the original game from more than one place, so a
+/// game made part of its update holds that part more than once, and games repeat their own data too. Each piece held whole again is stored
+/// once, and every other place it's held points at what was stored. The console's reader doesn't mind: a compression entry can start
+/// anywhere, and several can point at the same stored bytes. As SharedPieces does on the PC.
+struct SharedBlock {
+    i64 offset = 0;
+    int length = 0;
+    /// The piece it is, or -1, and whether this is where it's held first, where it's stored.
+    int piece = -1;
+    bool first = false;
+    /// Found to hold a piece again while compressing, rather than through the update.
+    bool found = false;
+};
+struct SharedPlan {
+    std::vector<SharedBlock> blocks;
+    int references = 0;
+    i64 sharedBytes = 0;
+};
+/// The blocks with only what the update's map gives shared, as the estimate takes them: fixed blocks from the start, as without an update,
+/// wherever nothing is shared. Compressing finds more as it reads (see run).
+SharedPlan planShared(i64 imageLength, int blockSize, const std::vector<KeptRange>* kept);
+
+/// XXH64: quick, and two different blocks come to the same about once in 2^64, differently for each seed.
+u64 blockHash(const u8* data, size_t length, u64 seed);
+
+/// Every spot in the bytes, as the planner finds them for blocks this size, sorted and each once. The first 63 bytes are left out, as a spot
+/// there depends on what's before them. Spots say what two places hold in common without either being read whole, as the estimate's look for
+/// copies of files does.
+std::vector<u64> spotsIn(const u8* data, size_t length, int blockSize);
+
+CompressedData run(const SourcePtr& image, ByteSink& payload, int blockSize, int level, int threads, Progress& progress,
+                   const std::vector<KeptRange>* kept = nullptr);
+
+/// Of the blocks stored where they are, every this many one is compressed to measure the rest by.
+constexpr int MeasureEvery = 16;
+
+/// What compressing an image comes to, as measure finds it: what the blocks stored where they are come to, compressed or not, with the
+/// padding before each compressed one; give or take, from how much the blocks compressed to measure by differ from their neighbours; and the
+/// blocks that point at a piece stored before, each a table entry of its own, with the bytes they hold.
+struct Measurement {
+    i64 stored = 0;
+    double margin = 0;
+    i64 lz4Blocks = 0;
+    i64 rawBlocks = 0;
+    i64 held = 0;
+    i64 heldBytes = 0;
+};
+
+/// Reads all of the image once, as run does, and writes nothing. Every block the planner finds held again counts just as run stores it, once
+/// the same two hashes agree. Of the blocks stored where they are, every so many is compressed, counting from the start, so it's the same
+/// ones every time, and what those come to goes for all of them. Whatever reads the image checks it as it goes, so a damaged game fails
+/// here, before anything is written. RomFsCompressor.Measure on the PC does the same, sum for sum, so both come to the same figure.
+Measurement measure(const SourcePtr& image, int blockSize, int level, int threads, Progress& progress, const std::vector<KeptRange>* kept,
+                    int every = MeasureEvery);
 }  // namespace RomFsCompressor
 
 /// A worker per core, for jobs cut into many small pieces.
@@ -151,7 +210,7 @@ public:
     /// What's been written so far, read back from where it went.
     virtual void readBack(i64 offset, void* data, size_t size) = 0;
     /// What to call reading it all back.
-    virtual const char* readBackLabel() const { return "Checking what was written"; }
+    virtual const char* readBackLabel() const { return "正在校验写入内容"; }
 };
 
 class NcaWriter {
@@ -192,7 +251,8 @@ public:
     /// out its hash, and gets compared with what was written if asked.
     NcaBuilder(NcaWriter& writer, NcaStream& output, i64 holdInMemory, bool compareReadBack = true);
     void add(int index, NcaSection section);
-    void addCompressed(int index, const SourcePtr& image, int blockSize, int level, int threads, bool encrypted, Progress& progress, CompressedData* details = nullptr);
+    void addCompressed(int index, const SourcePtr& image, int blockSize, int level, int threads, bool encrypted, Progress& progress, CompressedData* details = nullptr,
+                       const std::vector<KeptRange>* kept = nullptr);
     NcaInfo finish(NcaContentType contentType, u64 titleId, bool sign, int contentIndex, u32 sdkOverride);
 
 private:

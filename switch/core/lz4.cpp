@@ -110,7 +110,7 @@ int compressGreedy(const u8* s, int n, u8* d, int capacity, u16* head, int skipS
 }
 
 int findLongest(const u8* s, u16* head, u16* prev, int& nextInsert, int ip, int matchEnd, int attempts, int& match) {
-    // Positions are stored +1 so that 0 can mean "空". The last 12 bytes are never inserted, so they fit in 16 bits.
+    // Positions are stored +1 so that 0 can mean "empty". The last 12 bytes are never inserted, so they fit in 16 bits.
     for (int i = nextInsert; i < ip; i++) {
         u32 h = hashOf(rd32(s + i));
         prev[i] = head[h];

@@ -52,7 +52,10 @@ internal sealed class GameArchive : IDisposable
         }
     }
 
-    public static bool IsGameFile(string path) => Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+    /// <summary>By its extension. A Mac copying files to a card leaves "._" files beside them, which hold what Finder knows about each and
+    /// aren't games.</summary>
+    public static bool IsGameFile(string path) =>
+        Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase) && !Path.GetFileName(path).StartsWith("._", StringComparison.Ordinal);
 
     public DataSource Open(Entry entry) => new SubSource(_file, entry.Offset, entry.Size);
 
@@ -99,7 +102,7 @@ internal sealed class GameArchive : IDisposable
         int count = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(4));
         int nameTable = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(8));
         long tableSize = count * 0x18L + nameTable;
-        if (count < 0 || count > MaxEntries || nameTable < 0 || 0x10 + tableSize > Length)
+        if (count < 0 || count > MaxEntries || nameTable < 0 || nameTable > Ranges.MostTable || !Ranges.Fits(0x10, tableSize, Length))
             throw new ToolException($"'{FilePath}' has a damaged NSP header");
 
         var table = new byte[tableSize];
@@ -112,7 +115,7 @@ internal sealed class GameArchive : IDisposable
             long offset = BinaryPrimitives.ReadInt64LittleEndian(e);
             long size = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
             int nameOffset = BinaryPrimitives.ReadInt32LittleEndian(e[0x10..]);
-            if (offset < 0 || size < 0 || dataStart + offset + size > Length || nameOffset < 0 || nameOffset >= nameTable)
+            if (!Ranges.Fits(offset, size, Length - dataStart) || nameOffset < 0 || nameOffset >= nameTable)
                 throw new ToolException($"'{FilePath}' has a damaged NSP entry");
             var name = names[nameOffset..];
             int end = name.IndexOf((byte)0);
@@ -151,7 +154,7 @@ internal sealed class GameArchive : IDisposable
         int count = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(4));
         int nameTable = BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(8));
         long tableSize = count * (long)Hfs0EntrySize + nameTable;
-        if (count < 0 || count > MaxEntries || nameTable < 0 || start + Hfs0HeaderSize + tableSize > Length)
+        if (count < 0 || count > MaxEntries || nameTable < 0 || nameTable > Ranges.MostTable || !Ranges.Fits(start + Hfs0HeaderSize, tableSize, Length))
             throw new ToolException($"'{FilePath}' has a damaged partition");
 
         var table = new byte[tableSize];
@@ -167,7 +170,7 @@ internal sealed class GameArchive : IDisposable
             int nameOffset = BinaryPrimitives.ReadInt32LittleEndian(e[0x10..]);
             if (offset < 0 || size < 0 || nameOffset < 0 || nameOffset >= nameTable)
                 throw new ToolException($"'{FilePath}' has a damaged partition");
-            if (mustFit && dataStart + offset + size > Length)
+            if (mustFit && !Ranges.Fits(offset, size, Length - dataStart))
                 throw new ToolException($"'{FilePath}' is cut short: a file in its partition lies outside the file");
             var name = names[nameOffset..];
             int end = name.IndexOf((byte)0);

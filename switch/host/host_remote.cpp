@@ -22,7 +22,7 @@ public:
             return WSAStartup(MAKEWORD(2, 2), &data) == 0;
         }();
         if (!started)
-            throw ToolError("网络不可用");
+            throw ToolError("The network isn't available");
         _socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         DWORD wait = 20000;
         setsockopt(_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&wait, sizeof(wait));
@@ -30,10 +30,35 @@ public:
         to.sin_family = AF_INET;
         to.sin_port = htons(port);
         inet_pton(AF_INET, host.c_str(), &to.sin_addr);
-        if (::connect(_socket, (sockaddr*)&to, sizeof(to)) != 0) {
-            closesocket(_socket);
-            throw ToolError("无法通过网络连接到 PC");
+        // As on the console: a little at a time, giving way when asked, and not for longer than a PC on the same network takes to answer.
+        u_long on = 1;
+        ioctlsocket(_socket, FIONBIO, &on);
+        bool connected = ::connect(_socket, (sockaddr*)&to, sizeof(to)) == 0;
+        if (!connected && WSAGetLastError() != WSAEWOULDBLOCK)
+            unreachable();
+        double until = sys::now() + 8;
+        while (!connected) {
+            if (shouldGiveWay()) {
+                closesocket(_socket);
+                throw Cancelled();
+            }
+            fd_set writable, failed;
+            FD_ZERO(&writable);
+            FD_ZERO(&failed);
+            FD_SET(_socket, &writable);
+            FD_SET(_socket, &failed);
+            timeval wait{0, 100000};
+            int n = select(0, nullptr, &writable, &failed, &wait);
+            if (n > 0) {
+                if (FD_ISSET(_socket, &failed))
+                    unreachable();
+                connected = true;
+            } else if (n < 0 || sys::now() > until) {
+                unreachable();
+            }
         }
+        u_long off = 0;
+        ioctlsocket(_socket, FIONBIO, &off);
     }
     ~TcpTransport() override { closesocket(_socket); }
 
@@ -43,7 +68,7 @@ public:
             waitFor(POLLOUT);
             int sent = ::send(_socket, in, (int)size, 0);
             if (sent <= 0)
-                throw ToolError("PC 已停止通过网络应答");
+                throw ToolError("The PC stopped answering over the network");
             in += sent;
             size -= (size_t)sent;
         }
@@ -55,13 +80,18 @@ public:
             waitFor(POLLIN);
             int got = recv(_socket, out, (int)size, 0);
             if (got <= 0)
-                throw ToolError("PC 已停止通过网络应答");
+                throw ToolError("The PC stopped answering over the network");
             out += got;
             size -= (size_t)got;
         }
     }
 
 private:
+    [[noreturn]] void unreachable() {
+        closesocket(_socket);
+        throw ToolError("Couldn't reach the PC over the network");
+    }
+
     /// As on the console: a little at a time, so that whatever's waiting can give way, and no longer than it would otherwise wait.
     void waitFor(short events) {
         constexpr double MostSeconds = 20;
@@ -74,11 +104,18 @@ private:
             if (n > 0)
                 return;
             if (n < 0 || sys::now() - started > MostSeconds)
-                throw ToolError("PC 已停止通过网络应答");
+                throw ToolError("The PC stopped answering over the network");
         }
     }
 
     SOCKET _socket = INVALID_SOCKET;
+};
+
+/// The cable, as the tests have it: the network underneath, with the one way through that a cable has.
+class CableTransport : public TcpTransport {
+public:
+    using TcpTransport::TcpTransport;
+    bool onePipe() const override { return true; }
 };
 
 }  // namespace
@@ -91,15 +128,22 @@ std::vector<Peer> peers(bool cable) {
     size_t colon = address.rfind(':');
     std::string host = address.substr(0, colon);
     u16 port = colon == std::string::npos ? TcpPort : (u16)atoi(address.c_str() + colon + 1);
-    auto connect = [host, port] { return std::unique_ptr<Transport>(new TcpTransport(host, port)); };
+    // HBP_TEST_PC_CABLE has the same PC on a cable as well, which here is the network underneath, and the network PC is read through it when
+    // the cable comes first, as on the console.
+    const char* both = getenv("HBP_TEST_PC_CABLE");
+    bool onCable = cable && both && *both;
+    auto connect = [host, port, onCable]() -> std::unique_ptr<Transport> {
+        if (onCable && !wifiFirst())
+            return std::unique_ptr<Transport>(new CableTransport(host, port));
+        return std::unique_ptr<Transport>(new TcpTransport(host, port));
+    };
+    auto connectCable = [host, port] { return std::unique_ptr<Transport>(new CableTransport(host, port)); };
     const char* named = getenv("HBP_TEST_PC_NAME");
     std::string name = named && *named ? named : "Test-PC";
-    std::vector<Peer> list{Peer{name, "PC：" + name + "（网络）", connect, name}};
-    // HBP_TEST_PC_CABLE has the same PC on a cable as well, which here is the network underneath.
-    const char* both = getenv("HBP_TEST_PC_CABLE");
-    if (cable && both && *both)
-        list.push_back(Peer{"USB", "PC：" + name + "（USB 数据线）", connect, name});
-    preferCable(list);
+    std::vector<Peer> list{Peer{name, "PC: " + name + " (network)", connect, name}};
+    if (onCable)
+        list.push_back(Peer{"USB", "PC: " + name + " (USB cable)", connectCable, name});
+    keepOneWayEach(list);
     return list;
 }
 

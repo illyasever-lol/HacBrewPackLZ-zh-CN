@@ -1,8 +1,9 @@
 // An NCA stored as an NCZ, the way NSZ and XCZ files hold them, seen as the NCA it came from: the header as it was, followed
 // by its sections, which here are already decrypted. There are two kinds. Block mode compresses each block on its own, so any
 // part can be read at any time. Solid mode is one stream that can only be decoded from its start, so this works hard not to
-// go back: small sections are kept in memory as they go past, the latest data can be read again, and if something keeps
-// needing earlier data anyway, everything decoded from then on goes to a temporary file.
+// go back: small sections are kept in memory as they go past, the latest data can be read again, and if something needs
+// earlier data anyway, what's decoded is kept from then on: in memory from the first time if all of it fits, or else, once it
+// keeps going back, in memory as far as there's room and the rest in a temporary file.
 #pragma once
 
 #include "zstd.h"
@@ -36,6 +37,10 @@ public:
 
     /// Where a solid stream that can't be read in order is kept while it's in use. Set this before a job.
     static void setSpoolFolder(const std::string& folder);
+    /// How much memory the solid streams needed out of order can be kept in between them, rather than in a file. None to begin with.
+    static void setSpoolMemory(i64 bytes);
+    /// How big the stream decoded from it comes to: what keeping it aside takes.
+    i64 streamSize() const { return _streamSize; }
 
 private:
     struct KeptRange {
@@ -76,8 +81,18 @@ private:
 
     std::vector<std::unique_ptr<KeptRange>> _kept;
     std::unique_ptr<ZstdStream> _stream;
+    /// What's kept of the stream, from its start: as far as _memoryTaken in memory, in pieces, as one block that big may not be had, and
+    /// the rest in a temporary file. _spooled is how far it's got.
+    std::vector<std::unique_ptr<u8[]>> _memorySpool;
+    /// What it took of the memory they share, given back when it lets go.
+    i64 _memoryTaken = 0;
     std::unique_ptr<sys::File> _spool;
     std::string _spoolPath;
+    bool keeping() const { return _memoryTaken > 0 || _spool; }
+    i64 takeMemory(bool allOrNone);
+    void keepInMemoryAndFile();
+    void readCopy(i64 position, u8* buffer, size_t count);
+    size_t writeCopy(i64 position, const u8* data, size_t count);
     i64 _spooled = 0;
     int _rewinds = 0;
     bool _warned = false;

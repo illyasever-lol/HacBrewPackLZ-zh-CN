@@ -1,5 +1,6 @@
 // How the console gets to a PC: over the network, which it finds by listening for what `hacbrewpacklz send` announces, or over a USB cable.
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -49,6 +50,8 @@ namespace remote {
 namespace {
 
 constexpr int SecondsToWait = 20;
+/// A PC on the same network answers at once. One that's stopped sharing can otherwise take minutes to be given up on.
+constexpr double SecondsToConnect = 8;
 /// A PC that hasn't been heard from for this long has gone.
 constexpr double Forgotten = 6;
 
@@ -67,10 +70,32 @@ public:
         to.sin_family = AF_INET;
         to.sin_port = htons(port);
         to.sin_addr.s_addr = address;
-        if (connect(_socket, (sockaddr*)&to, sizeof(to)) != 0) {
-            close(_socket);
-            throw ToolError("无法通过网络连接到 PC");
+        // A little at a time, as the rest is, so that whatever's waiting on this can give way when it's asked to: the app on the screen waits
+        // for the list to, and stopped answering while this waited on a PC that had stopped sharing.
+        int flags = fcntl(_socket, F_GETFL, 0);
+        fcntl(_socket, F_SETFL, flags | O_NONBLOCK);
+        bool connected = connect(_socket, (sockaddr*)&to, sizeof(to)) == 0;
+        if (!connected && errno != EINPROGRESS)
+            unreachable();
+        double until = sys::now() + SecondsToConnect;
+        while (!connected) {
+            if (shouldGiveWay()) {
+                close(_socket);
+                throw Cancelled();
+            }
+            pollfd ready = {_socket, POLLOUT, 0};
+            int n = poll(&ready, 1, 100);
+            if (n > 0) {
+                int error = 0;
+                socklen_t length = sizeof(error);
+                if (getsockopt(_socket, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0)
+                    unreachable();
+                connected = true;
+            } else if ((n < 0 && errno != EINTR) || sys::now() > until) {
+                unreachable();
+            }
         }
+        fcntl(_socket, F_SETFL, flags);
     }
     ~TcpTransport() override { close(_socket); }
 
@@ -99,6 +124,11 @@ public:
     }
 
 private:
+    [[noreturn]] void unreachable() {
+        close(_socket);
+        throw ToolError("无法通过网络连接到 PC");
+    }
+
     /// Until the socket's ready, a little at a time, so that whatever's waiting can give way when it's asked to.
     void waitFor(short events) {
         while (true) {
@@ -203,8 +233,7 @@ void startListening() {
 /// driver the PC has for it is the same. Unlike usbComms, each transfer waits only so long and is then called off, so a PC that's gone leaves
 /// nothing waiting.
 /// When the cable last carried a request or an answer. A probe for the PC's sending service
-/// shares the one USB endpoint and its buffer with installations and list scans, so it must not
-/// cut into them.
+/// shares the one USB endpoint and its buffer with installations and list scans.
 std::atomic<double> g_lastUsbTraffic{0};
 
 class UsbPort {
@@ -441,17 +470,9 @@ private:
                     continue;
             }
             usbDsEndpoint_Cancel(endpoint);
-            // The transfer has stopped by the time it says it's finished, and only then can the
-            // buffer be used again. Keep waiting for that event: reusing a buffer the console's
-            // usb system module still has in flight corrupts its own state.
-            for (int i = 0; i < 20; i++)
-                if (R_SUCCEEDED(waitSingle(waiterForEvent(&endpoint->CompletionEvent), 100000000ULL)))
-                    break;
+            // The transfer has stopped by the time it says it's finished, and only then can the buffer be used again.
+            waitSingle(waiterForEvent(&endpoint->CompletionEvent), 1000000000ULL);
             eventClear(&endpoint->CompletionEvent);
-            // A cancelled URB can leave a report behind. Drain it while the cable is ours, so
-            // the next transfer isn't matched against a stale entry.
-            UsbDsReportData cancelled;
-            usbDsEndpoint_GetReportData(endpoint, &cancelled);
             _outOfStep = true;
             if (givingWay)
                 throw Cancelled();
@@ -462,9 +483,6 @@ private:
         u32 requested = 0, transferred = 0;
         if (R_FAILED(usbDsEndpoint_GetReportData(endpoint, &report)) || R_FAILED(usbDsParseReportData(&report, urb, &requested, &transferred)))
             throw ToolError("USB 数据线已断开");
-        // Refreshed on every completed transfer, not just at the start of a large read: a long
-        // answer must never look like an idle cable to the service probe.
-        g_lastUsbTraffic.store(sys::now(), std::memory_order_relaxed);
         return std::min<size_t>(transferred, size);
     }
 };
@@ -481,6 +499,7 @@ public:
 
     void send(const void* data, size_t size) override { _port.write((const u8*)data, size); }
     void receive(void* data, size_t size) override { _port.read((u8*)data, size); }
+    bool onePipe() const override { return true; }
 
 private:
     UsbPort& _port;
@@ -491,10 +510,8 @@ private:
 std::atomic<bool> g_usbLooked{false};
 bool g_usbWasThere = false;
 sys::Mutex g_usbMutex;
-/// The name of the PC on the cable, asked for when it's plugged in and checked every few seconds
-/// after that, so a service that stops sending is noticed without unplugging anything. Empty if
-/// nothing answers, as when hacbrewpacklz send isn't running: then there's no PC on the cable to
-/// look in, only a PC with a driver for the console.
+/// The name of the PC on the cable, asked for each time it's plugged in, and again now and then until it says. Empty if it hasn't, as
+/// when hacbrewpacklz send isn't running, and then there's no PC on the cable to look in, only a PC with a driver for the console.
 std::string g_usbName;
 
 bool usbToPc() {
@@ -506,7 +523,7 @@ bool usbToPc() {
 }
 
 /// Asks the PC on the cable what it's called, not waiting long, as nothing may be running there to answer.
-/// False when an install owns the cable: the probe is skipped altogether, and the last name is
+/// False when an install owns the cable: the probe is skipped altogether and the last name is
 /// kept. The whole probe holds cableBusy, so it can never be posted alongside a request/answer.
 bool askUsbName(std::string& name) {
     CableGuard probe(true, false);
@@ -541,8 +558,7 @@ bool askUsbName(std::string& name) {
 }
 
 /// Asking the PC on the cable its name can take a few seconds when nothing there answers, so it's asked on a thread of its own, and
-/// whoever wants the list of PCs never waits for it. It's asked again every few seconds once it has answered, so a service that
-/// stops is noticed too. Either way the list has changed, and whoever looks after it can take another look.
+/// whoever wants the list of PCs never waits for it. Once it says, the list has changed.
 void watchCable() {
     /// How often to retry while no service has answered, and how often to check one that has. The
     /// PC can stop sending with the cable still plugged in, so a name asked for only once would
@@ -550,13 +566,10 @@ void watchCable() {
     constexpr double AskAgainSeconds = 10;
     constexpr double AliveCheckSeconds = 3;
     /// A probe that went unanswered is retried shortly, not half a minute later: the PC
-    /// service is usually started after the cable is plugged in, and its files must show up
-    /// at once. The CableGuard in askUsbName() already skips the whole probe when an install
-    /// owns the cable, so a long backoff only delayed discovery without protecting anything.
+    /// service is usually started after the cable is plugged in.
     constexpr double FailedAgainSeconds = 2;
     /// A probe goes through the same endpoint as everything else, so it waits until the cable has
-    /// been quiet for this long, keeping out of the way of an install or a list scan. The guard
-    /// in askUsbName() is what makes this safe; this is only about not holding up an install.
+    /// been quiet for this long, keeping out of the way of an install or a list scan.
     constexpr double QuietSeconds = 2;
     bool asked = false;
     double askedAt = 0;
@@ -611,6 +624,14 @@ void startWatchingCable() {
 
 }  // namespace
 
+/// Whether the PC on the cable is this one, by the name it gave.
+static bool cableIs(const std::string& machine) {
+    if (machine.empty() || !g_usbLooked || !usbToPc())
+        return false;
+    sys::Lock lock(g_usbMutex);
+    return g_usbName == machine;
+}
+
 std::vector<Peer> peers(bool cable) {
     startListening();
     std::vector<Peer> list;
@@ -618,8 +639,13 @@ std::vector<Peer> peers(bool cable) {
         sys::Lock lock(g_heardMutex);
         for (auto& item : g_heard) {
             Heard heard = item.second;
-            list.push_back(Peer{heard.name, "PC：" + heard.name + "（网络）", [heard] { return std::unique_ptr<Transport>(new TcpTransport(heard.address, heard.port)); },
-                heard.name});
+            // A PC heard before the cable's PC said its name is listed over the network, and is still read through the cable once it has,
+            // when the cable comes first, as it's the same PC with the same files.
+            list.push_back(Peer{heard.name, "PC: " + heard.name + " （网络）", [heard]() -> std::unique_ptr<Transport> {
+                if (!wifiFirst() && cableIs(heard.name))
+                    return std::unique_ptr<Transport>(new UsbTransport());
+                return std::unique_ptr<Transport>(new TcpTransport(heard.address, heard.port));
+            }, heard.name});
         }
     }
     // Only once a PC has the console as its device, which takes a cable plugged into it.
@@ -635,8 +661,8 @@ std::vector<Peer> peers(bool cable) {
         name = there ? g_usbName : std::string();
     }
     if (there && !name.empty())
-        list.push_back(Peer{"USB", "PC：" + name + "（USB 数据线）", [] { return std::unique_ptr<Transport>(new UsbTransport()); }, name});
-    preferCable(list);
+        list.push_back(Peer{"USB", "PC: " + name + " （USB 数据线）", [] { return std::unique_ptr<Transport>(new UsbTransport()); }, name});
+    keepOneWayEach(list);
     return list;
 }
 

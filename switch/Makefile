@@ -17,12 +17,12 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	hacBrewPackLZ
 BUILD		:=	build
-SOURCES		:=	core app nx
+SOURCES		:=	core app nx third_party/qrcodegen
 DATA		:=
-INCLUDES	:=	third_party/libusbhsfs/include
+INCLUDES	:=	third_party/libusbhsfs/include third_party/qrcodegen
 APP_TITLE	:=	hacBrewPackLZ
 APP_AUTHOR	:=	MaellyPooh
-APP_VERSION	:=	1.4.3
+APP_VERSION	:=	1.5.1
 ICON		:=	icon.jpg
 
 #---------------------------------------------------------------------------------
@@ -120,6 +120,11 @@ $(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
 $(OUTPUT).elf	:	$(OFILES)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
+
+# When it was built, which the log gives (app/app_built.cpp), is compiled afresh every time, however little else changed, so that each build
+# can be told apart.
+app_built.o	:	FORCE
+FORCE:
 
 -include $(DEPENDS)
 

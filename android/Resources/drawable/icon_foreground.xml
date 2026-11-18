@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Two chevrons pressing together, as on the Windows icon, inside the 66 of 108 that launchers always show. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+  <path android:strokeColor="#FFFFFF" android:strokeWidth="6.9" android:strokeLineCap="round" android:strokeLineJoin="round"
+      android:pathData="M35.5,39.5 L48.1,54 L35.5,68.5 M72.5,39.5 L59.9,54 L72.5,68.5" />
+</vector>

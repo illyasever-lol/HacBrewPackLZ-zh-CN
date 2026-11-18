@@ -14,21 +14,33 @@ constexpr int MinBlockExponent = 14;
 constexpr int MaxBlockExponent = 30;
 constexpr u8 BlockTypeZstd = 1;
 constexpr i64 MaxKeptSection = 256LL << 20;
-constexpr int RewindsBeforeSpooling = 2;
+/// An update's stream goes back about three times by itself, to read the tables at its end before its data, and then reads straight on: kept
+/// from the third time, as it used to be, it was written in full and never read. Going back more than that, it keeps on doing so.
+constexpr int RewindsBeforeSpooling = 3;
 constexpr int NcaHeaderRegionSize = 0xC00;
 
 std::atomic<int> g_lastSweep{0};
 thread_local int t_sweep = 0;
 std::string g_spoolFolder;
 std::atomic<int> g_spoolNumber{0};
+/// What's left of the memory solid streams can be kept in, between them.
+std::atomic<i64> g_spoolMemory{0};
+constexpr i64 MemoryPiece = 64LL << 20;
+
+/// Tests go back fewer times, with games small enough that only their updates do.
+int rewindsBeforeSpooling() {
+    const char* test = getenv("HBP_TEST_REWINDS_BEFORE_KEEPING");
+    return test && *test ? atoi(test) : RewindsBeforeSpooling;
+}
 
 }  // namespace
 
 void NczSource::beginSinglePass() { t_sweep = ++g_lastSweep; }
 void NczSource::endSinglePass() { t_sweep = 0; }
 void NczSource::setSpoolFolder(const std::string& folder) { g_spoolFolder = folder; }
+void NczSource::setSpoolMemory(i64 bytes) { g_spoolMemory = std::max<i64>(bytes, 0); }
 
-void NczSource::fail() const { throw ToolError(_name + "已损坏，或不是 NCZ"); }
+void NczSource::fail() const { throw ToolError(_name + " 已损坏，或不是 NCZ"); }
 
 NczSource::NczSource(SourcePtr file, std::string name) : _file(std::move(file)), _name(std::move(name)) {
     if (_file->length() < HeaderSize + 16)
@@ -39,7 +51,13 @@ NczSource::NczSource(SourcePtr file, std::string name) : _file(std::move(file)),
 
     u8 head[16];
     _file->read(HeaderSize, head, sizeof(head));
-    if (memcmp(head, "NCZSECTN", 8) != 0)
+    // NXPress's NCZSECT2 is the same, for a game cut down to go with its update: each piece stored is a section of its own, decrypted as the
+    // rest, with how far its counter is from where it is. The pieces are read as they're stored, so only that it's sound matters here.
+    // NCZSECT3 is NXPress's archive kind, which only it can unpack. As NczSource on the PC.
+    bool withCounterOffsets = memcmp(head, "NCZSECT2", 8) == 0;
+    if (memcmp(head, "NCZSECT3", 8) == 0)
+        throw ToolError(_name + " is an archive only NXPress reads: unpack it with NXPress first");
+    if (!withCounterOffsets && memcmp(head, "NCZSECTN", 8) != 0)
         fail();
     u64 count = rd64(head + 8);
     if (count == 0 || count > MaxSections || HeaderSize + 16 + (i64)count * SectionEntrySize > _file->length())
@@ -57,6 +75,11 @@ NczSource::NczSource(SourcePtr file, std::string name) : _file(std::move(file)),
         i64 start = rdi64(e);
         i64 size = rdi64(e + 8);
         if (start < NcaHeaderRegionSize || size < 0 || start > INT64_MAX - size)
+            fail();
+        // A counter offset is whole AES blocks, and only on what's encrypted with a counter.
+        i64 counterOffset = withCounterOffsets ? rdi64(e + 0x18) : 0;
+        u64 crypto = rd64(e + 0x10);
+        if (counterOffset % 16 != 0 || (counterOffset != 0 && crypto != 3 && crypto != 4))
             fail();
         if (i == 0 && start > HeaderSize) {
             _ncaStarts.push_back(HeaderSize);
@@ -128,7 +151,10 @@ NczSource::NczSource(SourcePtr file, std::string name) : _file(std::move(file)),
 NczSource::~NczSource() { releaseMemory(); }
 
 void NczSource::keepIfSmall(i64 ncaOffset, i64 size) {
-    if (!isSolid() || size <= 0 || size > MaxKeptSection)
+    // Tests make it smaller, as their games are, for a solid stream to be read out of order.
+    const char* test = getenv("HBP_TEST_MOST_KEPT_SECTION");
+    i64 most = test && *test ? atoll(test) : MaxKeptSection;
+    if (!isSolid() || size <= 0 || size > most)
         return;
     int segment = findSegment(ncaOffset);
     if (segment < 0 || _ncaStarts[(size_t)segment] > ncaOffset)
@@ -151,6 +177,9 @@ void NczSource::releaseMemory() {
         _spool.reset();
         sys::removeFile(_spoolPath);
     }
+    _memorySpool.clear();
+    g_spoolMemory += _memoryTaken;
+    _memoryTaken = 0;
     _spooled = 0;
     _rewinds = 0;
     _block.reset();
@@ -258,7 +287,7 @@ void NczSource::readSolid(i64 position, u8* buffer, size_t count) {
         size_t n = readKept(position, buffer, count);
         if (n == 0 && position < _spooled) {
             n = (size_t)std::min<i64>((i64)count, _spooled - position);
-            _spool->read(position, buffer, n);
+            readCopy(position, buffer, n);
         }
         if (n == 0) {
             if (!_stream) {
@@ -297,18 +326,19 @@ size_t NczSource::readKept(i64 position, u8* buffer, size_t count) {
 }
 
 void NczSource::rewind(ZstdStream& stream) {
-    if (t_sweep == 0 && ++_rewinds > RewindsBeforeSpooling && !_spool) {
-        std::string folder = g_spoolFolder.empty() ? std::string(".") : g_spoolFolder;
-        sys::makeDirectories(folder);
-        _spoolPath = format("%s/.hacbrewpacklz_%d.tmp", folder.c_str(), ++g_spoolNumber);
-        _spool.reset(new sys::File(_spoolPath, sys::File::Mode::Create, _streamSize));
-        _spooled = 0;
-        sink().message(format("%s is needed out of order, so a temporary copy of up to %s is being kept in %s", _name.c_str(), formatSize(_streamSize).c_str(), folder.c_str()));
+    if (t_sweep == 0 && !keeping()) {
+        // In memory, if all of it fits, from the first time: that costs nothing but memory, where decoding it again costs a pass over it.
+        if (takeMemory(true) > 0) {
+            _spooled = 0;
+            sink().message(format("%s is needed out of order, so what's decoded of it is kept in memory, up to %s", _name.c_str(), formatSize(_streamSize).c_str()));
+        } else if (++_rewinds > rewindsBeforeSpooling()) {
+            keepInMemoryAndFile();
+        }
     }
 
     if (!_warned) {
         _warned = true;
-        sink().message(_name + "使用固态压缩，必须从头重新解码，耗时较长");
+        sink().message(_name + " 使用固态压缩，必须从头重新解码，耗时较长");
     }
     stream.rewind();
 }
@@ -328,10 +358,94 @@ void NczSource::onDecoded(i64 position, const u8* data, size_t count) {
         range->filled += (i64)n;
     }
 
-    if (_spool && position == _spooled) {
-        _spool->write(position, data, count);
-        _spooled += (i64)count;
+    if (position == _spooled && keeping())
+        _spooled += (i64)writeCopy(position, data, count);
+}
+
+/// Memory for the stream from its start, from what's left for all of them, so that two kept at once, such as a game's and its update's, can't
+/// take more than there is between them: all of it or none, or else as much as there is. It's all had at once, so that running out shows up
+/// now rather than part of the way through. How much it got.
+i64 NczSource::takeMemory(bool allOrNone) {
+    i64 left = g_spoolMemory.load(), taken;
+    do {
+        taken = std::min(_streamSize, left);
+        if (taken <= 0 || (allOrNone && taken < _streamSize))
+            return 0;
+    } while (!g_spoolMemory.compare_exchange_weak(left, left - taken));
+    for (i64 at = 0; at < taken; at += MemoryPiece) {
+        _memorySpool.emplace_back(new (std::nothrow) u8[(size_t)std::min(MemoryPiece, taken - at)]);
+        if (!_memorySpool.back()) {
+            _memorySpool.clear();
+            g_spoolMemory += taken;
+            return 0;
+        }
     }
+    _memoryTaken = taken;
+    return taken;
+}
+
+/// For a stream that keeps going back: what there's memory for in memory, and the rest in a temporary file.
+void NczSource::keepInMemoryAndFile() {
+    i64 inMemory = takeMemory(false);
+    std::string folder = g_spoolFolder.empty() ? std::string(".") : g_spoolFolder;
+    if (inMemory < _streamSize) {
+        try {
+            sys::makeDirectories(folder);
+            _spoolPath = format("%s/.hacbrewpacklz_%d.tmp", folder.c_str(), ++g_spoolNumber);
+            _spool.reset(new sys::File(_spoolPath, sys::File::Mode::Create, _streamSize - inMemory));
+        } catch (...) {
+            _memorySpool.clear();
+            g_spoolMemory += _memoryTaken;
+            _memoryTaken = 0;
+            throw;
+        }
+    }
+    _spooled = 0;
+    if (inMemory == 0)
+        sink().message(format("%s keeps being needed out of order, so a temporary copy of up to %s is being kept in %s", _name.c_str(), formatSize(_streamSize).c_str(), folder.c_str()));
+    else if (inMemory < _streamSize)
+        sink().message(format("%s keeps being needed out of order, so what's decoded of it is kept: the first %s in memory, and a temporary copy of the rest, up to %s, in %s",
+                              _name.c_str(), formatSize(inMemory).c_str(), formatSize(_streamSize - inMemory).c_str(), folder.c_str()));
+    else
+        sink().message(format("%s keeps being needed out of order, so what's decoded of it is kept in memory, up to %s", _name.c_str(), formatSize(_streamSize).c_str()));
+}
+
+void NczSource::readCopy(i64 position, u8* buffer, size_t count) {
+    while (count > 0) {
+        size_t n = count;
+        if (position < _memoryTaken) {
+            i64 inPiece = position % MemoryPiece;
+            n = (size_t)std::min<i64>((i64)n, std::min(MemoryPiece - inPiece, _memoryTaken - position));
+            memcpy(buffer, _memorySpool[(size_t)(position / MemoryPiece)].get() + inPiece, n);
+        } else {
+            _spool->read(position - _memoryTaken, buffer, n);
+        }
+        position += (i64)n;
+        buffer += n;
+        count -= n;
+    }
+}
+
+/// What's decoded next, kept: in memory as far as that goes, and then in the file, if there is one. How much of it was kept.
+size_t NczSource::writeCopy(i64 position, const u8* data, size_t count) {
+    count = (size_t)std::min<i64>((i64)count, _streamSize - position);
+    size_t kept = 0;
+    while (kept < count) {
+        size_t n = count - kept;
+        if (position < _memoryTaken) {
+            i64 inPiece = position % MemoryPiece;
+            n = (size_t)std::min<i64>((i64)n, std::min(MemoryPiece - inPiece, _memoryTaken - position));
+            memcpy(_memorySpool[(size_t)(position / MemoryPiece)].get() + inPiece, data, n);
+        } else if (_spool) {
+            _spool->write(position - _memoryTaken, data, n);
+        } else {
+            break;
+        }
+        position += (i64)n;
+        data += n;
+        kept += n;
+    }
+    return kept;
 }
 
 }  // namespace hbp

@@ -2,10 +2,10 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>HacBrewPackLz</RootNamespace>
     <AssemblyName>hacbrewpacklz-gui</AssemblyName>
-    <Version>1.4.3</Version>
+    <Version>1.5.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -27,7 +27,7 @@
 
   <ItemGroup>
     <Compile Include="*.cs" />
-    <Compile Include="..\src\**\*.cs" Exclude="..\src\Program.cs;..\src\Tui.cs" />
+    <Compile Include="..\src\**\*.cs" Exclude="..\src\Program.cs;..\src\Tui.cs;..\src\TuiInside.cs" />
   </ItemGroup>
 
 </Project>

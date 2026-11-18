@@ -31,6 +31,49 @@ struct ToolError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+/// What was read isn't what it should be: it doesn't match its hashes, a compressed block in it doesn't decode, or an update reading it needs
+/// a part of the original game that isn't there. Read through a compressed copy, that's an update that doesn't fit the copy, rather than a
+/// file that can't be read.
+struct MismatchError : ToolError {
+    using ToolError::ToolError;
+};
+
+/// Whether size bytes from offset lie within length, without the sum overflowing, as it can with what a damaged file says (Ranges.Fits on the PC).
+inline bool fitsWithin(i64 offset, i64 size, i64 length) { return offset >= 0 && size >= 0 && offset <= length && size <= length - offset; }
+
+/// The most a table of names or entries is read whole for. Real ones are a few KB; a damaged one could ask for gigabytes.
+constexpr i64 MostTable = 16LL << 20;
+
+/// Whether what went wrong was the system turning a request down (askCard in nx_sys.cpp), which can go through later on.
+inline bool refusedBySystem(const std::string& message) {
+    return message.find("(2001-0106)") != std::string::npos || message.find("(2001-0105)") != std::string::npos;
+}
+
+/// The system says the file system being written to is damaged. Writing more to it can only make that worse, so whatever's being done
+/// stops there, rather than going on to the next game.
+struct DamagedFileSystem : ToolError {
+    using ToolError::ToolError;
+};
+
+/// A FAT file system the system has found damaged: the 2002-4681 to 2002-4699 range, as an SD card or the console's own storage can be.
+inline bool isDamagedFileSystem(u32 module, u32 description) { return module == 2 && description >= 4681 && description <= 4699; }
+
+/// Whether what went wrong is a damaged file system, whether it came as one or was passed on in other words, which keep the system's code.
+inline bool saysFileSystemDamaged(const ToolError& e) {
+    if (dynamic_cast<const DamagedFileSystem*>(&e))
+        return true;
+    std::string text = e.what();
+    for (size_t at = text.find("2002-"); at != std::string::npos; at = text.find("2002-", at + 5)) {
+        u32 description = 0;
+        size_t i = at + 5;
+        for (; i < text.size() && i < at + 9 && text[i] >= '0' && text[i] <= '9'; i++)
+            description = description * 10 + (u32)(text[i] - '0');
+        if (i == at + 9 && isDamagedFileSystem(2, description))
+            return true;
+    }
+    return false;
+}
+
 /// The person asked to stop.
 struct Cancelled {};
 

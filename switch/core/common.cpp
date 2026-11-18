@@ -80,7 +80,7 @@ std::string formatSize(i64 bytes) {
 std::string formatElapsed(double seconds) {
     if (seconds < 90)
         return format("%.0f s", seconds);
-    return format("%.1f min", seconds / 60);
+    return format("%.1f 分钟", seconds / 60);
 }
 
 bool endsWithNoCase(const std::string& text, const char* suffix) {

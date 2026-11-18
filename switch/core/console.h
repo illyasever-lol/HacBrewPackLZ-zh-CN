@@ -37,6 +37,9 @@ struct InstalledMeta {
     MetaKey key;
     Storage storage = Storage::None;
     std::vector<InstalledContent> contents;
+    /// As the console's records have them, which is what it goes by, read for a base game only. Compacted says the game is only whole
+    /// with its update, and the console won't start it without one.
+    u8 attributes = 0;
 };
 
 struct InstalledGame {
@@ -49,6 +52,16 @@ struct InstalledGame {
     std::vector<InstalledMeta> metas;
     /// Why this game can't be touched just now, if it can't.
     std::string blocked;
+    /// An official update newer than a copy this tool rebuilt went in over it, which stops it starting until compressing makes the two one.
+    /// What's installed doesn't say so: the app works it out, as it does some of what's blocked.
+    bool updateOverCopy = false;
+    /// A copy this tool rebuilt, before version 1.5, from a game only whole with its update, still says so: the console asks for an update and
+    /// won't start it, though it's whole. Or a copy made in place of a game an installer such as DBI had let start on an older system asks for
+    /// the newer system version the game's files say, and the console asks for a system update. Taking that off its record is all it takes.
+    /// Worked out by the app, like updateOverCopy.
+    bool markedIncomplete = false;
+    /// For the second, what its record asks of the system. Zero otherwise.
+    u32 asksSystem = 0;
 
     i64 totalBytes() const;
 };
@@ -57,8 +70,11 @@ struct InstalledGame {
 class ContentWriter {
 public:
     virtual ~ContentWriter() = default;
-    /// What it takes to find these bytes again after a power cut.
+    /// What it takes to find these bytes again after a power cut. It's known before they have anywhere to go, so it can be written down first.
     virtual std::string token() const = 0;
+    /// Makes room for them, under that token, once it's been written down: made first, a power cut before it was written down left a placeholder
+    /// as big as the file was to be, that nothing knew of.
+    virtual void create() = 0;
     /// It grows as needed, if there's room.
     virtual void write(i64 offset, const void* data, size_t size) = 0;
     virtual void setSize(i64 size) = 0;
@@ -74,11 +90,24 @@ public:
     virtual void read(const std::string& path, i64 offset, void* buffer, size_t size) = 0;
 };
 
+/// What the console keeps to itself about which version of a game it starts: below which version it won't (one started before, or pushed with
+/// setLaunchVersion), and from its version list, when the game is in it, the newest version it knows of and the one it says is required.
+struct VersionFigures {
+    u64 application = 0;
+    u32 launchRequired = 0;
+    bool listed = false;
+    u32 newest = 0;
+    u32 required = 0;
+};
+
 class ConsoleApi {
 public:
     virtual ~ConsoleApi() = default;
 
     virtual std::vector<u64> listApplications() = 0;
+    /// The games on the game card that's in, as the system has them while it's in: each can be read like an installed game, through its
+    /// records on Storage::GameCard, and installed from there, but nothing on the card can be changed. None without a card.
+    virtual std::vector<u64> cardApplications() { return {}; }
     /// What's installed of a game. That's quick, unlike its name and icon, which come from readControl.
     virtual InstalledGame describe(u64 applicationId) = 0;
     /// Fills in the name, the publisher, the version people know it by and the icon.
@@ -97,6 +126,8 @@ public:
     virtual void deleteContent(Storage storage, const ContentId& id) = 0;
     /// Written and committed before this returns.
     virtual void setMeta(Storage storage, const MetaKey& key, const Bytes& installMeta) = 0;
+    /// The record as setMeta takes it.
+    virtual Bytes getMeta(Storage storage, const MetaKey& key) = 0;
     virtual bool hasMeta(Storage storage, const MetaKey& key) = 0;
     virtual void removeMeta(Storage storage, const MetaKey& key) = 0;
     /// What the home menu goes by to find a game's content.
@@ -104,6 +135,12 @@ public:
     virtual std::vector<std::pair<MetaKey, Storage>> records(u64 applicationId) = 0;
     /// The console remembers how new a game has to be to start, and says to update it otherwise. This says what's there now is what counts.
     virtual void setLaunchVersion(u64 applicationId, u32 version) = 0;
+    /// One for each game asked about, in the same order, for the log, as that's why a game asks for an update before it starts. Asking
+    /// changes nothing. None where there's no asking; throws if the console turns it down.
+    virtual std::vector<VersionFigures> versionFigures(const std::vector<u64>& applicationIds) {
+        (void)applicationIds;
+        return {};
+    }
 
     /// Mounts a Data NCA with the firmware's own code, which is what will have to read it later. Throws if the firmware won't have it.
     virtual std::unique_ptr<FirmwareView> mountGameData(Storage storage, const ContentId& id, u64 programId) = 0;

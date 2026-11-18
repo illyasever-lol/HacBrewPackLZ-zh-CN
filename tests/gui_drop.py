@@ -127,6 +127,26 @@ class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [('cbSize', wt.UINT), ('dwTime', wt.DWORD)]
 
 
+def own_window(pid, cls, title):
+    """A window of the program this started, never one of the same name that someone has open."""
+    found = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def each(hwnd, _):
+        owner = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, name, 256)
+        text = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, text, 256)
+        if owner.value == pid and name.value == cls and text.value == title:
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(each, 0)
+    return found[0] if found else None
+
+
 def idle_seconds():
     info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO))
     user32.GetLastInputInfo(ctypes.byref(info))
@@ -143,11 +163,16 @@ def main():
     keys = os.path.abspath(sys.argv[2])
     source = os.path.abspath(sys.argv[3])
     shots = os.path.abspath(sys.argv[4]) if len(sys.argv) > 4 else None
+    if shots:
+        os.makedirs(shots, exist_ok=True)
 
     work = tempfile.mkdtemp(prefix='hbplz_drop_')
     game = os.path.join(work, 'A Dropped Game [0123456789ABCDEF]' + os.path.splitext(source)[1])
     shutil.copyfile(source, game)
     settings = os.path.join(work, 'settings.txt')
+    # Past the welcome, which would sit over the window and take the drop.
+    with open(settings, 'w', encoding='utf-8') as f:
+        f.write('welcomed=1\n')
     environment = dict(os.environ, HACBREWPACKLZ_SETTINGS=settings)
 
     deadline = time.time() + IDLE_WAIT_LIMIT
@@ -162,7 +187,7 @@ def main():
     window = None
     deadline = time.time() + 10
     while not window and time.time() < deadline:
-        window = user32.FindWindowW('hacBrewPackLZ.Window', 'hacBrewPackLZ')
+        window = own_window(process.pid, 'hacBrewPackLZ.Window', 'hacBrewPackLZ')
         time.sleep(0.05)
     if not window:
         print('FAIL: the window did not open')

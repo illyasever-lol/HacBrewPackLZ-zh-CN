@@ -179,6 +179,17 @@ void addEntries(DirNode* dir, const std::vector<sys::DirEntry>& entries, Tree& t
     next.insert(next.end(), childDirs.begin(), childDirs.end());
 }
 
+/// What's in one of a game's folders, all of it or nothing. A folder the system turned down, or that couldn't all be read, would otherwise
+/// have the game built without what's in it, and nothing would say so, as what's built is whole by its own hashes, the check of a new copy
+/// included.
+std::vector<sys::DirEntry> listWhole(const std::string& folder) {
+    bool refused = false;
+    std::vector<sys::DirEntry> entries = sys::list(folder, true, &refused);
+    if (refused)
+        throw ToolError("'" + folder + "' couldn't all be read just now: the system turned it down or gave an error, so nothing was built from it. Try again in a moment");
+    return entries;
+}
+
 /// Most of the time this takes is waiting for the card, which a few folders at a time make better use of.
 void visit(DirNode* root, Tree& tree, const std::map<std::string, Bytes>& replacements) {
     std::vector<DirNode*> level{root};
@@ -186,7 +197,7 @@ void visit(DirNode* root, Tree& tree, const std::map<std::string, Bytes>& replac
         std::vector<std::vector<sys::DirEntry>> listed(level.size());
         parallelFor(sys::FileThreads, (int)level.size(), [&](int index, int) {
             checkStop();
-            listed[(size_t)index] = sys::list(level[(size_t)index]->path);
+            listed[(size_t)index] = listWhole(level[(size_t)index]->path);
         });
         std::vector<DirNode*> next;
         for (size_t i = 0; i < level.size(); i++)
@@ -198,7 +209,7 @@ void visit(DirNode* root, Tree& tree, const std::map<std::string, Bytes>& replac
 
 i64 folderBytes(const std::string& folder) {
     i64 total = 0;
-    for (auto& entry : sys::list(folder))
+    for (auto& entry : listWhole(folder))
         total += entry.isDirectory ? folderBytes(folder + "/" + entry.name) : entry.size;
     return total;
 }
@@ -215,24 +226,61 @@ SourcePtr buildRomFsImage(const std::string& folder, const std::map<std::string,
     return imageOfTree(tree, root);
 }
 
-SourcePtr buildRomFsImageOf(const std::map<std::string, Bytes>& files) {
+SourcePtr buildRomFsImageOf(const std::map<std::string, Bytes>& files, const std::vector<std::string>& folders) {
     Tree tree;
     DirNode root;
-    FileNode* last = nullptr;
+    std::map<std::string, DirNode*> byPath{{"", &root}};
+    std::function<DirNode*(const std::string&)> dirOf = [&](const std::string& path) -> DirNode* {
+        auto known = byPath.find(path);
+        if (known != byPath.end())
+            return known->second;
+        size_t slash = path.rfind('/');
+        DirNode* parent = dirOf(slash == std::string::npos ? "" : path.substr(0, slash));
+        tree.ownedDirs.emplace_back(new DirNode);
+        DirNode* dir = tree.ownedDirs.back().get();
+        dir->name = slash == std::string::npos ? path : path.substr(slash + 1);
+        dir->sortKey = parent->sortKey + '\\' + dir->name;
+        dir->parent = parent;
+        byPath[path] = dir;
+        tree.dirs.push_back(dir);
+        return dir;
+    };
+    for (auto& folder : folders)
+        dirOf(folder);
     for (auto& file : files) {
+        size_t slash = file.first.rfind('/');
+        DirNode* dir = dirOf(slash == std::string::npos ? "" : file.first.substr(0, slash));
         tree.ownedFiles.emplace_back(new FileNode);
         FileNode* node = tree.ownedFiles.back().get();
-        node->name = file.first;
-        node->sortKey = "\\" + file.first;
+        node->name = slash == std::string::npos ? file.first : file.first.substr(slash + 1);
+        node->sortKey = dir->sortKey + '\\' + node->name;
         node->size = (i64)file.second.size();
-        node->parent = &root;
+        node->parent = dir;
         node->replacement = &file.second;
-        if (last)
-            last->sibling = node;
-        else
-            root.firstFile = node;
-        last = node;
         tree.files.push_back(node);
+    }
+
+    // Each folder's own folders and files in order, as going through a folder on disk has them.
+    for (auto& entry : byPath) {
+        DirNode* dir = entry.second;
+        std::vector<DirNode*> childDirs;
+        std::vector<FileNode*> childFiles;
+        for (DirNode* d : tree.dirs) {
+            if (d->parent == dir)
+                childDirs.push_back(d);
+        }
+        for (FileNode* f : tree.files) {
+            if (f->parent == dir)
+                childFiles.push_back(f);
+        }
+        std::sort(childDirs.begin(), childDirs.end(), [](DirNode* a, DirNode* b) { return byKey(a->sortKey, b->sortKey); });
+        std::sort(childFiles.begin(), childFiles.end(), [](FileNode* a, FileNode* b) { return byKey(a->sortKey, b->sortKey); });
+        for (size_t i = 0; i + 1 < childDirs.size(); i++)
+            childDirs[i]->sibling = childDirs[i + 1];
+        for (size_t i = 0; i + 1 < childFiles.size(); i++)
+            childFiles[i]->sibling = childFiles[i + 1];
+        dir->firstChild = childDirs.empty() ? nullptr : childDirs[0];
+        dir->firstFile = childFiles.empty() ? nullptr : childFiles[0];
     }
     return imageOfTree(tree, root);
 }
@@ -327,7 +375,7 @@ static SourcePtr imageOfTree(Tree& tree, DirNode& root) {
 
 SourcePtr buildPfs0FromFolder(const std::string& folder, const std::map<std::string, Bytes>& replacements) {
     std::vector<sys::DirEntry> entries;
-    for (auto& entry : sys::list(folder)) {
+    for (auto& entry : listWhole(folder)) {
         if (!entry.isDirectory)
             entries.push_back(entry);
     }
@@ -347,7 +395,10 @@ SourcePtr buildPfs0FromFolder(const std::string& folder, const std::map<std::str
     return buildPfs0(files);
 }
 
-bool ExtractedGame::isOne(const std::string& folder) { return sys::exists(folder + "/exefs/main.npdm") && sys::exists(folder + "/control/control.nacp"); }
+bool ExtractedGame::isOne(const std::string& folder) {
+    return sys::exists(folder + "/exefs/main.npdm") && sys::exists(folder + "/control/control.nacp") &&
+           sys::presence(folder + "/" + NotFinished) == sys::Presence::Missing;
+}
 
 ExtractedGame ExtractedGame::open(const std::string& folder) {
     ExtractedGame game;
@@ -380,7 +431,14 @@ ExtractedGame ExtractedGame::open(const std::string& folder) {
     if (!hasPublisher)
         throw ToolError("' 中没有发行商" + nacpPath + "'");
 
-    game.hasRomFs = sys::isDirectory(folder + "/romfs");
+    // A part's folder the system won't answer about isn't taken for one that isn't there: that built the game with no game data at all.
+    auto hasFolder = [](const std::string& path) {
+        sys::Presence there = sys::folderPresence(path);
+        if (there == sys::Presence::CantTell)
+            throw ToolError("Couldn't tell whether '" + path + "' is there just now: the system turned the question down or gave an error, so nothing was built. Try again in a moment");
+        return there == sys::Presence::There;
+    };
+    game.hasRomFs = hasFolder(folder + "/romfs");
     if (game.hasRomFs) {
         Tree tree;
         DirNode root;
@@ -390,9 +448,9 @@ ExtractedGame ExtractedGame::open(const std::string& folder) {
             game.inputBytes += file->size;
         game.romFsImage = imageOfTree(tree, root);
     }
-    game.hasLogo = sys::isDirectory(folder + "/logo");
-    game.hasHtmlDoc = sys::isDirectory(folder + "/htmldoc");
-    game.hasLegalInfo = sys::isDirectory(folder + "/legalinfo");
+    game.hasLogo = hasFolder(folder + "/logo");
+    game.hasHtmlDoc = hasFolder(folder + "/htmldoc");
+    game.hasLegalInfo = hasFolder(folder + "/legalinfo");
 
     // Extracting leaves the version in the folder's name, and a game had better not come back older than it was.
     size_t slash = folder.find_last_of("/\\");

@@ -89,7 +89,13 @@ internal sealed class NczSource : DataSource
 
         var head = new byte[16];
         file.Read(HeaderSize, head, 0, head.Length);
-        if (!head.AsSpan(0, 8).SequenceEqual("NCZSECTN"u8))
+        // NXPress's NCZSECT2 is the same, for a game cut down to go with its update: each piece stored is a section of its own, decrypted as
+        // the rest, with how far its counter is from where it is (docs/ncz-sparse.md). The pieces are read as they're stored, so only that
+        // it's sound matters here. NCZSECT3 is NXPress's archive kind, which only it can unpack.
+        bool withCounterOffsets = head.AsSpan(0, 8).SequenceEqual("NCZSECT2"u8);
+        if (head.AsSpan(0, 8).SequenceEqual("NCZSECT3"u8))
+            throw new ToolException($"{_name} is an archive only NXPress reads: unpack it with NXPress first");
+        if (!withCounterOffsets && !head.AsSpan(0, 8).SequenceEqual("NCZSECTN"u8))
             throw Damaged();
         ulong count = BinaryPrimitives.ReadUInt64LittleEndian(head.AsSpan(8));
         if (count == 0 || count > MaxSections || HeaderSize + 16 + (long)count * SectionEntrySize > file.Length)
@@ -110,6 +116,11 @@ internal sealed class NczSource : DataSource
             long start = BinaryPrimitives.ReadInt64LittleEndian(e);
             long size = BinaryPrimitives.ReadInt64LittleEndian(e[8..]);
             if (start < NcaWriter.HeaderRegionSize || size < 0 || start > long.MaxValue - size)
+                throw Damaged();
+            // A counter offset is whole AES blocks, and only on what's encrypted with a counter.
+            long counterOffset = withCounterOffsets ? BinaryPrimitives.ReadInt64LittleEndian(e[0x18..]) : 0;
+            ulong crypto = BinaryPrimitives.ReadUInt64LittleEndian(e[0x10..]);
+            if (counterOffset % 16 != 0 || (counterOffset != 0 && crypto is not (3 or 4)))
                 throw Damaged();
             if (i == 0 && start > HeaderSize)
             {
@@ -159,7 +170,8 @@ internal sealed class NczSource : DataSource
             long expected = _blockExponent is >= MinBlockExponent and <= MaxBlockExponent && decompressed >= streamSize
                 ? (decompressed + (1L << _blockExponent) - 1) >> _blockExponent
                 : -1;
-            if (blocks != expected || position + blocks * 4L > file.Length)
+            // A count of none or less, with a block size out of range as well, would match the -1 that stands for it, as the Switch knows.
+            if (blocks != expected || blocks <= 0 || position + blocks * 4L > file.Length)
                 throw Damaged();
             _streamSize = decompressed;
 
@@ -383,7 +395,7 @@ internal sealed class NczSource : DataSource
         if (!_warned)
         {
             _warned = true;
-            Ui.Detail($"  {_name} 采用固实压缩，必须从头重新解码，这需要一些时间");
+            Ui.Detail($"  {_name} 使用固态压缩，必须从头重新解码，需要一些时间");
         }
         stream.Rewind();
     }

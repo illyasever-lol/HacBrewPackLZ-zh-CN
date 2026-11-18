@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Report service tests</title>
+<pre id="out">running</pre>
+<script type="module">
+// The report service's handling, run in a browser against the inbox kept in memory. run_tests.py serves this and reads what it says.
+import { handle } from '../worker.js';
+import { memoryStore } from './memory_store.js';
+
+const lines = [];
+let failures = 0;
+const report = (name, ok, detail = '') => {
+  failures += ok ? 0 : 1;
+  lines.push(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : '  ' + detail}`);
+};
+const env = { READ_KEY: 'the-read-key' };
+const store = memoryStore();
+const call = async (method, path, body, key, ip = '1.2.3.4') => {
+  const headers = { 'CF-Connecting-IP': ip };
+  if (key)
+    headers.Authorization = `Bearer ${key}`;
+  const init = { method, headers };
+  if (body !== undefined)
+    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+  const response = await handle(new Request(`https://reports.test${path}`, init), env, store);
+  let value = null;
+  try { value = await response.json(); } catch {}
+  return { code: response.status, value };
+};
+const sample = (extra = {}) => ({ app: 'hacBrewPackLZ', version: '1.5.0-test.1', platform: 'Windows', kind: 'failed-job', fingerprint: 'failed|2002-0002|journal',
+  title: "Couldn't rename the journal", said: '', report: 'what happened', device: 'device-a', count: 1, ...extra });
+
+try {
+  let r = await call('POST', '/report', sample());
+  report('a report is taken, with its number', r.code === 200 && r.value.status === 'received' && r.value.id === 1, JSON.stringify(r));
+  report('the inbox needs the read key', (await call('GET', '/inbox')).code === 401 && (await call('GET', '/inbox', undefined, 'wrong')).code === 401);
+  r = await call('GET', '/inbox', undefined, 'the-read-key');
+  report('with it, the problem is there once', r.code === 200 && r.value.problems.length === 1 && r.value.problems[0].reports === 1 && r.value.problems[0].devices === 1, JSON.stringify(r));
+
+  await call('POST', '/report', sample({ device: 'device-b', version: '1.5.0', count: 3 }), undefined, '5.6.7.8');
+  await call('POST', '/report', sample({ device: 'device-a' }));
+  r = await call('GET', '/inbox', undefined, 'the-read-key');
+  const p = r.value.problems[0];
+  report('the same problem from others is counted, not repeated', r.value.problems.length === 1 && p.reports === 3 && p.devices === 2 && p.occurrences === 5,
+    JSON.stringify(p));
+  report('with every version it was seen on', JSON.stringify(p.versions) === '["1.5.0-test.1","1.5.0"]', JSON.stringify(p.versions));
+
+  await call('POST', '/report', sample({ kind: 'manual', fingerprint: '', said: "It won't start", device: 'device-c' }), undefined, '9.9.9.9');
+  await call('POST', '/report', sample({ kind: 'game-didnt-start', fingerprint: 'game|0100abc', title: 'Slay the Princess', device: 'device-d' }), undefined, '8.8.8.8');
+  r = await call('GET', '/inbox', undefined, 'the-read-key');
+  report('a message with no error behind it stands on its own', r.value.problems.some(q => q.key.startsWith('message|') && q.latest[0].said === "It won't start"), JSON.stringify(r.value));
+  report('a game that won\'t start comes first', r.value.problems[0].kind === 'game-didnt-start', r.value.problems.map(q => q.kind).join(', '));
+
+  r = await call('POST', `/problem/${encodeURIComponent('hacBrewPackLZ|failed|2002-0002|journal')}`, { status: 'fixed', fixedIn: '1.5.1', issue: 42 }, 'the-read-key');
+  report('a problem can be marked fixed', r.code === 200, JSON.stringify(r));
+  r = await call('POST', '/report', sample({ device: 'device-e' }), undefined, '7.7.7.7');
+  report('and the next report of it is told so at once', r.value.status === 'fixed' && r.value.fixedIn === '1.5.1' && r.value.issue === 42, JSON.stringify(r));
+  r = await call('GET', '/inbox', undefined, 'the-read-key');
+  report('what\'s been dealt with leaves the new ones', !r.value.problems.some(q => q.key === 'hacBrewPackLZ|failed|2002-0002|journal'), JSON.stringify(r.value));
+  report('marking needs the key', (await call('POST', '/problem/x', { status: 'known' })).code === 401);
+  report('and a status there is', (await call('POST', `/problem/${encodeURIComponent('game|0100abc')}`, { status: 'gone' }, 'the-read-key')).code === 400);
+
+  r = await call('GET', '/inbox/report/1', undefined, 'the-read-key');
+  report('a whole report can be read with the key', r.code === 200 && r.value.body === 'what happened' && r.value.device === 'device-a', JSON.stringify(r));
+
+  // Seen again by an app that has sent it already: counted, with no report of its own.
+  r = await call('POST', '/seen', { app: 'hacBrewPackLZ', fingerprint: 'game|0100abc', device: 'device-d', version: '1.5.1', count: 4 }, undefined, '4.4.4.4');
+  report('a problem seen again is counted', r.code === 200 && r.value.status === 'counted', JSON.stringify(r));
+  r = await call('GET', '/inbox', undefined, 'the-read-key');
+  const again = r.value.problems.find(q => q.key === 'hacBrewPackLZ|game|0100abc') || {};
+  report('without a report of its own', again.reports === 1 && again.occurrences === 5 && (again.versions || []).includes('1.5.1'), JSON.stringify(again));
+  r = await call('POST', '/seen', { app: 'hacBrewPackLZ', fingerprint: 'failed|2002-0002|journal', device: 'device-a', version: '1.5.0', count: 2 }, undefined, '4.4.4.5');
+  report('one that is fixed says so', r.code === 200 && r.value.status === 'fixed' && r.value.fixedIn === '1.5.1', JSON.stringify(r));
+  r = await call('POST', '/seen', { app: 'hacBrewPackLZ', fingerprint: 'never|sent', device: 'device-a', count: 1 }, undefined, '4.4.4.6');
+  report('one that was never sent is turned away', r.code === 404, JSON.stringify(r));
+  report('and so is a count of nothing', (await call('POST', '/seen', { app: 'hacBrewPackLZ' }, undefined, '4.4.4.7')).code === 400);
+
+  let codes = [];
+  for (let i = 0; i < 12; i++)
+    codes.push((await call('POST', '/report', sample({ device: 'busy', fingerprint: `busy|${i}` }), undefined, `10.0.0.${i}`)).code);
+  report('one device can\'t flood it', codes.slice(0, 10).every(c => c === 200) && codes.slice(10).every(c => c === 429), codes.join(' '));
+  codes = [];
+  for (let i = 0; i < 12; i++)
+    codes.push((await call('POST', '/report', sample({ device: `d${i}`, fingerprint: `addr|${i}` }), undefined, '6.6.6.6')).code);
+  report('and nor can one address', codes.slice(0, 10).every(c => c === 200) && codes.slice(10).every(c => c === 429), codes.join(' '));
+
+  report('what isn\'t a report is turned away', (await call('POST', '/report', 'not json', undefined, '1.1.1.1')).code === 400
+    && (await call('POST', '/report', { version: '1' }, undefined, '1.1.1.2')).code === 400);
+  report('and so is something too big', (await call('POST', '/report', 'x'.repeat((1 << 20) + 1), undefined, '1.1.1.3')).code === 413);
+  report('anything else isn\'t there', (await call('GET', '/', undefined, undefined, '1.1.1.4')).code === 404);
+} catch (e) {
+  report('the tests ran to the end', false, String(e && e.stack || e));
+}
+lines.push(failures === 0 ? 'all passed' : `${failures} failed`);
+document.getElementById('out').textContent = lines.join('\n');
+</script>

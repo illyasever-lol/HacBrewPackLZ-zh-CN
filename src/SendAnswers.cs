@@ -33,8 +33,10 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
         return Directory.Exists(path) ? DescribeFolder(path) : DescribeFile(path);
     });
 
-    /// <summary>What a game comes to compressed. The request is "level, block size, compress, game" on its first line, tab separated, then each
-    /// of the game's files on a line of its own, as the Switch has put them together.</summary>
+    /// <summary>What a game comes to compressed. The request is "级别、块大小、压缩、游戏" on its first line, tab separated, then each
+    /// of the game's files on a line of its own, as the Switch has put them together. A fifth field of 1 asks for it measured, from reading all
+    /// of it, which the PC does far faster than the Switch could across the network, and the answer's seventh field is then 1. A PC from before
+    /// that leaves the field alone and answers with its first look, which the Switch can tell from the answer.</summary>
     public Answer Estimate(string request) => Ask("estimate|" + request, () =>
     {
         var lines = request.Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -48,6 +50,7 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
         if (level is < Lz4Encoder.MinLevel or > Lz4Encoder.MaxLevel || blockSize is < 0x1000 or > RomFsCompressor.MaxPhysicalBlockSize || (blockSize & (blockSize - 1)) != 0)
             return Failed;
         var options = new Options { Compress = settings[2] == "1", Level = level, BlockSize = blockSize };
+        bool measure = settings.Length > 4 && settings[4] == "1";
         var paths = new List<string>();
         foreach (string inside in lines.Skip(1))
         {
@@ -57,9 +60,13 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
         }
 
         SizeEstimate estimate;
+        long installed = 0;
         if (paths.Count == 1 && Directory.Exists(paths[0]))
         {
-            estimate = Analyzer.EstimateBuild(GameFolder.Open(paths[0]).BuildOptions(options));
+            // A game folder too, measured exactly under 1 GB by its size as the Switch lists it, which is what this says it is.
+            var folder = GameFolder.Open(paths[0]);
+            var build = folder.BuildOptions(options);
+            estimate = Analyzer.EstimateBuild(measure ? build.MeasuringGameOf(folder.Bytes) : build, measure);
         }
         else
         {
@@ -67,14 +74,18 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
             var jobs = set.Jobs.Where(j => j.ApplicationId == application).ToList();
             if (jobs.Count == 0)
                 return Failed;
-            // The same as on the Switch: DLC with no game data to it, or nothing to gain, says nothing either way, and margins add up as a sum of squares.
-            var each = jobs.Select(job => Analyzer.Estimate(job, options)).ToList();
-            bool compressed = each.Any(e => e.AlreadyCompressed) && each.All(e => e.AlreadyCompressed || e.RomFsBytes == 0 || e.SavedFraction < SavingRule.NothingToGain);
-            estimate = new SizeEstimate(each.Sum(e => e.InputBytes), each.Sum(e => e.OutputBytes), (long)Math.Sqrt(each.Sum(e => (double)e.MarginBytes * e.MarginBytes)),
-                each.Sum(e => e.RomFsBytes), each.Sum(e => e.RomFsStoredBytes)) { AlreadyCompressed = compressed };
+            // The same as on the Switch: DLC with no game data to it says nothing either way, and margins add up as a sum of squares. Measured,
+            // a game under 1 GB, as the Switch lists it, is measured exactly.
+            var measuring = options.MeasuringGameOf(jobs.Sum(job => job.InputBytes));
+            estimate = SizeEstimate.Together(jobs.Select(job => measure ? Analyzer.Measure(job, measuring) : Analyzer.Estimate(job, options)).ToList());
+            if (jobs.Any(job => job.Contents.Any(c => c.Base?.Packed == true || c.Patch?.Packed == true)))
+                installed = jobs.Sum(CopyMark.InstalledBytes);
         }
+        // Then whether it was measured, what compressing a copy this tool made freed, whether its makers compressed it, and for a game packed
+        // as an NSZ is, what it takes installed as it is, which the Switch compares it with when it installs it. A Switch from before reads past them.
         string text = string.Create(CultureInfo.InvariantCulture,
-            $"{estimate.InputBytes} {estimate.OutputBytes} {estimate.MarginBytes} {estimate.RomFsBytes} {estimate.RomFsStoredBytes} {(estimate.AlreadyCompressed ? 1 : 0)}");
+            $"{estimate.InputBytes} {estimate.OutputBytes} {estimate.MarginBytes} {estimate.RomFsBytes} {estimate.RomFsStoredBytes} {(estimate.AlreadyCompressed ? 1 : 0)} "
+            + $"{(estimate.Measured ? 1 : 0)} {estimate.FreedBytes} {(estimate.ByMakers ? 1 : 0)} {installed}");
         return new Answer(true, true, Encoding.UTF8.GetBytes(text));
     });
 
@@ -109,14 +120,15 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
                     {
                         answer = work();
                     }
-                    catch (Exception e) when (e is ToolException or IOException or UnauthorizedAccessException or CryptographicException or InvalidDataException)
+                    catch (Exception)
                     {
-                        // The Switch then has a go itself, and says what's wrong if it's the same there.
+                        // The Switch then has a go itself, and says what's wrong if it's the same there. Whatever it was, it mustn't take this
+                        // thread down, which would take the whole program with it in the middle of sending.
                         answer = Failed;
                     }
                     _answers[key] = answer;
                 }
-            }) { IsBackground = true, Name = "正在应答" }.Start();
+            }) { IsBackground = true, Name = "Answering" }.Start();
         }
     }
 
@@ -138,7 +150,8 @@ internal sealed class SendAnswers(Func<string, string?> resolve, Func<Keyset> ke
             byte[] icon = title.Icon ?? [];
             icons.Add(icon);
             text.Append(CultureInfo.InvariantCulture,
-                $"T\t{title.TitleId:x16}\t{title.Type}\t{title.Version}\t{title.LinkedId:x16}\t{title.Bytes}\t{(title.HoldsOnlyPart ? 1 : 0)}\t{icon.Length}\t{OneLine(title.DisplayVersion ?? "")}\t{OneLine(title.Name ?? "")}\n");
+                $"T\t{title.TitleId:x16}\t{title.Type}\t{title.Version}\t{title.LinkedId:x16}\t{title.Bytes}\t{(title.HoldsOnlyPart ? 1 : 0)}\t{icon.Length}\t{OneLine(title.DisplayVersion ?? "")}\t{OneLine(title.Name ?? "")}"
+                + $"\t{(title.MadeHere ? 1 : 0)}\t{title.OriginalBytes}\n");
         }
         return Together(text, icons);
     }

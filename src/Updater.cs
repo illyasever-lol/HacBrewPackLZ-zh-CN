@@ -11,7 +11,12 @@ namespace HacBrewPackLz;
 internal static class Updater
 {
     private const string ReleasesUrl = "https://gitlab.com/api/v4/projects/ismaellozanoperezserrano%2Fhacbrewpacklz/releases?per_page=1";
+    /// <summary>Test versions are released in the same project, dated just before its newest release, so the newest release by date, which is
+    /// all everyone else's copy looks at, and all every copy before 1.5 looks at, stays the newest release. A test version's copy looks through
+    /// them all.</summary>
+    private const string AllReleasesUrl = "https://gitlab.com/api/v4/projects/ismaellozanoperezserrano%2Fhacbrewpacklz/releases?per_page=100";
     private const string DownloadsUrl = "https://gitlab.com/ismaellozanoperezserrano/hacbrewpacklz/-/releases/";
+    private const string TestMark = "-test.";
     private const string ManifestName = "hacbrewpacklz-update.txt";
     private const string SignatureName = "hacbrewpacklz-update.sig";
     private const string TagField = "\"tag_name\":\"";
@@ -22,9 +27,16 @@ internal static class Updater
     /// <summary>Somewhere else to get releases from, for testing. What comes from there still has to carry the right signature.</summary>
     private static string? TestSite => Environment.GetEnvironmentVariable("HACBREWPACKLZ_UPDATE_SITE");
 
+    /// <summary>The version this copy counts as: what it is, or for testing, whatever it's told, though only while it's pointed at a pretend
+    /// site, so nothing can make a real copy think it's something else.</summary>
+    private static string Current => TestSite is not null && Environment.GetEnvironmentVariable("HACBREWPACKLZ_UPDATE_AS") is { Length: > 0 } pretend
+        ? pretend : AppInfo.Version;
+
     /// <summary>What this program is called among the files of a release.</summary>
     private static string ReleaseFileName()
     {
+        if (OperatingSystem.IsAndroid())
+            return "hacbrewpacklz-android.apk";
         if (OperatingSystem.IsLinux())
             return "hacbrewpacklz-linux-x64";
         if (OperatingSystem.IsMacOS())
@@ -49,31 +61,47 @@ internal static class Updater
         }
         catch (Exception e) when (e is ToolException or HttpRequestException or TaskCanceledException or IOException or UnauthorizedAccessException or CryptographicException)
         {
-            return (false, $"Couldn't update: {e.Message}");
+            return (false, $"无法更新：{e.Message}");
         }
     }
 
+    /// <summary>
+    /// On Android an app can't replace itself: the checked package is handed over, with its version, for Android to
+    /// install once the person agrees. It only accepts it signed by the same key as the app already there.
+    /// </summary>
+    public static Action<byte[], string>? InstallPackage { get; set; }
+
     private static (bool, string) Install()
     {
-        string path = Environment.ProcessPath ?? throw new ToolException("当前副本无法确认自身存放位置");
+        string path = InstallPackage is not null ? "" : Environment.ProcessPath ?? throw new ToolException("当前副本无法确认自身存放位置");
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
         http.DefaultRequestHeaders.UserAgent.ParseAdd(AppInfo.Name);
         byte[] Get(string url) => http.GetByteArrayAsync(url).GetAwaiter().GetResult();
 
-        string listing = Encoding.UTF8.GetString(Get(TestSite is { } site ? $"{site}/releases" : ReleasesUrl));
-        int at = listing.IndexOf(TagField, StringComparison.Ordinal);
-        if (at < 0)
+        // Everyone's copy goes by the newest release by date, which a test version is never dated after. A test version's copy looks through
+        // every release for the newest version, test versions too, and so moves on to the release once it's out.
+        bool testing = IsTestVersion(Current);
+        string listing = Encoding.UTF8.GetString(Get(TestSite is { } site ? $"{site}/releases?per_page={(testing ? 100 : 1)}" : testing ? AllReleasesUrl : ReleasesUrl));
+        string tag = "";
+        for (int at = listing.IndexOf(TagField, StringComparison.Ordinal); at >= 0; at = listing.IndexOf(TagField, at, StringComparison.Ordinal))
+        {
+            at += TagField.Length;
+            int end = listing.IndexOf('"', at);
+            if (end < 0)
+                break;
+            string found = listing[at..end];
+            if (tag.Length == 0 || IsNewer(found.TrimStart('v'), tag.TrimStart('v')))
+                tag = found;
+            at = end;
+        }
+        if (tag.Length == 0)
             throw new ToolException("获取的版本列表格式与预期不符");
-        at += TagField.Length;
-        int end = listing.IndexOf('"', at);
-        if (end < 0)
-            throw new ToolException("获取的版本列表格式与预期不符");
-        string tag = listing[at..end];
+        string downloads = TestSite is { } other ? $"{other}/" : DownloadsUrl;
         string version = tag.TrimStart('v');
-        if (!IsNewer(version, AppInfo.Version))
-            return (false, $"This is the latest version ({AppInfo.Version}).");
+        if (!IsNewer(version, Current))
+            return (false, $"当前已是最新版本（{Current}）。");
 
-        string source = $"{(TestSite is { } other ? $"{other}/" : DownloadsUrl)}{tag}/downloads/";
+        string source = $"{downloads}{tag}/downloads/";
         byte[] manifest = Get(source + ManifestName);
         byte[] signature = Get(source + SignatureName);
         if (!IsSigned(manifest, signature))
@@ -91,11 +119,17 @@ internal static class Updater
         if (signedVersion != version)
             throw new ToolException("该版本自报的版本号与列表中的不一致，因此未安装");
         if (expected is null)
-            throw new ToolException($"that release has nothing called {name}");
+            throw new ToolException($"该发布版中没有名为 {name} 的文件");
 
         byte[] program = Get(source + name);
         if (Convert.ToHexString(SHA256.HashData(program)).ToLowerInvariant() != expected)
             throw new ToolException("下载内容与该版本声明的不一致，因此未安装");
+
+        if (InstallPackage is { } install)
+        {
+            install(program, version);
+            return (true, $"版本 {version} 已就绪，可以安装。");
+        }
 
         string fresh = path + ".new", old = path + ".old";
         File.WriteAllBytes(fresh, program);
@@ -113,11 +147,25 @@ internal static class Updater
             throw;
         }
         TryDelete(old);
-        return (true, $"Updated to version {version}. It'll be what opens from now on.");
+        return (true, $"已更新到版本 {version}，以后启动的都是这个版本。");
     }
 
-    private static bool IsNewer(string candidate, string current) =>
-        Version.TryParse(candidate, out var a) && Version.TryParse(current, out var b) && a > b;
+    /// <summary>Whether one version comes after another. A test version, such as 1.5.0-test.2, comes after the test versions before it and
+    /// before the release with its number, so testers move on to that once it's out.</summary>
+    internal static bool IsNewer(string candidate, string current) =>
+        Parse(candidate) is { } a && Parse(current) is { } b && (a.number != b.number ? a.number > b.number : a.test > b.test);
+
+    public static bool IsTestVersion(string version) => version.Contains(TestMark, StringComparison.Ordinal);
+
+    /// <summary>The release number, and which test version it is, with a release itself counting after every test version.</summary>
+    private static (Version number, int test)? Parse(string text)
+    {
+        int mark = text.IndexOf(TestMark, StringComparison.Ordinal);
+        int test = int.MaxValue;
+        if (mark >= 0 && (!int.TryParse(text[(mark + TestMark.Length)..], out test) || test < 1))
+            return null;
+        return Version.TryParse(mark < 0 ? text : text[..mark], out var number) ? (number, test) : null;
+    }
 
     private static bool IsSigned(byte[] data, byte[] signature)
     {

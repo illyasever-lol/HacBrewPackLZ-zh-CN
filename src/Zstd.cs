@@ -394,8 +394,8 @@ internal sealed unsafe class ZstdDecoder
     }
 
     /// <summary>
-    /// Decodes one compressed block to <paramref name="目标"/>, with matches reaching back no further than
-    /// <paramref name="历史"/>, and returns how many bytes it made.
+    /// Decodes one compressed block to <paramref name="destination"/>, with matches reaching back no further than
+    /// <paramref name="history"/>, and returns how many bytes it made.
     /// </summary>
     public int DecodeBlock(byte* source, int size, byte* history, byte* destination, byte* destinationEnd)
     {

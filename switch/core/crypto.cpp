@@ -595,11 +595,65 @@ void Keyset::load(const std::string& path) {
     _keys.clear();
     _titleKeys.clear();
     parse(readWholeFile(path), _keys);
+    deriveMissing();
 
     size_t slash = path.find_last_of("/\\");
     std::string titleKeys = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "title.keys";
-    if (sys::exists(titleKeys))
-        parse(readWholeFile(titleKeys), _titleKeys);
+    if (sys::exists(titleKeys)) {
+        std::string text;
+        // Only games with tickets of their own need these, and the card turning the file down for the moment is no reason to go without the rest.
+        try {
+            text = readWholeFile(titleKeys);
+        } catch (const ToolError&) {
+        }
+        parse(text, _titleKeys);
+    }
+}
+
+/// The keys each master key leads to, worked out the way Lockpick and hactool do, for any that the file doesn't have but has what they come
+/// from: a file can have every master key and only some of what comes from them, and the games then run but can't be read here.
+void Keyset::deriveMissing() {
+    const u8* kekSeed = find("aes_kek_generation_source", 16);
+    const u8* keySeed = find("aes_key_generation_source", 16);
+    const u8* titleKekSource = find("titlekek_source", 16);
+    static const char* const kinds[] = {"application", "ocean", "system"};
+    for (int generation = 0; generation < 0x40; generation++) {
+        const u8* master = find(format("master_key_%02x", generation), 16);
+        if (!master)
+            continue;
+        std::string titleKek = format("titlekek_%02x", generation);
+        if (titleKekSource && !find(titleKek, 16)) {
+            Bytes key(titleKekSource, titleKekSource + 16);
+            aesEcbDecrypt(master, key.data(), key.size());
+            _keys[titleKek] = key;
+        }
+        if (!kekSeed || !keySeed)
+            continue;
+        for (const char* kind : kinds) {
+            std::string name = format("key_area_key_%s_%02x", kind, generation);
+            const u8* source = find(format("key_area_key_%s_source", kind), 16);
+            if (!source || find(name, 16))
+                continue;
+            Bytes kek(kekSeed, kekSeed + 16);
+            aesEcbDecrypt(master, kek.data(), kek.size());
+            Bytes sourceKek(source, source + 16);
+            aesEcbDecrypt(kek.data(), sourceKek.data(), sourceKek.size());
+            Bytes key(keySeed, keySeed + 16);
+            aesEcbDecrypt(sourceKek.data(), key.data(), key.size());
+            _keys[name] = key;
+        }
+    }
+}
+
+std::vector<std::string> Keyset::secrets() const {
+    std::vector<std::string> all;
+    for (auto* keys : {&_keys, &_titleKeys}) {
+        for (auto& entry : *keys) {
+            if (entry.second.size() >= 8)
+                all.push_back(toHex(entry.second.data(), entry.second.size()));
+        }
+    }
+    return all;
 }
 
 const u8* Keyset::find(const std::string& name, size_t size) const {
